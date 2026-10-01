@@ -23,6 +23,12 @@ jobs:
         run: |
           if command -v rg >/dev/null; then exit 0; fi
           if [ "$RUNNER_OS" = Linux ]; then sudo apt-get update && sudo apt-get install -y ripgrep; else brew install ripgrep; fi
+      - name: Install ripgrep (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          if (-not (Get-Command rg -ErrorAction SilentlyContinue)) { choco install ripgrep -y --no-progress }
+          if (-not (Get-Command rg -ErrorAction SilentlyContinue)) { throw 'ripgrep is required for LOCAL exploration' }
       - name: Format
         run: cargo fmt --manifest-path custom-tui/Cargo.toml -- --check
       - name: Test
