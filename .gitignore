@@ -1,0 +1,9 @@
+**/target/
+**/.custom-tui/
+**/__pycache__/
+*.pyc
+*.log
+.env
+.env.*
+!.env.example
+.DS_Store

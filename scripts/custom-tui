@@ -1,0 +1,9 @@
+#!/bin/sh
+set -eu
+custom_repo_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+# Keep the interactive UI optimized; opt into the faster-to-build debug binary
+# explicitly when iterating on Rust code.
+if [ "${CUSTOM_TUI_PROFILE:-release}" = debug ]; then
+    exec cargo run --quiet --manifest-path "$custom_repo_root/custom-tui/Cargo.toml" -- "$@"
+fi
+exec cargo run --release --quiet --manifest-path "$custom_repo_root/custom-tui/Cargo.toml" -- "$@"

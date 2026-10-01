@@ -1,0 +1,33 @@
+name: Verify Loom
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  verify:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install stable Rust
+        run: rustup update stable --no-self-update && rustup default stable
+      - name: Install Rust checks
+        run: rustup component add rustfmt clippy
+      - name: Install ripgrep
+        run: |
+          if command -v rg >/dev/null; then exit 0; fi
+          if [ "$RUNNER_OS" = Linux ]; then sudo apt-get update && sudo apt-get install -y ripgrep; else brew install ripgrep; fi
+      - name: Format
+        run: cargo fmt --manifest-path custom-tui/Cargo.toml -- --check
+      - name: Test
+        run: cargo test --locked --manifest-path custom-tui/Cargo.toml
+      - name: Clippy
+        run: cargo clippy --locked --manifest-path custom-tui/Cargo.toml --all-targets -- -D warnings
+      - name: Build
+        run: cargo build --locked --manifest-path custom-tui/Cargo.toml
+      - name: Terminal interactions (no model calls)
+        run: python3 custom-tui/tests/terminal_smoke.py

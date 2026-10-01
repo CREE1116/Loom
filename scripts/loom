@@ -1,0 +1,4 @@
+#!/bin/sh
+set -eu
+loom_repo_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+exec "$loom_repo_root/scripts/custom-tui" "$@"
