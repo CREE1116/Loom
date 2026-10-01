@@ -21,3 +21,6 @@ unicode-segmentation = "1.13"
 unicode-width = "0.2"
 
 tempfile = "3"
+pulldown-cmark = { version = "0.10", default-features = false }
+libc = "0.2"
+dunce = "1"

@@ -82,8 +82,8 @@ class Screen:
     def text(self):
         return "\n".join("".join(row).rstrip() for row in self.cells)
 
-    def position(self, text):
-        for y, row in enumerate(self.cells):
+    def position(self, text, start_row=0):
+        for y, row in enumerate(self.cells[start_row:], start_row):
             for x in range(self.width):
                 if "".join(row[x:]).startswith(text):
                     return x, y
@@ -140,7 +140,7 @@ class Session:
             try:
                 x, y = self.screen.position(f"[>{text}]")
             except AssertionError:
-                x, y = self.screen.position(text)
+                x, y = self.screen.position(text, start_row=1)
         self.send(f"\x1b[<0;{x+1};{y+1}M")
         self.send(f"\x1b[<0;{x+1};{y+1}m")
 
@@ -163,11 +163,11 @@ def demo_test():
     workdir=tempfile.TemporaryDirectory(prefix="custom-tui-demo-")
     session = Session("--demo",cwd=workdir.name)
     try:
-        session.wait("실제 실행 없음")
+        session.wait("세션 ▾")
         session.send("\x1b[200~입력 초안\n두 번째 줄\x1b[201~")
         session.wait(f"[붙여넣은 내용 · {len('입력 초안' + chr(10) + '두 번째 줄')}자]")
         session.click("활동")
-        session.wait("현재 세션의 에이전트")
+        session.wait("연결된 runtime 활동")
         session.click("대화")
         session.wait("[붙여넣은 내용")
         session.click("파일 변경 1")
@@ -221,10 +221,10 @@ def demo_test():
         session.click("○ fixture-fast")
         session.wait("fixture-fast")
         session.wait("[붙여넣은 내용")
-        session.click("도움말")
-        session.wait("명령 안내")
+        session.click("설정")
+        session.wait("시작 시 작업 패널")
         session.resize(80,24)
-        session.wait("● 도움말")
+        session.wait("● 설정")
         session.click("대화")
         session.wait("[붙여넣은 내용")
         session.click("설정")
@@ -273,7 +273,7 @@ def session_menu_test():
     with tempfile.TemporaryDirectory(prefix="custom-tui-sessions-") as directory:
         session = Session("--demo", cwd=directory)
         try:
-            session.wait("실제 실행 없음")
+            session.wait("세션 ▾")
             session.click("세션 ▾")
             session.wait("현재 대화")
             session.wait("최근 대화")
@@ -327,7 +327,7 @@ def paging_test():
     workdir = tempfile.TemporaryDirectory(prefix="custom-tui-paging-")
     session = Session("--demo", cwd=workdir.name)
     try:
-        session.wait("실제 실행 없음")
+        session.wait("세션 ▾")
         session.resize(120, 50)
         session.wait("TUI 구조 읽기")
         session.click("TUI 구조 읽기")
@@ -346,7 +346,7 @@ def queue_test():
     workdir = tempfile.TemporaryDirectory(prefix="custom-tui-queue-")
     session = Session("--demo", cwd=workdir.name)
     try:
-        session.wait("실제 실행 없음")
+        session.wait("세션 ▾")
         session.click("승인")
         session.wait("파일 변경 승인")
         session.wait("이번 요청 허용")
@@ -354,7 +354,7 @@ def queue_test():
         session.wait("대기 중인 승인 요청이 없습니다")
         session.click("대화")
         session.send("first request\r")
-        session.wait("데모 스트리밍")
+        session.wait("코드를 짜는 중")
         session.send("second queued\r")
         session.wait("대기열 · 1개")
         session.send("third queued\r")
@@ -376,14 +376,14 @@ def force_queue_test():
     workdir = tempfile.TemporaryDirectory(prefix="custom-tui-force-queue-")
     session = Session("--demo", cwd=workdir.name)
     try:
-        session.wait("실제 실행 없음")
+        session.wait("세션 ▾")
         session.click("승인")
         session.wait("이번 요청 허용")
         session.click("거절")
         session.wait("대기 중인 승인 요청이 없습니다")
         session.click("대화")
         session.send("running request\r")
-        session.wait("데모 스트리밍")
+        session.wait("코드를 짜는 중")
         session.send("second queued\r")
         session.send("third queued\r")
         session.wait("대기열 · 2개")
@@ -486,12 +486,12 @@ def focus_recovery_test():
     with tempfile.TemporaryDirectory(prefix="custom-tui-focus-") as directory:
         session = Session("--demo", cwd=directory)
         try:
-            session.wait("실제 실행 없음")
+            session.wait("세션 ▾")
             session.send("\t")  # Move keyboard focus to a UI control.
             session.send("type")  # Typing returns to the composer.
             session.wait("› type")
-            session.click("도움말")
-            session.wait("명령 안내")
+            session.click("설정")
+            session.wait("시작 시 작업 패널")
             session.send("more")  # A compact detail pane also yields to typing.
             session.wait("● 대화")
             session.wait("› typemore")
@@ -582,6 +582,113 @@ def question_form_test():
     print("PTY questions: explicit options, custom paste, validation, hide/reopen, resize and submit OK", flush=True)
 
 
+def activity_graph_test():
+    with tempfile.TemporaryDirectory(prefix="loom-activity-") as directory:
+        session = Session("--demo", cwd=directory)
+        try:
+            session.send("/approve 1 1\r")
+            session.wait("데모 승인 선택 완료")
+            session.send("활동 데모\r")
+            session.wait("활동 그래프 데모")
+            session.resize(140, 38)
+            session.send("/agents\r")
+            session.wait("작업 그래프")
+            session.wait("MEDIUM")
+            session.wait("원인 분석 결과가")
+            session.send("/task 4\r")
+            session.wait("작업 상세 · 수정안 작성")
+            session.wait("demo-analysis · 원인 분석")
+            session.wait("Cost/cache: 미계측")
+            session.send("\x03")
+            session.wait("사용자 중단 (fixture)")
+        finally:
+            session.close()
+    print("PTY activity: worker labels, critical path, waiting reason, task detail and cancellation OK", flush=True)
+
+
+def conversation_dividers_test():
+    with tempfile.TemporaryDirectory(prefix="loom-dividers-") as directory:
+        session = Session("--demo", cwd=directory)
+        try:
+            session.send("/approve 1 1\r")
+            session.wait("데모 승인 선택 완료")
+            session.send("/chat\r")
+            session.resize(80, 40)
+            session.send("divider first\r")
+            session.wait("코드를 짜는 중")
+            session.wait("── 사용자")
+            session.wait("── Loom")
+            session.wait("✓ 완료", timeout=10)
+            session.send("divider second\r")
+            session.wait("› divider second")
+            session.wait("✓ 완료", timeout=10)
+            assert session.screen.text().count("── 사용자") == 3, session.screen.text()
+            assert session.screen.text().count("── Loom") == 3, session.screen.text()
+            session.resize(40, 40)
+            session.wait("── 사용자")
+            session.wait("── Loom")
+            assert "› divider second" in session.screen.text()
+        finally:
+            session.close()
+    print("PTY transcript: labeled turn dividers, streaming and narrow resize OK", flush=True)
+
+
+def markdown_test():
+    with tempfile.TemporaryDirectory(prefix="loom-markdown-") as directory:
+        session = Session("--demo", cwd=directory)
+        try:
+            session.send("/approve 1 1\r")
+            session.wait("데모 승인 선택 완료")
+            session.send("/new\r")
+            session.wait("새 데모 대화")
+            session.resize(100, 50)
+            session.send("마크다운 데모\r")
+            session.wait("✓ 완료", timeout=35)
+            session.wait("구현 결과")
+            session.wait("중요한 변경")
+            session.wait("refresh_session()")
+            session.wait("│ 원문은 복사할 때 유지됩니다.")
+            assert "**중요한 변경**" not in session.screen.text()
+            assert "## 구현 결과" not in session.screen.text()
+            assert "| --- |" not in session.screen.text()
+            assert "☑ 한글 표시" in session.screen.text()
+            session.resize(40, 50)
+            session.wait("항목: Markdown")
+            session.wait("상태: 정상")
+            session.wait("let 값 = 42;")
+        finally:
+            session.close()
+    print("PTY Markdown: streamed headings, emphasis, inline code, task list, quote, table, code and narrow stacked layout OK", flush=True)
+
+
+def effort_and_quota_test():
+    with tempfile.TemporaryDirectory(prefix="loom-effort-quota-") as directory:
+        session = Session("--demo", cwd=directory)
+        try:
+            session.send("/approve 1 1\r")
+            session.wait("데모 승인 선택 완료")
+            line = session.screen.text().splitlines()[1]
+            assert line.find("모델") < line.find("세션")
+            assert "/ 명령" not in session.screen.text() and "도움말" not in line
+            session.send("/effort high\r")
+            session.wait("● effort high")
+            session.send("/chat\r")
+            session.send("할당량 데모\r")
+            session.wait("할당량 소진")
+            session.wait("tokens 12.4k")
+            session.send("보존할 지시\r")
+            session.wait("보존할 지시")
+            session.send("/usage\r")
+            session.wait("Total tokens: 12400")
+            session.wait("Cached input: 7000")
+            session.send("/usage refresh\r")
+            session.wait("사용 가능한 할당량")
+            session.wait("일시정지")
+        finally:
+            session.close()
+    print("PTY effort/quota: capability choices, model/session order, reported tokens, quota stop and queue preservation OK", flush=True)
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--live", action="store_true")
@@ -598,5 +705,9 @@ if __name__ == "__main__":
     keyboard_only_commands_test()
     local_exploration_test()
     question_form_test()
+    activity_graph_test()
+    effort_and_quota_test()
+    conversation_dividers_test()
+    markdown_test()
     if options.live:
         live_test(options.model)

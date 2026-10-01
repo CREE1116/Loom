@@ -26,6 +26,122 @@ pub struct Agent {
     pub detail: String,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WorkerKind {
+    Local,
+    Small,
+    Medium,
+    Flagship,
+}
+impl WorkerKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Local => "LOCAL",
+            Self::Small => "SMALL",
+            Self::Medium => "MEDIUM",
+            Self::Flagship => "FLAGSHIP",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TaskStatus {
+    Pending,
+    Ready,
+    Running,
+    Blocked,
+    Completed,
+    Failed,
+    Cancelled,
+    NeedsReview,
+}
+
+/// A read-only UI projection. Task ownership and critical-path decisions stay in Core.
+#[derive(Clone, Debug)]
+pub struct ActivityTask {
+    pub id: String,
+    pub parent: Option<String>,
+    pub title: String,
+    pub worker: Option<WorkerKind>,
+    pub status: TaskStatus,
+    pub dependencies: Vec<String>,
+    pub reason: Option<String>,
+    pub critical: bool,
+    pub elapsed_ms: Option<u64>,
+    pub inputs: Vec<String>,
+    pub outputs: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum WorkPhase {
+    #[default]
+    Thinking,
+    Writing,
+    Tool,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct TokenUsage {
+    pub total: Option<u64>,
+    pub input: Option<u64>,
+    pub cached_input: Option<u64>,
+    pub output: Option<u64>,
+    pub reasoning_output: Option<u64>,
+    pub last: Option<u64>,
+    pub context_window: Option<u64>,
+}
+
+#[derive(Clone, Debug)]
+pub struct EffortOption {
+    pub value: String,
+    pub description: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct ModelProfile {
+    pub id: String,
+    pub efforts: Vec<EffortOption>,
+    pub default_effort: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct QuotaWindow {
+    pub used_percent: u32,
+    pub duration_minutes: Option<u64>,
+    pub resets_at: Option<u64>,
+}
+
+#[derive(Clone, Debug)]
+pub struct QuotaSnapshot {
+    pub id: String,
+    pub label: String,
+    pub model: Option<String>,
+    pub primary: Option<QuotaWindow>,
+    pub secondary: Option<QuotaWindow>,
+    pub credits_available: Option<bool>,
+    pub credits_unlimited: Option<bool>,
+    pub spend_control_reached: Option<bool>,
+    pub reached: Option<LimitKind>,
+}
+impl QuotaSnapshot {
+    pub fn can_resume(&self) -> bool {
+        if self.spend_control_reached == Some(true) || self.reached.is_some() {
+            return false;
+        }
+        if self.credits_unlimited == Some(true) || self.credits_available == Some(true) {
+            return true;
+        }
+        let windows: Vec<_> = self.primary.iter().chain(&self.secondary).collect();
+        !windows.is_empty() && windows.iter().all(|window| window.used_percent < 100)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LimitKind {
+    UsageExhausted,
+    RateLimited,
+}
+
 /// Opaque choice token. Only the backend knows how to execute it.
 #[derive(Clone, Debug)]
 pub struct Choice {
@@ -155,6 +271,8 @@ pub struct SessionSnapshot {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Operation {
+    CloseSession,
+    Usage,
     Initialize,
     OpenSession,
     SwitchSession,
@@ -173,6 +291,7 @@ pub enum Operation {
 
 #[derive(Clone, Debug)]
 pub enum AgentCommand {
+    RefreshUsage,
     Explore(String),
     Answer {
         request_id: String,
@@ -181,6 +300,7 @@ pub enum AgentCommand {
     Submit {
         text: String,
         model: String,
+        effort: Option<String>,
         skills: Vec<Skill>,
     },
     Interrupt,
@@ -232,6 +352,17 @@ impl AgentEvent {
 
 #[derive(Clone, Debug)]
 pub enum AgentUpdate {
+    ModelProfilesLoaded(Vec<ModelProfile>),
+    EffortObserved(Option<String>),
+    WorkPhaseUpdated(WorkPhase),
+    TokenUsageUpdated(TokenUsage),
+    QuotaUpdated(QuotaSnapshot),
+    ExecutionLimited {
+        kind: LimitKind,
+        reason: String,
+    },
+    ExecutionLimitCleared,
+    TaskUpdated(ActivityTask),
     InputRequested(InputRequest),
     InputResolved(String),
     InputReplyFailed {
@@ -321,4 +452,8 @@ pub enum AgentUpdate {
 pub trait AgentBackend {
     fn command(&mut self, command: AgentCommand) -> anyhow::Result<()>;
     fn poll(&mut self) -> anyhow::Result<Option<AgentEvent>>;
+    /// Stop owned work and detach; saved history is not deleted or archived.
+    fn shutdown(&mut self) -> anyhow::Result<()> {
+        Ok(())
+    }
 }

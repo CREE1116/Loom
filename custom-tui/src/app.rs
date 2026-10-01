@@ -6,7 +6,10 @@ use crate::engine::{Action, Canvas, Tone, wrap};
 use crate::preferences::{self, Language, Preferences};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
+mod activity;
 mod events;
+mod meter;
+mod models;
 mod questions;
 #[cfg(test)]
 mod test_protocol;
@@ -228,7 +231,7 @@ impl Editor {
 }
 struct CachedMessage {
     body: String,
-    rows: Vec<document::Row>,
+    rows: Vec<document::StyledRow>,
 }
 type MessageCache = RefCell<HashMap<(String, usize), CachedMessage>>;
 type ContentRow = (String, Tone, Option<Action>);
@@ -236,10 +239,12 @@ struct CachedChatRows {
     width: usize,
     count: usize,
     tail_len: usize,
+    language: Language,
     rows: Rc<Vec<ContentRow>>,
 }
 #[derive(Clone, Debug)]
 pub struct QueuedMessage {
+    pub effort: Option<String>,
     pub text: String,
     pub skills: Vec<Skill>,
     pub model: String,
@@ -362,6 +367,12 @@ const COMMANDS: &[(&str, &str)] = &[
     ("/skill", "스킬 선택/해제: /skill NAME | remove NAME"),
     ("/explore", "로컬 공유 코드 탐색: /explore SYMBOL"),
     ("/questions", "대기 중인 질문 선택·직접 입력"),
+    ("/task", "작업 상세 보기: /task N"),
+    ("/usage", "토큰·할당량 보기: /usage [refresh]"),
+    (
+        "/effort",
+        "모델 추론 effort 설정: /effort VALUE|default|runtime",
+    ),
 ];
 #[derive(Clone, Debug, PartialEq)]
 pub enum Intent {
@@ -384,11 +395,15 @@ pub enum Intent {
     SaveSettings,
     UpdatePermission(String, String),
     TrustWorkspace(bool),
+    RefreshUsage,
 }
 pub struct App {
     pub thread: Option<String>,
     pub turn: Option<String>,
     pub model: String,
+    pub effort: Option<String>,
+    pub runtime_effort: Option<String>,
+    pub model_profiles: Vec<crate::agent::ModelProfile>,
     pub status: String,
     pub readonly: bool,
     pub entries: Vec<Entry>,
@@ -398,6 +413,8 @@ pub struct App {
     // Reuse the laid-out transcript while only the composer or status changes.
     chat_rows_cache: RefCell<Option<CachedChatRows>>,
     pub agents: Vec<Agent>,
+    pub tasks: Vec<crate::agent::ActivityTask>,
+    pub selected_task: Option<String>,
     pub approvals: Vec<Approval>,
     pub input_forms: Vec<questions::InputForm>,
     pub approval_popup_dismissed: bool,
@@ -409,6 +426,12 @@ pub struct App {
     selected_diff_entry: Option<String>,
     recent_change_ids: HashSet<String>,
     pub usage: String,
+    pub tokens: crate::agent::TokenUsage,
+    pub quotas: Vec<crate::agent::QuotaSnapshot>,
+    pub execution_limit: Option<crate::agent::LimitKind>,
+    pub work_phase: crate::agent::WorkPhase,
+    work_phrase_index: usize,
+    work_phrase_tick: Instant,
     pub editor: Editor,
     pub view: View,
     pub focus: Option<Action>,
@@ -428,6 +451,7 @@ pub struct App {
     pub pending: HashMap<u64, Operation>,
     pub submitted: Option<String>,
     pub submitted_model: Option<String>,
+    pub submitted_effort: Option<String>,
     pub queued: VecDeque<QueuedMessage>,
     pub queue_paused: bool,
     // The current turn must finish before the promoted message may start.
@@ -472,12 +496,17 @@ impl App {
             thread: None,
             turn: None,
             model: String::new(),
+            effort: None,
+            runtime_effort: None,
+            model_profiles: Vec::new(),
             status: "연결 중".into(),
             readonly,
             entries: Vec::new(),
             message_cache: RefCell::new(HashMap::new()),
             chat_rows_cache: RefCell::new(None),
             agents: Vec::new(),
+            tasks: Vec::new(),
+            selected_task: None,
             approvals: Vec::new(),
             input_forms: Vec::new(),
             approval_popup_dismissed: false,
@@ -489,6 +518,12 @@ impl App {
             selected_diff_entry: None,
             recent_change_ids: HashSet::new(),
             usage: String::new(),
+            tokens: crate::agent::TokenUsage::default(),
+            quotas: Vec::new(),
+            execution_limit: None,
+            work_phase: crate::agent::WorkPhase::default(),
+            work_phrase_index: 0,
+            work_phrase_tick: Instant::now(),
             editor: Editor::default(),
             view: View::Chat,
             focus: None,
@@ -508,6 +543,7 @@ impl App {
             pending: HashMap::new(),
             submitted: None,
             submitted_model: None,
+            submitted_effort: None,
             queued: VecDeque::new(),
             queue_paused: false,
             force_after_interrupt: None,
@@ -601,6 +637,11 @@ impl App {
             changed = true;
         }
         if self.is_working() {
+            if now.saturating_duration_since(self.work_phrase_tick) >= Duration::from_millis(2200) {
+                self.work_phrase_index = (self.work_phrase_index + 1) % 3;
+                self.work_phrase_tick = now;
+                changed = true;
+            }
             let steps = now
                 .saturating_duration_since(self.animation_tick)
                 .as_millis()
@@ -614,6 +655,8 @@ impl App {
             changed |= self.animation_frame != 0;
             self.animation_frame = 0;
             self.animation_tick = now;
+            self.work_phrase_index = 0;
+            self.work_phrase_tick = now;
         }
         changed
     }
@@ -623,6 +666,12 @@ impl App {
             || self.turn.is_some()
             || self.submitted.is_some()
             || !self.active_tasks.is_empty())
+            && (self.execution_limit.is_none()
+                || self.active_tasks.iter().any(|id| {
+                    self.tasks.iter().any(|task| {
+                        &task.id == id && task.worker == Some(crate::agent::WorkerKind::Local)
+                    })
+                }))
             && self.approvals.is_empty()
             && !self.input_forms.iter().any(|f| f.request.blocking)
             && self.trust_prompt.is_none()
@@ -694,6 +743,7 @@ impl App {
             && cached.width == width
             && cached.count == count
             && cached.tail_len == tail_len
+            && cached.language == self.preferences.language
         {
             return Rc::clone(&cached.rows);
         }
@@ -702,12 +752,24 @@ impl App {
             width,
             count,
             tail_len,
+            language: self.preferences.language,
             rows: Rc::clone(&rows),
         });
         rows
     }
     pub fn activate(&mut self, action: Action) -> Option<Intent> {
         match action {
+            Action::Effort(value) => self.select_effort(&value),
+            Action::Task(id) => {
+                if self.tasks.iter().any(|task| task.id == id) {
+                    self.selected_task = Some(id);
+                    self.panel_open = true;
+                    self.switch_view(View::Agents);
+                    self.follow = false;
+                    self.scroll = 0;
+                    self.focus = None;
+                }
+            }
             Action::Questions
             | Action::QuestionOption(_)
             | Action::QuestionMove(_)
@@ -746,6 +808,7 @@ impl App {
                 self.invalidate_chat_rows();
             }
             Action::Agents => {
+                self.selected_task = None;
                 self.panel_open = true;
                 self.switch_view(View::Agents);
             }
@@ -862,7 +925,7 @@ impl App {
             Action::ConfirmPermission(false) => {
                 self.permission_confirm = None;
             }
-            Action::SelectEntry(id) => {
+            Action::SelectEntry(id) | Action::MessageRow(id, _, _) => {
                 self.branch_entry = Some(id);
                 self.focus = None;
             }
@@ -969,6 +1032,10 @@ impl App {
                     self.queued.push_front(item);
                 }
                 self.focus = None;
+                if self.execution_limit.is_some() {
+                    self.error("할당량 또는 호출 제한을 확인한 후 재개하세요. /usage refresh");
+                    return None;
+                }
                 self.queue_paused = false;
                 if let Some(turn) = self.turn.clone() {
                     if self.force_after_interrupt.as_deref() == Some(turn.as_str()) {
@@ -993,14 +1060,22 @@ impl App {
             }
             Action::ForceQueued(_) => {}
             Action::ResumeQueue => {
+                if self.execution_limit.is_some() {
+                    self.error("할당량 또는 호출 제한을 확인한 후 재개하세요. /usage refresh");
+                    return None;
+                }
                 self.queue_paused = false;
                 self.focus = None;
                 self.notify("대기열 자동 전송을 재개합니다.");
             }
             Action::Model(model) if !self.readonly && self.submitted.is_none() => {
                 if self.models.contains(&model) {
+                    let had_effort = self.effort.is_some();
                     self.model = model;
-                    self.notify("다음 메시지부터 선택한 모델을 사용합니다");
+                    self.reconcile_effort();
+                    if !(had_effort && self.effort.is_none()) {
+                        self.notify("다음 메시지부터 선택한 모델을 사용합니다");
+                    }
                     self.switch_view(View::Chat);
                 }
             }
@@ -1021,6 +1096,7 @@ impl App {
                     self.notice_error = false;
                     let text = self.editor.take_text();
                     let item = QueuedMessage {
+                        effort: self.effort.clone(),
                         text,
                         skills: std::mem::take(&mut self.selected_skills),
                         model: self.model.clone(),
@@ -1032,6 +1108,7 @@ impl App {
                         || !self.queued.is_empty()
                         || self.thread.is_none()
                         || self.queue_paused
+                        || self.execution_limit.is_some()
                     {
                         self.queued.push_back(item);
                         self.notify(format!("전송 대기열에 추가됨 · {}개", self.queued.len()));
@@ -1078,6 +1155,7 @@ impl App {
         self.submitted = Some(item.text.clone());
         self.submitted_skills = item.skills;
         self.submitted_model = Some(item.model);
+        self.submitted_effort = item.effort;
         self.status = "전송 중".into();
         self.follow = true;
         Intent::Submit(item.text)
@@ -1090,6 +1168,7 @@ impl App {
             || self.permission_pending.is_some()
             || self.force_after_interrupt.is_some()
             || self.queue_paused
+            || self.execution_limit.is_some()
             || self.thread.is_none()
             || !self.approvals.is_empty()
             || !self.input_forms.is_empty()
@@ -1114,6 +1193,7 @@ impl App {
     pub fn fail_submission(&mut self, message: impl Into<String>) {
         if let Some(text) = self.submitted.take() {
             self.queued.push_front(QueuedMessage {
+                effort: self.submitted_effort.take(),
                 text,
                 skills: std::mem::take(&mut self.submitted_skills),
                 model: self
@@ -1143,7 +1223,7 @@ impl App {
             Some("승인 요청을 처리한 후 대화를 전환할 수 있습니다.")
         } else if self.permission_pending.is_some() {
             Some("권한 변경이 완료된 후 대화를 전환할 수 있습니다.")
-        } else if !self.queued.is_empty() {
+        } else if !self.queued.is_empty() && self.thread.is_some() {
             Some("대기열을 전송하거나 /queue clear로 비운 후 대화를 전환하세요.")
         } else if self.busy && self.thread.is_none() {
             Some("세션 연결이 끝나면 전환할 수 있습니다.")
@@ -1325,6 +1405,36 @@ impl App {
                     }
                 } else {
                     self.error("사용법: /copy [N], /branch [N], /tool N [next|prev]");
+                }
+                None
+            }
+            "/effort" => {
+                self.switch_view(View::Models);
+                if !argument.is_empty() {
+                    self.select_effort(if argument == "runtime" { "" } else { argument });
+                }
+                None
+            }
+            "/usage" => {
+                self.activate(Action::Agents);
+                self.follow = false;
+                self.scroll = 0;
+                if argument == "refresh" {
+                    Some(Intent::RefreshUsage)
+                } else if argument.is_empty() {
+                    None
+                } else {
+                    self.error("사용법: /usage [refresh]");
+                    None
+                }
+            }
+            "/task" => {
+                if let Some(index) = command_index(argument)
+                    && let Some(task) = self.tasks.get(index)
+                {
+                    self.activate(Action::Task(task.id.clone()));
+                } else {
+                    self.error("사용법: /task N (1부터 시작)");
                 }
                 None
             }
@@ -1863,7 +1973,7 @@ impl App {
             },
             Tone::Normal,
         );
-        let mut header = Canvas::new(width.saturating_sub(if width >= 74 { 44 } else { 32 }), 1);
+        let mut header = Canvas::new(width.saturating_sub(19), 1);
         let (status_icon, status_tone) = if self.is_working() {
             (
                 ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"][self.animation_frame],
@@ -1878,26 +1988,42 @@ impl App {
             &format!(
                 "{} {}",
                 status_icon,
-                if self.input_forms.iter().any(|f| f.request.blocking) {
-                    "질문 답변 대기"
+                if !self.approvals.is_empty() {
+                    self.label("승인 대기")
+                } else if self.input_forms.iter().any(|f| f.request.blocking) {
+                    self.label("질문 답변 대기")
                 } else if !self.active_tasks.is_empty() && !self.busy {
-                    "LOCAL 탐색 중"
+                    if self.active_tasks.iter().all(|id| {
+                        self.tasks.iter().any(|t| {
+                            &t.id == id && t.worker == Some(crate::agent::WorkerKind::Local)
+                        })
+                    }) {
+                        self.working_phrase()
+                    } else {
+                        "작업 실행 중"
+                    }
+                } else if self.is_working() {
+                    self.working_phrase()
                 } else {
                     self.label(status_label(&self.status))
                 }
             ),
             status_tone,
         );
-        header.text(state_x, 0, &format!("  · {}", self.model), Tone::Muted);
+        header.text(
+            state_x,
+            0,
+            &format!(
+                "  · {}{}",
+                self.model,
+                self.effort
+                    .as_ref()
+                    .map(|effort| format!(" · {effort}"))
+                    .unwrap_or_default()
+            ),
+            Tone::Muted,
+        );
         c.blit(&header, 17, 0);
-        if width >= 74 && !self.readonly {
-            let action = Action::Sessions;
-            c.button(width - 26, 0, self.label("세션 ▾"), action.clone(), false);
-            if self.view == View::Sessions {
-                c.highlight(&action, Tone::Selected);
-            }
-        }
-        c.button(width - 11, 0, self.label("/ 명령"), Action::Menu, false);
         let mut nav = Canvas::new(width - 4, 1);
         let mut x: u16 = 0;
         let approvals_label = if self.approvals.is_empty() {
@@ -1928,11 +2054,7 @@ impl App {
                 Action::Command("/model".into()),
                 self.view == View::Models,
             ),
-            (
-                "도움말",
-                Action::Command("/help".into()),
-                self.view == View::Help,
-            ),
+            ("세션 ▾", Action::Sessions, self.view == View::Sessions),
             (
                 "설정",
                 Action::Command("/settings".into()),
@@ -2017,7 +2139,14 @@ impl App {
             self.chat_scroll_limit = max;
             *scroll = if *follow { max } else { (*scroll).min(max) };
             c.blit(
-                &paint_rows(&rows, *scroll, left_width, body_height, self.focus.as_ref()),
+                &paint_rows(
+                    &rows,
+                    *scroll,
+                    left_width,
+                    body_height,
+                    self.focus.as_ref(),
+                    &self.message_cache,
+                ),
                 0,
                 body_top,
             );
@@ -2036,6 +2165,7 @@ impl App {
                     left_width,
                     body_height,
                     self.focus.as_ref(),
+                    &self.message_cache,
                 ),
                 0,
                 body_top,
@@ -2068,6 +2198,7 @@ impl App {
                     side_width,
                     body_height,
                     self.focus.as_ref(),
+                    &self.message_cache,
                 ),
                 split + 1,
                 body_top,
@@ -2187,7 +2318,9 @@ impl App {
                 } else {
                     String::new()
                 },
-                if self.queue_paused {
+                if self.thread.is_none() {
+                    " · 세션 연결 대기 · /new"
+                } else if self.queue_paused {
                     if compact_queue {
                         " · 재개"
                     } else {
@@ -2327,6 +2460,7 @@ impl App {
             }
         }
         c.rule(composer_bottom, "");
+        self.paint_meter(&mut c, composer_bottom);
         let compact_footer = width < 70;
         c.text(
             2,
@@ -2550,7 +2684,8 @@ impl App {
             ));
             rows.push(("에이전트가 보고한 변경 내용".into(), Tone::Muted, None));
         }
-        if self.agents.is_empty() {
+        rows.extend(self.task_rows(width, false));
+        if self.agents.is_empty() && self.tasks.is_empty() {
             rows.push(("아직 하위 에이전트가 없습니다".into(), Tone::Muted, None));
         }
         for (index, agent) in self.agents.iter().enumerate() {
@@ -2587,6 +2722,7 @@ impl App {
                     width,
                     &self.tool_pages,
                     &self.message_cache,
+                    self.preferences.language,
                 );
             }
             View::Diff => {
@@ -2628,7 +2764,12 @@ impl App {
                 }
             }
             View::Agents => {
-                rows.push(("현재 세션의 에이전트".into(), Tone::Accent, None));
+                if self.selected_task.is_none() {
+                    rows.extend(self.meter_rows(width));
+                    rows.push((String::new(), Tone::Normal, None));
+                }
+                rows.extend(self.task_rows(width, true));
+                rows.push(("연결된 runtime 활동".into(), Tone::Accent, None));
                 if self.agents.is_empty() {
                     rows.push((
                         "아직 생성된 하위 에이전트가 없습니다.".into(),
@@ -2660,6 +2801,7 @@ impl App {
                     width,
                     &self.tool_pages,
                     &self.message_cache,
+                    self.preferences.language,
                 );
             }
             View::Help => {
@@ -3041,9 +3183,9 @@ impl App {
                             "첫 메시지 전 · 아직 저장되지 않았을 수 있음"
                         }
                     } else if english {
-                        "Closing the terminal keeps saved history; the runtime continues"
+                        "Closing stops owned work; saved history remains"
                     } else {
-                        "창을 닫아도 대화는 저장되고 서버 작업은 계속됨"
+                        "종료 시 실행을 정리하고 저장된 기록은 유지됨"
                     })
                     .into(),
                     Tone::Muted,
@@ -3053,7 +3195,7 @@ impl App {
                     if english {
                         "The next launch reopens your most recent conversation."
                     } else {
-                        "다음 실행 시 가장 최근 대화를 자동으로 다시 엽니다."
+                        "다음 실행 시 새 연결로 최근 기록을 다시 엽니다."
                     }
                     .into(),
                     Tone::Muted,
@@ -3215,6 +3357,8 @@ impl App {
                 }
             }
             View::Models => {
+                rows.extend(self.effort_rows(width));
+                rows.push((String::new(), Tone::Normal, None));
                 rows.push(("다음 메시지에 사용할 모델".into(), Tone::Accent, None));
                 if self.models.is_empty() {
                     rows.push(("모델 목록을 불러오는 중…".into(), Tone::Muted, None));
@@ -3328,6 +3472,7 @@ fn paint_rows(
     width: u16,
     height: u16,
     focus: Option<&Action>,
+    message_cache: &MessageCache,
 ) -> Canvas {
     let mut c = Canvas::new(width, height);
     for (y, (text, tone, action)) in rows
@@ -3338,6 +3483,10 @@ fn paint_rows(
     {
         let mut line = Canvas::new(width.saturating_sub(4), 1);
         if let Some(action) = action {
+            let target = match action {
+                Action::MessageRow(id, _, _) => Action::SelectEntry(id.clone()),
+                _ => action.clone(),
+            };
             if matches!(action, Action::Resume(_)) {
                 // A session is a selectable list row, including its smaller
                 // last-activity line. The full pane width is a click target.
@@ -3351,10 +3500,26 @@ fn paint_rows(
                     y: 0,
                     width: line.width,
                     height: if has_metadata { 2 } else { 1 },
-                    action: action.clone(),
+                    action: target.clone(),
                 });
-            } else if matches!(action, Action::SelectEntry(_)) {
-                document::paint(&mut line, text, *tone);
+            } else if matches!(action, Action::SelectEntry(_) | Action::MessageRow(_, _, _)) {
+                let cache = message_cache.borrow();
+                let styled = match action {
+                    Action::MessageRow(id, index, width) => cache
+                        .get(&(id.clone(), *width))
+                        .and_then(|entry| entry.rows.get(*index)),
+                    _ => None,
+                };
+                if let Some(styled) = styled {
+                    let prefix = if text.starts_with("● ") {
+                        "● "
+                    } else {
+                        "  "
+                    };
+                    document::paint_message(&mut line, styled, prefix);
+                } else {
+                    document::paint(&mut line, text, *tone);
+                }
                 if text.starts_with("› ") {
                     line.text(0, 0, "›", Tone::User);
                 } else if text.starts_with("● ") {
@@ -3366,7 +3531,7 @@ fn paint_rows(
                     width: unicode_width::UnicodeWidthStr::width(text.as_str())
                         .min(usize::from(line.width)) as u16,
                     height: 1,
-                    action: action.clone(),
+                    action: target.clone(),
                 });
             } else {
                 line.button(0, 0, text, action.clone(), false);
@@ -3393,8 +3558,8 @@ fn paint_rows(
                     line.text(1, 0, text, decision_tone);
                 }
             }
-            if focus == Some(action) {
-                line.highlight(action, Tone::Selected);
+            if focus == Some(&target) {
+                line.highlight(&target, Tone::Selected);
             }
         } else {
             document::paint(&mut line, text, *tone);
@@ -3409,8 +3574,37 @@ fn append_entries(
     width: usize,
     tool_pages: &HashMap<String, usize>,
     message_cache: &MessageCache,
+    language: Language,
 ) {
+    // An assistant's commentary, tools and final answer form one visual group.
+    // Start another group only on a speaker change, including consecutive user turns.
+    let mut loom_group = false;
     for entry in entries {
+        let is_loom = matches!(entry.kind, Kind::Assistant | Kind::Tool | Kind::Change);
+        if entry.kind == Kind::User || (is_loom && !loom_group) {
+            let label = if entry.kind == Kind::User {
+                if language == Language::English {
+                    "You"
+                } else {
+                    "사용자"
+                }
+            } else {
+                "Loom"
+            };
+            let start = format!("── {label} ");
+            let length = unicode_width::UnicodeWidthStr::width(start.as_str());
+            rows.push((
+                format!("{start}{}", "─".repeat(width.saturating_sub(length))),
+                if entry.kind == Kind::User {
+                    Tone::User
+                } else {
+                    Tone::Faint
+                },
+                None,
+            ));
+        }
+        loom_group = is_loom;
+
         match entry.kind {
             Kind::Tool | Kind::Change => {
                 let (symbol, state_tone) = item_style(&entry.status);
@@ -3500,21 +3694,21 @@ fn append_entries(
                         .entry((entry.id.clone(), width))
                         .or_insert_with(|| CachedMessage {
                             body: entry.body.clone(),
-                            rows: document::message_rows(&entry.body, width),
+                            rows: document::styled_message_rows(&entry.body, width),
                         });
                 if cached.body != entry.body {
                     cached.body.clone_from(&entry.body);
-                    cached.rows = document::message_rows(&entry.body, width);
+                    cached.rows = document::styled_message_rows(&entry.body, width);
                 }
-                append_message(rows, entry, &cached.rows);
+                append_message(rows, entry, &cached.rows, Some(width));
             }
             _ => {
                 let available = width.saturating_sub(if entry.kind == Kind::User { 12 } else { 2 });
                 let rendered: Vec<_> = wrap(&entry.body, available)
                     .into_iter()
-                    .map(|line| (line, Tone::Normal))
+                    .map(|line| document::StyledRow::plain(line, Tone::Normal))
                     .collect();
-                append_message(rows, entry, &rendered);
+                append_message(rows, entry, &rendered, None);
             }
         }
         rows.push((String::new(), Tone::Normal, None));
@@ -3523,18 +3717,22 @@ fn append_entries(
 fn append_message(
     rows: &mut Vec<(String, Tone, Option<Action>)>,
     entry: &Entry,
-    rendered: &[document::Row],
+    rendered: &[document::StyledRow],
+    cache_width: Option<usize>,
 ) {
     let marker = match entry.kind {
         Kind::User => "›",
         Kind::Assistant => "●",
         _ => "·",
     };
-    for (index, (line, tone)) in rendered.iter().enumerate() {
+    for (index, row) in rendered.iter().enumerate() {
+        let (line, tone) = (&row.text, row.tone);
         rows.push((
             format!("{} {}", if index == 0 { marker } else { " " }, line),
-            *tone,
-            if matches!(entry.kind, Kind::User | Kind::Assistant) {
+            tone,
+            if let Some(width) = cache_width {
+                Some(Action::MessageRow(entry.id.clone(), index, width))
+            } else if matches!(entry.kind, Kind::User | Kind::Assistant) {
                 Some(Action::SelectEntry(entry.id.clone()))
             } else {
                 None
@@ -3547,6 +3745,82 @@ fn append_message(
 mod tests {
     use super::*;
     use serde_json::json;
+    #[test]
+    fn markdown_display_keeps_copy_source_and_interactive_message_controls() {
+        let mut app = App::new(false);
+        let source = "## 제목\n\n**강조**와 `함수()`";
+        app.entries.push(Entry {
+            id: "markdown".into(),
+            kind: Kind::Assistant,
+            title: "Loom".into(),
+            body: source.into(),
+            status: "completed".into(),
+            expanded: false,
+        });
+        let canvas = app.render(80, 24);
+        let plain = (0..canvas.height)
+            .map(|y| canvas.plain_line(y))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            plain.contains("제목") && !plain.contains("## 제목") && !plain.contains("**강조**")
+        );
+        assert!(canvas.cells.iter().any(|cell| cell.tone == Tone::Strong));
+        assert!(canvas.cells.iter().any(|cell| cell.tone == Tone::InlineCode
+            && cell.background == crate::engine::Background::Code));
+        assert!(
+            canvas
+                .hits
+                .iter()
+                .any(|hit| hit.action == Action::SelectEntry("markdown".into()))
+        );
+        assert_eq!(
+            app.activate(Action::Copy("markdown".into())),
+            Some(Intent::Copy(source.into()))
+        );
+    }
+    #[test]
+    fn conversation_dividers_group_tools_and_follow_language_and_width() {
+        let mut app = App::new(false);
+        for (id, kind, body) in [
+            ("u1", Kind::User, "첫 요청"),
+            ("a1", Kind::Assistant, "살펴보겠습니다."),
+            ("t1", Kind::Tool, "output"),
+            ("a2", Kind::Assistant, "완료했습니다."),
+            ("u2", Kind::User, "다음 요청"),
+            ("a3", Kind::Assistant, "다음 응답"),
+        ] {
+            app.entries.push(Entry {
+                id: id.into(),
+                kind,
+                title: "rg example".into(),
+                body: body.into(),
+                status: "completed".into(),
+                expanded: false,
+            });
+        }
+        let rows = app.cached_chat_rows(36);
+        let bars: Vec<_> = rows.iter().filter(|row| row.0.starts_with("── ")).collect();
+        assert_eq!(
+            bars.len(),
+            4,
+            "tools and assistant continuations share a group"
+        );
+        assert_eq!(bars[0].1, Tone::User);
+        assert!(bars[1].0.contains("Loom"));
+        assert!(bars.iter().all(
+            |row| unicode_width::UnicodeWidthStr::width(row.0.as_str()) == 36 && row.2.is_none()
+        ));
+        app.activate(Action::Setting("english".into()));
+        let english = app.cached_chat_rows(36);
+        assert!(english.iter().any(|row| row.0.starts_with("── You ")));
+        assert!(!english.iter().any(|row| row.0.contains("── 사용자")));
+        assert!(
+            english
+                .iter()
+                .any(|row| matches!(&row.2, Some(Action::MessageRow(id, _, _)) if id == "a2"))
+        );
+    }
     #[test]
     fn pasted_blocks_display_as_atomic_chips_but_send_the_full_original_text() {
         let mut app = App::new(false);
@@ -3798,6 +4072,7 @@ mod tests {
         app.upsert(&json!({"id":"user","type":"userMessage","content":[{"text":"hello"}]}));
         app.upsert(&json!({"id":"assistant","type":"agentMessage","text":"world"}));
         app.queued.push_back(QueuedMessage {
+            effort: None,
             text: "next".into(),
             model: "test".into(),
             skills: vec![],
@@ -4311,6 +4586,7 @@ mod tests {
         a.thread = Some("main".into());
         for text in ["first", "second", "third"] {
             a.queued.push_back(QueuedMessage {
+                effort: None,
                 text: text.into(),
                 skills: vec![],
                 model: "test".into(),
@@ -4370,7 +4646,7 @@ mod tests {
             .map(|y| c.plain_line(y))
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(screen.contains("대화 기록 유지") && screen.contains("현재 세션의 에이전트"));
+        assert!(screen.contains("대화 기록 유지") && screen.contains("연결된 runtime 활동"));
         a.activate(Action::Input);
         a.key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE), &c);
         assert_eq!(a.view, View::Agents);
@@ -4877,7 +5153,7 @@ mod tests {
             Some(Intent::LoadMoreSessions("cursor".into()))
         );
         let canvas = app.render(80, 24);
-        assert!(canvas.plain_line(0).contains("세션"));
+        assert!(canvas.plain_line(1).contains("세션"));
         assert!(!canvas.plain_line(1).contains("기록"));
 
         app.busy = true;

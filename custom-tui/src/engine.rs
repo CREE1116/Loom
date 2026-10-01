@@ -14,6 +14,9 @@ use unicode_width::UnicodeWidthStr;
 pub enum Tone {
     #[default]
     Normal,
+    Strong,
+    Emphasis,
+    InlineCode,
     Muted,
     Faint,
     Accent,
@@ -48,12 +51,12 @@ impl Tone {
                 g: 117,
                 b: 130,
             },
-            Self::Accent => Color::Rgb {
+            Self::Accent | Self::Strong => Color::Rgb {
                 r: 117,
                 g: 200,
                 b: 230,
             },
-            Self::User => Color::Rgb {
+            Self::User | Self::Emphasis => Color::Rgb {
                 r: 172,
                 g: 190,
                 b: 245,
@@ -77,7 +80,7 @@ impl Tone {
             },
             Self::Selected | Self::Hover => Color::White,
             Self::Keyword => Color::Cyan,
-            Self::String => Color::Green,
+            Self::String | Self::InlineCode => Color::Green,
             Self::Number => Color::Magenta,
             Self::Comment => Color::DarkGrey,
             Self::Function => Color::Yellow,
@@ -124,6 +127,8 @@ pub struct Cell {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Action {
+    Effort(String),
+    Task(String),
     Questions,
     QuestionOption(usize),
     QuestionMove(bool),
@@ -155,6 +160,7 @@ pub enum Action {
     ResumeQueue,
     Model(String),
     SelectEntry(String),
+    MessageRow(String, usize, usize),
     Branch(String),
     Resume(String),
     Sessions,

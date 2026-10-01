@@ -28,6 +28,7 @@ pub fn open_agent_with_demo(
     thread: &str,
     demo: bool,
 ) -> Result<()> {
+    #[cfg(not(windows))]
     let text = if demo {
         format!(
             "{} --cwd {} --agent {} --demo",
@@ -53,7 +54,24 @@ pub fn open_agent_with_demo(
         }
         Ok(())
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        let mut command = Command::new(executable);
+        command.arg("--cwd").arg(cwd).arg("--agent").arg(thread);
+        if demo {
+            command.arg("--demo");
+        } else {
+            command.arg("--endpoint").arg(endpoint);
+        }
+        command
+            .current_dir(cwd)
+            .creation_flags(0x00000010)
+            .spawn()
+            .context("Cannot open agent console")?;
+        Ok(())
+    }
+    #[cfg(not(any(target_os = "macos", windows)))]
     {
         bail!(
             "Automatic window launching currently supports macOS Terminal.app. Run this in another terminal: {text}"
@@ -86,10 +104,16 @@ pub fn write_launcher(directory: &Path, command: &str) -> Result<std::path::Path
 pub fn copy(text: &str) -> Result<()> {
     #[cfg(target_os = "macos")]
     let mut command = Command::new("pbcopy");
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", windows)))]
     let mut command = Command::new("xclip");
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", windows)))]
     command.args(["-selection", "clipboard"]);
+    #[cfg(windows)]
+    let mut command = {
+        let mut command = Command::new("powershell.exe");
+        command.args(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", "[Console]::InputEncoding = [System.Text.UTF8Encoding]::new(); Set-Clipboard -Value ([Console]::In.ReadToEnd())"]);
+        command
+    };
     let mut child = command
         .stdin(Stdio::piped())
         .spawn()
@@ -107,9 +131,13 @@ pub fn copy(text: &str) -> Result<()> {
 pub fn paste() -> Result<String> {
     #[cfg(target_os = "macos")]
     let command = Command::new("pbpaste").output();
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", windows)))]
     let command = Command::new("xclip")
         .args(["-selection", "clipboard", "-o"])
+        .output();
+    #[cfg(windows)]
+    let command = Command::new("powershell.exe")
+        .args(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", "[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new(); [Console]::Write((Get-Clipboard -Raw))"])
         .output();
     let output = command.context("Clipboard unavailable")?;
     if !output.status.success() {

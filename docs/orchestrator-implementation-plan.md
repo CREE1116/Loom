@@ -349,7 +349,7 @@ Runtime Adapter는 model session 실행과 exec/tool/isolation/approval 등 서�
 
 처음부터 하지 않을 것: 네 모델 broadcast, worker 직접 대화, agent society, 매 턴 자동 요약, 모든 정보 vector DB화, FLAGSHIP speculation, 모델 merge 권한, session을 Source of Truth로 사용, custom runtime 일괄 재작성, 학습 router 우선 개발.
 
-현재 구현한 단위는 **MVP 1의 event/command 경계**, 비동기 LOCAL 공유 탐색, 작업 중 애니메이션, 질문 선택·직접 입력 경계다. [TUI 완성 계획](tui-completion-plan.md)에 화면 기능과 순서를 기록한다. UI는 provider JSON을 해석하지 않고, 승인 payload도 adapter가 소유한다. 기존 JSON fixture는 테스트에서만 adapter를 거쳐 재사용한다. Mock Core·로컬 WebSocket fixture·PTY로 현재 UI 흐름과 요청 경계를 검증한다.
+현재 구현한 단위는 **MVP 1의 event/command 경계**, 비동기 LOCAL 공유 탐색, 작업 중 애니메이션, 질문 선택·직접 입력 경계, ActivityTask projection과 LOCAL/Mock 활동 상세다. [TUI 완성 계획](tui-completion-plan.md)에 화면 기능과 순서를 기록한다. UI는 provider JSON을 해석하지 않고, 승인 payload도 adapter가 소유한다. 기존 JSON fixture는 테스트에서만 adapter를 거쳐 재사용한다. Mock Core·로컬 WebSocket fixture·PTY로 현재 UI 흐름과 요청 경계를 검증한다.
 
 공유 코드 탐색은 네 동시 소비자가 같은 index와 query result를 공유하는 검증을 포함한다. 아직 네 실제 원격 모델을 동시에 실행하거나 patch 충돌을 해결한다는 뜻은 아니다. 다음 구현 단위는 MVP 2의 durable CanonicalState·TaskGraph·WorkerTask/Result와 이 공유 자원의 연결이다.
 

@@ -8,9 +8,19 @@ use serde_json::{Value, json};
 use std::time::{Duration, Instant};
 
 pub fn probe(cwd: &std::path::Path, codex_bin: &str, endpoint: Option<&str>) -> Result<()> {
+    let owned = if endpoint.is_none() {
+        Some(runtime::ensure_owned(cwd, codex_bin)?)
+    } else {
+        None
+    };
     let info = match endpoint {
         Some(endpoint) => endpoint.to_owned(),
-        None => runtime::ensure(cwd, codex_bin)?.endpoint,
+        None => owned
+            .as_ref()
+            .expect("owned probe runtime")
+            .info
+            .endpoint
+            .clone(),
     };
     let mut first = Client::connect(&info)?;
     rpc(
@@ -85,8 +95,16 @@ pub fn probe(cwd: &std::path::Path, codex_bin: &str, endpoint: Option<&str>) -> 
         }
         std::thread::sleep(Duration::from_millis(10));
     }
+    backend.shutdown()?;
+    drop(backend);
+    drop(third);
+    let was_owned = owned.is_some();
+    drop(owned);
+    if was_owned && crate::transport::connect_socket(&info).is_ok() {
+        bail!("Owned runtime remains reachable after cleanup");
+    }
     println!(
-        "Real Codex handshake OK; shared two-client metadata OK; connection reopen OK; AgentEvent backend OK. No inference or tool execution.\nRuntime: {info}\nThread: {id}"
+        "Real Codex handshake OK; shared two-client metadata OK; connection reopen OK; AgentEvent backend OK; owned runtime cleanup OK. No inference or tool execution.\nRuntime: {info}\nThread: {id}"
     );
     Ok(())
 }

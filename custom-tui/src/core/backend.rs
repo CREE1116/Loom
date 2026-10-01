@@ -6,15 +6,26 @@ use std::{
     collections::{HashMap, VecDeque},
     path::Path,
     sync::{Arc, mpsc},
+    time::Instant,
 };
+
+struct LocalJob {
+    scope: Option<String>,
+    projection: ActivityTask,
+    started: Instant,
+}
+struct ExploreOutput {
+    body: String,
+    references: Vec<String>,
+}
 
 pub struct CoreBackend {
     remote: Box<dyn AgentBackend>,
     repository: Arc<RepositoryExplorer>,
     events: VecDeque<AgentEvent>,
-    results_tx: mpsc::Sender<(String, Result<String, String>)>,
-    results_rx: mpsc::Receiver<(String, Result<String, String>)>,
-    tasks: HashMap<String, Option<String>>,
+    results_tx: mpsc::Sender<(String, Result<ExploreOutput, String>)>,
+    results_rx: mpsc::Receiver<(String, Result<ExploreOutput, String>)>,
+    tasks: HashMap<String, LocalJob>,
     session: Option<String>,
     may_read_workspace: bool,
     serial: u64,
@@ -64,8 +75,29 @@ impl AgentBackend for CoreBackend {
         self.serial += 1;
         let id = format!("local-explore-{}", self.serial);
         let scope = self.session.clone();
-        self.tasks.insert(id.clone(), scope.clone());
+        let projection = ActivityTask {
+            id: id.clone(),
+            parent: None,
+            title: format!("공유 코드 탐색: {query}"),
+            worker: Some(WorkerKind::Local),
+            status: TaskStatus::Running,
+            dependencies: vec![],
+            reason: None,
+            critical: false,
+            elapsed_ms: None,
+            inputs: vec![format!("Query: {query}")],
+            outputs: vec![],
+        };
+        self.tasks.insert(
+            id.clone(),
+            LocalJob {
+                scope: scope.clone(),
+                projection: projection.clone(),
+                started: Instant::now(),
+            },
+        );
         self.emit(scope.clone(), AgentUpdate::TaskStarted { id: id.clone() });
+        self.emit(scope.clone(), AgentUpdate::TaskUpdated(projection));
         self.emit(
             scope,
             AgentUpdate::EntryUpdated(Entry {
@@ -84,10 +116,17 @@ impl AgentBackend for CoreBackend {
                 .explore(&query, 4096)
                 .map(|r| {
                     let (builds, searches) = repository.counts();
-                    format!(
-                        "{}\nAPI 호출 0 · index builds {builds} · unique searches {searches}",
-                        r.compact()
-                    )
+                    ExploreOutput {
+                        body: format!(
+                            "{}\nAPI 호출 0 · index builds {builds} · unique searches {searches}",
+                            r.compact()
+                        ),
+                        references: r
+                            .evidence
+                            .iter()
+                            .map(|item| item.reference.clone())
+                            .collect(),
+                    }
                 })
                 .map_err(|error| error.to_string());
             let _ = tx.send((id, result));
@@ -95,20 +134,36 @@ impl AgentBackend for CoreBackend {
         Ok(())
     }
 
+    fn shutdown(&mut self) -> Result<()> {
+        self.remote.shutdown()
+    }
+
     fn poll(&mut self) -> Result<Option<AgentEvent>> {
         if let Some(event) = self.events.pop_front() {
             return Ok(Some(event));
         }
         if let Ok((id, result)) = self.results_rx.try_recv() {
-            if let Some(scope) = self.tasks.remove(&id) {
+            if let Some(mut job) = self.tasks.remove(&id) {
+                let scope = job.scope;
                 if scope != self.session {
                     self.emit(scope, AgentUpdate::TaskCompleted { id });
                     return Ok(self.events.pop_front());
                 }
                 let (body, status) = match result {
-                    Ok(body) => (body, "completed"),
-                    Err(error) => (error, "failed"),
+                    Ok(output) => {
+                        job.projection.status = TaskStatus::Completed;
+                        job.projection.outputs = output.references;
+                        (output.body, "completed")
+                    }
+                    Err(error) => {
+                        job.projection.status = TaskStatus::Failed;
+                        job.projection.reason = Some(error.clone());
+                        (error, "failed")
+                    }
                 };
+                job.projection.elapsed_ms =
+                    Some(job.started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64);
+                self.emit(scope.clone(), AgentUpdate::TaskUpdated(job.projection));
                 self.emit(
                     scope.clone(),
                     AgentUpdate::EntryUpdated(Entry {

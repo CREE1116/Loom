@@ -29,10 +29,15 @@ pub fn connect_socket(endpoint: &str) -> Result<WebSocket<TcpStream>> {
     let stream = TcpStream::connect(address).context("Connecting to Codex runtime")?;
     // Requests share the reader thread; a long read timeout also delays outgoing
     // keystroke-triggered requests when the server is otherwise quiet.
-    stream.set_read_timeout(Some(Duration::from_millis(10)))?;
+    // The WebSocket upgrade needs a startup timeout; the short polling timeout
+    // applies only after the handshake, otherwise cold servers fail with WouldBlock.
+    stream.set_read_timeout(Some(Duration::from_secs(3)))?;
     stream.set_write_timeout(Some(Duration::from_secs(3)))?;
     let (socket, _) = tungstenite::client(endpoint, stream)
         .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    socket
+        .get_ref()
+        .set_read_timeout(Some(Duration::from_millis(10)))?;
     Ok(socket)
 }
 impl Client {
@@ -119,5 +124,32 @@ impl Client {
     }
     pub fn reject(&self, id: Value, message: &str) -> Result<()> {
         self.send(json!({"id":id,"error":{"code":-32601,"message":message}}))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn dropping_client_releases_the_socket_and_reader_thread() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("ws://{}", listener.local_addr().unwrap());
+        let (closed, result) = mpsc::channel();
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut socket = tungstenite::accept(stream).unwrap();
+            let disconnected = matches!(
+                socket.read(),
+                Ok(Message::Close(_)) | Err(tungstenite::Error::ConnectionClosed)
+            );
+            closed.send(disconnected).unwrap();
+        });
+        let client = Client::connect(&endpoint).unwrap();
+        drop(client);
+        assert!(result.recv_timeout(Duration::from_secs(3)).unwrap());
+        server.join().unwrap();
     }
 }

@@ -8,7 +8,7 @@
 
 Loom is a coding agent CLI built around one Orchestrator Core. Its goal is to combine local computation and model sessions of different costs and capabilities, reuse what has already been learned, and finish coding tasks with less API spend and waiting time.
 
-**Status: early implementation.** The terminal UI, typed UI/Core boundary, question forms and shared local repository explorer are working. Remote coding currently uses a Codex adapter. The full multi-worker scheduler, durable state, patch isolation, long-term retrieval and OpenRouter routing are still planned. API savings and quality parity have not yet been benchmarked.
+**Status: early implementation.** The terminal UI, typed UI/Core boundary, question forms, activity projections and shared local repository explorer are working. Remote coding currently uses a Codex adapter. The full multi-worker scheduler, durable state, patch isolation, long-term retrieval and OpenRouter routing are still planned. API savings and quality parity have not yet been benchmarked.
 
 ## Why Loom
 
@@ -33,13 +33,15 @@ The success criterion is maintained task quality with lower API cost, wall-clock
 | Terminal UI | Streaming conversation, Unicode editing, multiline paste, keyboard/mouse navigation, responsive panels, resizing and terminal restoration |
 | UI/Core boundary | Typed `AgentEvent` and `AgentCommand`; provider JSON and approval payloads stay in backend adapters |
 | Questions | Explicit options, descriptions, custom text, multiple questions, masked secret input, hide/reopen, validation and duplicate-submission protection |
-| Execution feedback | An animated working indicator during silent execution; pauses for approvals, blocking questions, completion and connection errors |
+| Execution feedback | A spinner and 32 phrases selected by observed reasoning, output, exploration, tests, patches and tools; paused for blocking input and completion |
 | Session controls | Codex-backed session listing, switching, new conversations, forking and reopening a workspace's recent conversation |
 | Task interaction | Message queue, interruption, queue promotion, permission/trust controls, tool-output pages and reported diff review |
+| Activity inspector | Typed task/worker/status projections, waiting reasons, Core-provided critical markers and task details; real LOCAL events plus a Mock TaskGraph |
 | Native LOCAL work | Interactive `/explore QUERY` and offline `--explore QUERY`, sharing one repository index and query cache within a Core instance |
+| Model and usage controls | Runtime-advertised effort choices, per-message model/effort snapshots, reported tokens/cached input/quota, queue stop on explicit limits |
 | Verification | Local protocol fixtures, Rust regression tests, PTY interaction tests and a real-runtime probe without inference |
 
-The Activity panel currently shows transitional Codex activities. Dependency graphs, critical-path display, worker routing explanations and a cost profiler are planned. The panel remains optional for normal use.
+The Activity panel displays native task projections alongside transitional Codex activities. LOCAL exploration provides real status, elapsed time and evidence references. A Mock TaskGraph exercises dependencies and Core-provided critical markers; real multi-worker scheduling, routing explanations and a cost profiler remain planned. The panel remains optional for normal use.
 
 ### Shared exploration, without duplicate searches
 
@@ -60,9 +62,9 @@ Individual files above 512 KiB and binary/invalid UTF-8 files are excluded. `.gi
 
 - A stable Rust toolchain with Cargo, plus Git and ripgrep (`rg`).
 - A terminal supporting UTF-8 and normal ANSI terminal interaction.
-- For **remote coding only**, an installed and authenticated Codex CLI. The adapter has been checked against `codex-cli 0.151.0`; compatibility with every release is not assumed.
+- For **remote coding only**, an installed and authenticated Codex CLI. The adapter has been checked against `codex-cli 0.151.0` and `0.159.3` protocols; compatibility with every release is not assumed.
 
-Demo mode and offline exploration do not require Codex or API credentials. macOS is locally verified; CI is configured for macOS and Linux. Separate-window launching currently targets macOS Terminal.app. Linux clipboard integration requires `xclip`; macOS uses `pbcopy`/`pbpaste`. Windows support is not currently verified.
+Demo mode and offline exploration do not require Codex or API credentials. macOS is locally verified; CI is configured for macOS, Linux and Windows. Separate-window launching targets macOS Terminal.app and Windows consoles. Linux clipboard integration requires `xclip`; macOS uses `pbcopy`/`pbpaste`. Windows launcher, npm shim discovery, clipboard and separate-console paths are implemented. Windows CI checks compilation and a runtime probe without inference; interactive Windows console behavior remains an additional validation target.
 
 ```sh
 git clone https://github.com/CREE1116/Loom.git
@@ -107,7 +109,30 @@ The internal crate/binary is currently named `custom-tui`; `scripts/loom` is the
 
 Normal startup reopens the workspace's recent saved conversation when available. Session restoration currently relies on Codex history; it is not yet recovery from Loom's own Canonical State. Runtime metadata, recent-session pointers and UI preferences live in the workspace's `.custom-tui/` directory. Existing Codex authentication is reused.
 
+### Windows launch
+
+```powershell
+# Install Rust, Git and ripgrep, then reopen the terminal.
+.\scripts\loom.cmd --demo
+.\scripts\loom.cmd --cwd C:\projects\my-app --explore refresh_session
+
+# Remote coding additionally requires Codex installation and authentication.
+npm.cmd install -g @openai/codex
+codex.cmd login
+.\scripts\loom.cmd --cwd C:\projects\my-app
+```
+
+The CMD entry forwards arguments to the PowerShell launcher. If Codex is missing, reopen your terminal or use `--codex-bin` with its native executable or npm entry point. WSL/Git Bash can use the shell launcher.
+
 ## Using the TUI
+
+Session follows Model in the navigation row. `/` opens command search; `/help` remains available. Labeled dividers separate user turns from Loom responses, while commentary, tools and the final answer stay in the same response group. Markdown headings, emphasis, lists, links, tables and code blocks render within the pane width; narrow tables become stacked records. Copy and branch retain the original source.
+
+`/effort high` selects a runtime-advertised effort. `/effort default` selects the model default; `/effort runtime` inherits the effective runtime setting. Codex effort overrides also affect subsequent turns. Queue entries preserve their selected model and effort.
+
+Token summaries appear below the composer; `/usage` shows reported counters and quota. Unknown metrics and API cost remain unmeasured. Explicit quota exhaustion or rate limits pause remote submission without discarding queued instructions. Refresh with `/usage refresh`, then manually resume with `/queue resume` when available.
+
+Closing the main Loom requests interruption and detaches its session, then stops the runtime process tree it started. Saved history remains available through a fresh connection next launch. Closing a read-only viewer does not interrupt main work. External `--endpoint` servers are not terminated. One managed main window owns each workspace.
 
 The main view is a conversation with an input composer fixed at the bottom. Wide terminals can show an optional Activity/detail panel alongside it; narrow terminals use a separate detail view. Opening details preserves your draft and reading position.
 
@@ -124,6 +149,7 @@ The main view is a conversation with an input composer fixed at the bottom. Wide
 | Local evidence search | `/explore QUERY` |
 | Reopen a hidden question | `/questions` or the question notification |
 | Sessions / new conversation | `/sessions`, `/new` |
+| Activity / task details | `/agents`, `/task N` |
 | Reported changes / tool output | `/diff`, `/tool N` |
 | Approvals / permission policy | `/approvals`, `/permissions` |
 | Queue controls | `/queue drop N`, `/queue force N`, `/queue resume`, `/queue clear` |
@@ -136,7 +162,9 @@ A question card has its own drafts, separate from the conversation composer. Use
 
 A highlighted default is **not** a submitted answer. Esc or “later” hides the card without answering it; `/questions` reopens it. Failed submissions retain the answers for retry. Secret inputs are masked on screen. Blocking questions pause the working indicator, while nonblocking questions leave execution running. Timers do not automatically submit defaults.
 
-To try this without a model, run `--demo`, resolve the sample approval, then send **`질문 데모`** (“question demo”). The trigger text is currently Korean even when UI language is set to English; some question/interface labels still need full localization.
+To try this without a model, run `--demo`, resolve the sample approval, then send **`질문 데모`** (“question demo”). The trigger text is currently Korean even when UI language is set to English; some question/activity/interface labels still need full localization.
+
+For the activity fixture, resolve the sample approval and send **`활동 데모`** (“activity demo”), then open `/agents` or `/task 4`. It demonstrates worker labels, dependency waiting and cancellation; it does not launch remote worker models.
 
 The [detailed TUI guide](custom-tui/README.md) is currently in Korean and includes command variants, session rules and runtime behavior.
 
@@ -159,7 +187,7 @@ The native Core currently owns shared exploration and its LOCAL jobs. Codex stil
 | Module | Responsibility |
 | --- | --- |
 | `custom-tui/src/agent.rs` | Typed UI/Core commands, events, projections and question contracts |
-| `custom-tui/src/app/` | Event reduction and independent question-form state |
+| `custom-tui/src/app/` | Event reduction, question-form state and task/activity inspection |
 | `custom-tui/src/app.rs` | Conversation state, input/actions and UI composition |
 | `custom-tui/src/engine.rs` | Cells, Unicode layout, incremental painting and hit regions |
 | `custom-tui/src/core/` | Native LOCAL execution, repository snapshots and shared query results |
@@ -201,7 +229,7 @@ The LOCAL cache is working infrastructure, not proof of a measured reduction in 
 The immediate priority is a complete TUI with durable interaction boundaries, followed by native Core ownership.
 
 1. **Question/input interaction:** implemented and tested; continue localization and usability refinements.
-2. **Activity inspection:** task/worker status, dependencies, waiting reasons and progressive detail; mock TaskGraph first, real Core events next.
+2. **Activity inspection:** initial task projections, waiting reasons, Core-provided critical markers and details implemented for LOCAL and Mock TaskGraph; connect the full scheduler when available.
 3. **Recovery and session experience:** explicit reconnect/error recovery, preserved unsent work and improved review/navigation.
 4. **Single Worker Core:** TaskGraph, durable Canonical State, WorkerTask/Result, revision handling and event bus.
 5. **Native worker execution:** LOCAL tools, persistent remote sessions and independent-task scheduling.

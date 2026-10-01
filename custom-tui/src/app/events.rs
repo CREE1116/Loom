@@ -8,6 +8,7 @@ impl App {
                 request_id: id.clone(),
                 answers: answers.clone(),
             },
+            Intent::RefreshUsage => AgentCommand::RefreshUsage,
             Intent::Explore(query) => AgentCommand::Explore(query.clone()),
             Intent::Submit(text) => AgentCommand::Submit {
                 text: text.clone(),
@@ -17,6 +18,7 @@ impl App {
                     .unwrap_or(&self.model)
                     .into(),
                 skills: self.submitted_skills.clone(),
+                effort: self.submitted_effort.clone(),
             },
             Intent::Interrupt => AgentCommand::Interrupt,
             Intent::Reply(id, choice) => AgentCommand::Reply {
@@ -54,6 +56,17 @@ impl App {
             return;
         }
         match event.update {
+            AgentUpdate::ModelProfilesLoaded(profiles) => {
+                self.model_profiles = profiles;
+                self.reconcile_effort();
+            }
+            AgentUpdate::EffortObserved(effort) => self.runtime_effort = effort,
+            AgentUpdate::WorkPhaseUpdated(phase) => self.work_phase = phase,
+            AgentUpdate::TokenUsageUpdated(usage) => self.set_tokens(usage),
+            AgentUpdate::QuotaUpdated(quota) => self.update_quota(quota),
+            AgentUpdate::ExecutionLimited { kind, reason } => self.execution_limited(kind, reason),
+            AgentUpdate::ExecutionLimitCleared => self.clear_execution_limit(),
+            AgentUpdate::TaskUpdated(task) => self.update_task(task),
             AgentUpdate::InputRequested(request) => self.input_requested(request),
             AgentUpdate::InputResolved(id) => self.input_resolved(&id),
             AgentUpdate::InputReplyFailed { id, reason } => self.input_reply_failed(&id, &reason),
@@ -70,12 +83,24 @@ impl App {
                 permissions,
             } => {
                 if switching {
+                    // Recovery from a failed initial connection is still the same
+                    // unsent conversation. Normal session switches stay isolated.
+                    let unsent = if self.thread.is_none() {
+                        Some((std::mem::take(&mut self.queued), self.queue_paused))
+                    } else {
+                        None
+                    };
                     self.reset_session_view();
+                    if let Some((unsent, paused)) = unsent {
+                        self.queued = unsent;
+                        self.queue_paused = paused || self.execution_limit.is_some();
+                    }
                 }
                 self.set_session(snapshot);
                 self.apply_permissions(permissions, false);
                 if let Some(model) = model {
                     self.model = model;
+                    self.reconcile_effort();
                 }
             }
             AgentUpdate::TurnStarted { id } => {
@@ -83,6 +108,7 @@ impl App {
                 self.selected_diff_entry = None;
                 self.recent_change_ids.clear();
                 self.turn = id;
+                self.work_phase = crate::agent::WorkPhase::Thinking;
                 self.status = "실행 중".into();
                 self.busy = true;
             }
@@ -90,6 +116,7 @@ impl App {
                 self.submitted = None;
                 self.submitted_skills.clear();
                 self.submitted_model = None;
+                self.submitted_effort = None;
                 if !id
                     .as_ref()
                     .is_some_and(|id| self.finished_turns.contains(id))
@@ -120,13 +147,31 @@ impl App {
                 } else if status != "completed" {
                     self.queue_paused = !self.queued.is_empty();
                 }
-                self.status = status;
+                self.status = if self.execution_limit.is_some() {
+                    "원격 실행 제한 · 중단됨".into()
+                } else {
+                    status
+                };
                 if let Some(error) = error {
                     self.error(error);
                 }
             }
-            AgentUpdate::EntryUpdated(entry) => self.upsert_entry(entry),
+            AgentUpdate::EntryUpdated(entry) => {
+                if entry.status == "inProgress" {
+                    self.work_phase = if matches!(entry.kind, Kind::Tool | Kind::Change) {
+                        crate::agent::WorkPhase::Tool
+                    } else {
+                        crate::agent::WorkPhase::Writing
+                    };
+                }
+                self.upsert_entry(entry);
+            }
             AgentUpdate::EntryDelta { id, kind, text } => {
+                self.work_phase = if kind == Kind::Tool {
+                    crate::agent::WorkPhase::Tool
+                } else {
+                    crate::agent::WorkPhase::Writing
+                };
                 if !self.entries.iter().any(|entry| entry.id == id) {
                     self.upsert_entry(Entry {
                         id: id.clone(),
@@ -235,7 +280,15 @@ impl App {
             AgentUpdate::UsageUpdated(usage) => self.usage = usage,
             AgentUpdate::DiffUpdated(diff) => self.diff = diff,
             AgentUpdate::StatusUpdated { status, busy } => {
-                self.status = status;
+                self.status = if self.execution_limit.is_some() {
+                    if busy {
+                        "원격 실행 제한 · 종료 대기".into()
+                    } else {
+                        "원격 실행 제한 · 중단됨".into()
+                    }
+                } else {
+                    status
+                };
                 self.busy = busy;
             }
             AgentUpdate::OperationStarted { id, operation } => {
@@ -322,6 +375,10 @@ impl App {
         let trust = self.workspace_trust;
         let restricted = self.restricted_workspace;
         let pending = std::mem::take(&mut self.pending);
+        let profiles = std::mem::take(&mut self.model_profiles);
+        let effort = self.effort.clone();
+        let quotas = std::mem::take(&mut self.quotas);
+        let execution_limit = self.execution_limit;
         *self = App::new(false);
         self.panel_open = preferences.panel_open;
         self.preferences = preferences;
@@ -334,6 +391,10 @@ impl App {
         self.workspace_trust = trust;
         self.restricted_workspace = restricted;
         self.pending = pending;
+        self.model_profiles = profiles;
+        self.effort = effort;
+        self.quotas = quotas;
+        self.execution_limit = execution_limit;
     }
 
     fn set_session(&mut self, snapshot: SessionSnapshot) {

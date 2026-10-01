@@ -26,6 +26,7 @@ struct Pending {
     operation: Operation,
     scope: Option<String>,
     generation: Option<u64>,
+    effort: Option<String>,
 }
 
 struct PendingApproval {
@@ -52,12 +53,16 @@ pub struct CodexBackend {
     turn: Option<String>,
     finished_turns: HashSet<String>,
     models: Vec<String>,
+    profiles: Vec<ModelProfile>,
+    profile_page: Vec<ModelProfile>,
     entries: HashMap<String, Entry>,
     generation: u64,
     initialized: bool,
     trust_pending: bool,
     restricted: bool,
     busy: bool,
+    execution_limit: Option<LimitKind>,
+    closing: bool,
 }
 
 impl CodexBackend {
@@ -76,12 +81,16 @@ impl CodexBackend {
             turn: None,
             finished_turns: HashSet::new(),
             models: vec![],
+            profiles: vec![],
+            profile_page: vec![],
             entries: HashMap::new(),
             generation: 0,
             initialized: false,
             trust_pending,
             restricted: false,
             busy: false,
+            execution_limit: None,
+            closing: false,
         };
         if trust_pending {
             backend.emit(AgentUpdate::TrustRequired(
@@ -119,6 +128,7 @@ impl CodexBackend {
                 operation,
                 scope,
                 generation: session_bound.then_some(self.generation),
+                effort: None,
             },
         );
         self.emit(AgentUpdate::OperationStarted { id, operation });
@@ -130,12 +140,40 @@ impl CodexBackend {
         operation: Operation,
         session_bound: bool,
     ) -> Result<()> {
+        let effort = params["effort"].as_str().map(str::to_owned);
         let id = self.client.request(method, params)?;
         self.track(id, method, operation, self.session.clone(), session_bound);
+        if operation == Operation::Submit {
+            self.pending.get_mut(&id).expect("tracked request").effort = effort;
+        }
         Ok(())
     }
     fn in_flight(&self, operation: Operation) -> bool {
         self.pending.values().any(|p| p.operation == operation)
+    }
+
+    fn apply_quotas(&mut self, value: &Value) {
+        for quota in codec::quota_snapshots(value) {
+            let relevant = quota.model.as_ref().is_none_or(|model| {
+                self.options
+                    .model
+                    .as_ref()
+                    .is_none_or(|selected| selected == model)
+            });
+            if relevant {
+                if let Some(kind) = quota.reached {
+                    self.execution_limit = Some(kind);
+                    self.emit(AgentUpdate::ExecutionLimited {
+                        kind,
+                        reason: format!("{}: runtime이 사용 제한을 보고했습니다.", quota.label),
+                    });
+                } else if self.execution_limit.is_some() && quota.can_resume() {
+                    self.execution_limit = None;
+                    self.emit(AgentUpdate::ExecutionLimitCleared);
+                }
+            }
+            self.emit(AgentUpdate::QuotaUpdated(quota));
+        }
     }
 
     fn open_session(&mut self, requested: Option<String>, switching: bool) -> Result<()> {
@@ -231,6 +269,9 @@ impl CodexBackend {
                     )));
                 }
             } else {
+                if method == "account/rateLimits/updated" {
+                    self.apply_quotas(params);
+                }
                 if method == "skills/changed" {
                     self.request(
                         "skills/list",
@@ -254,6 +295,9 @@ impl CodexBackend {
                 for event in codec::notification(method, params) {
                     if current {
                         match &event.update {
+                            AgentUpdate::ExecutionLimited { kind, .. } => {
+                                self.execution_limit = Some(*kind)
+                            }
                             AgentUpdate::EntryUpdated(entry) => {
                                 self.entries.insert(entry.id.clone(), entry.clone());
                             }
@@ -296,15 +340,25 @@ impl CodexBackend {
             let error = message["error"]["message"].as_str().unwrap_or("RPC failed");
             if pending.method == "thread/resume"
                 && self.options.auto_restore
-                && ["not materialized", "not found", "does not exist"]
-                    .iter()
-                    .any(|s| error.contains(s))
+                && [
+                    "not materialized",
+                    "not found",
+                    "does not exist",
+                    "already has an active writer",
+                ]
+                .iter()
+                .any(|s| error.contains(s))
             {
                 self.options.auto_restore = false;
-                runtime::forget_recent_thread(&self.options.cwd)?;
-                self.emit(AgentUpdate::Notice(
-                    "최근 대화가 저장되지 않아 새 대화를 시작합니다.".into(),
-                ));
+                let occupied = error.contains("already has an active writer");
+                if !occupied {
+                    runtime::forget_recent_thread(&self.options.cwd)?;
+                }
+                self.emit(AgentUpdate::Notice(if occupied {
+                    "최근 대화는 다른 프로세스가 사용 중입니다. 기존 기록을 보존하고 별도 대화를 시작합니다.".into()
+                } else {
+                    "최근 대화가 저장되지 않아 새 대화를 시작합니다.".into()
+                }));
                 return self.open_session(None, false);
             }
             if matches!(
@@ -335,6 +389,7 @@ impl CodexBackend {
                 }
             }
             let update = match pending.operation {
+                Operation::Usage => AgentUpdate::Notice("할당량 정보를 조회할 수 없습니다. 현재 runtime/provider에서 지원하지 않을 수 있습니다.".into()),
                 Operation::Trust => {
                     AgentUpdate::TrustFailed(format!("폴더 신뢰 설정 실패: {error}"))
                 }
@@ -351,6 +406,12 @@ impl CodexBackend {
                 _ => AgentUpdate::Error(error.into()),
             };
             self.emit(update);
+            if pending.operation == Operation::Submit
+                && let Some((kind, reason)) = codec::execution_limit(&message["error"])
+            {
+                self.execution_limit = Some(kind);
+                self.scoped(AgentUpdate::ExecutionLimited { kind, reason });
+            }
             if matches!(
                 pending.operation,
                 Operation::SwitchSession | Operation::OpenSession
@@ -365,6 +426,7 @@ impl CodexBackend {
         }
         let result = &message["result"];
         match pending.operation {
+            Operation::Usage => self.apply_quotas(result),
             Operation::Initialize => {
                 self.initialized = true;
                 self.client.send(json!({"method":"initialized"}))?;
@@ -384,6 +446,12 @@ impl CodexBackend {
                     false,
                 )?;
                 self.request("model/list", json!({"limit":100}), Operation::Models, false)?;
+                self.request(
+                    "account/rateLimits/read",
+                    json!({}),
+                    Operation::Usage,
+                    false,
+                )?;
             }
             Operation::Config => self.emit(AgentUpdate::PermissionsUpdated {
                 permissions: codec::permissions(&result["config"], true),
@@ -407,6 +475,18 @@ impl CodexBackend {
                 self.emit(AgentUpdate::SkillsLoaded { skills, errors });
             }
             Operation::Models => {
+                for profile in codec::model_profiles(result) {
+                    if let Some(old) = self
+                        .profile_page
+                        .iter_mut()
+                        .find(|old| old.id == profile.id)
+                    {
+                        *old = profile;
+                    } else {
+                        self.profile_page.push(profile);
+                    }
+                }
+
                 if let Some(models) = result["data"].as_array() {
                     for model in models {
                         if let Some(name) = model["model"].as_str().or_else(|| model["id"].as_str())
@@ -424,6 +504,9 @@ impl CodexBackend {
                         Operation::Models,
                         false,
                     )?;
+                } else {
+                    self.profiles = std::mem::take(&mut self.profile_page);
+                    self.emit(AgentUpdate::ModelProfilesLoaded(self.profiles.clone()));
                 }
             }
             Operation::OpenSession | Operation::SwitchSession | Operation::History => {
@@ -471,6 +554,9 @@ impl CodexBackend {
                     model: self.options.model.clone(),
                     permissions: codec::permissions(result, false),
                 });
+                self.scoped(AgentUpdate::EffortObserved(
+                    result["reasoningEffort"].as_str().map(str::to_owned),
+                ));
                 if pending.method == "thread/fork" {
                     self.emit(AgentUpdate::Notice(
                         "새 분기 시작 · 원본 대화는 기록에 남습니다".into(),
@@ -478,6 +564,9 @@ impl CodexBackend {
                 }
             }
             Operation::Submit => {
+                if let Some(effort) = pending.effort {
+                    self.scoped(AgentUpdate::EffortObserved(Some(effort)));
+                }
                 if !self.options.readonly
                     && let Some(id) = &self.session
                 {
@@ -515,7 +604,7 @@ impl CodexBackend {
                         .collect(),
                 });
             }
-            Operation::Interrupt => {}
+            Operation::Interrupt | Operation::CloseSession => {}
         }
         Ok(())
     }
@@ -523,6 +612,9 @@ impl CodexBackend {
 
 impl AgentBackend for CodexBackend {
     fn command(&mut self, command: AgentCommand) -> Result<()> {
+        if self.closing {
+            bail!("Session is closing");
+        }
         if self.options.readonly
             && !matches!(
                 command,
@@ -531,11 +623,22 @@ impl AgentBackend for CodexBackend {
                     | AgentCommand::MoreSessions(_)
                     | AgentCommand::RefreshSkills
                     | AgentCommand::RefreshModels
+                    | AgentCommand::RefreshUsage
             )
         {
             bail!("열람 창에서는 실행을 변경할 수 없습니다.");
         }
         match command {
+            AgentCommand::RefreshUsage => {
+                if !self.in_flight(Operation::Usage) {
+                    self.request(
+                        "account/rateLimits/read",
+                        json!({}),
+                        Operation::Usage,
+                        false,
+                    )?;
+                }
+            }
             AgentCommand::Answer {
                 request_id,
                 answers,
@@ -580,8 +683,28 @@ impl AgentBackend for CodexBackend {
                 text,
                 model,
                 skills,
+                effort,
             } => {
-                let result = if self.trust_pending
+                let selected_model = if model.is_empty() {
+                    self.options.model.as_deref().unwrap_or("")
+                } else {
+                    &model
+                };
+                let effort_valid = effort.as_ref().is_none_or(|effort| {
+                    self.profiles.iter().any(|profile| {
+                        profile.id == selected_model
+                            && profile.efforts.iter().any(|option| &option.value == effort)
+                    })
+                });
+                let result = if !effort_valid {
+                    Err(anyhow::anyhow!(
+                        "선택한 모델이 지원하지 않는 reasoning effort입니다."
+                    ))
+                } else if self.execution_limit.is_some() {
+                    Err(anyhow::anyhow!(
+                        "원격 사용량이 제한되었습니다. /usage refresh로 확인하세요."
+                    ))
+                } else if self.trust_pending
                     || self.busy
                     || !self.approvals.is_empty()
                     || !self.inputs.is_empty()
@@ -592,7 +715,7 @@ impl AgentBackend for CodexBackend {
                     ))
                 } else if let Some(session) = self.session.clone() {
                     self.options.model = (!model.is_empty()).then_some(model);
-                    self.request("turn/start", json!({"threadId":session,"input":codec::turn_input(&text,&skills),"model":self.options.model}), Operation::Submit, true)
+                    self.request("turn/start", json!({"threadId":session,"input":codec::turn_input(&text,&skills),"model":self.options.model,"effort":effort}), Operation::Submit, true)
                 } else {
                     Err(anyhow::anyhow!("세션 연결이 준비되지 않았습니다."))
                 };
@@ -699,6 +822,7 @@ impl AgentBackend for CodexBackend {
             AgentCommand::RefreshModels => {
                 if !self.in_flight(Operation::Models) {
                     self.models.clear();
+                    self.profile_page.clear();
                     self.request("model/list", json!({"limit":100}), Operation::Models, false)?;
                 }
             }
@@ -764,6 +888,74 @@ impl AgentBackend for CodexBackend {
                         self.open_session(self.options.initial_session.clone(), false)?;
                     }
                 }
+            }
+        }
+        Ok(())
+    }
+
+    fn shutdown(&mut self) -> Result<()> {
+        if self.closing {
+            return Ok(());
+        }
+        self.closing = true;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        // A start reply may still be in flight when Quit is pressed. Resolve its
+        // identity before cancelling so that a paid turn cannot start after exit.
+        while self.pending.values().any(|p| {
+            matches!(
+                p.operation,
+                Operation::Initialize
+                    | Operation::OpenSession
+                    | Operation::SwitchSession
+                    | Operation::Submit
+            )
+        }) {
+            if std::time::Instant::now() >= deadline {
+                bail!("Session startup did not settle before shutdown");
+            }
+            let _ = self.poll()?;
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        if let Some(session) = self.session.clone() {
+            if !self.options.readonly
+                && let Some(turn) = self.turn.clone()
+            {
+                self.request(
+                    "turn/interrupt",
+                    json!({"threadId":session,"turnId":turn}),
+                    Operation::Interrupt,
+                    true,
+                )?;
+                while self.in_flight(Operation::Interrupt) {
+                    if std::time::Instant::now() >= deadline {
+                        bail!("Turn interruption did not finish before shutdown");
+                    }
+                    if let Some(event) = self.poll()?
+                        && let AgentUpdate::InterruptFailed(reason)
+                        | AgentUpdate::Disconnected(reason) = event.update
+                    {
+                        bail!("{reason}");
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+            }
+            self.request(
+                "thread/unsubscribe",
+                json!({"threadId":session}),
+                Operation::CloseSession,
+                true,
+            )?;
+            while self.in_flight(Operation::CloseSession) {
+                if std::time::Instant::now() >= deadline {
+                    bail!("Session detach did not finish before shutdown");
+                }
+                if let Some(event) = self.poll()?
+                    && let AgentUpdate::Error(reason) | AgentUpdate::Disconnected(reason) =
+                        event.update
+                {
+                    bail!("{reason}");
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
             }
         }
         Ok(())

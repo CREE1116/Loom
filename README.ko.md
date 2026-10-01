@@ -10,7 +10,7 @@
 
 Loom은 하나의 Orchestrator Core를 중심으로 만드는 코딩 에이전트 CLI입니다. 비용과 능력이 다른 모델 세션과 로컬 계산을 함께 운용하고, 이미 얻은 정보를 재사용하여 API 비용과 작업 시간을 줄이는 것이 목표입니다.
 
-**현재는 초기 구현 단계입니다.** TUI, UI/Core 이벤트 경계, 질문 선택·입력, 공유 로컬 코드 탐색이 동작합니다. 원격 코딩 실행은 아직 Codex adapter를 사용합니다. 전체 멀티 worker scheduler, durable state, patch 격리, 장기 retrieval, OpenRouter routing은 후속 단계입니다. API 절감률이나 기본 Codex와의 품질 동등성은 아직 benchmark하지 않았습니다.
+**현재는 초기 구현 단계입니다.** TUI, UI/Core 이벤트 경계, 질문 선택·입력, 활동 projection, 공유 로컬 코드 탐색이 동작합니다. 원격 코딩 실행은 아직 Codex adapter를 사용합니다. 전체 멀티 worker scheduler, durable state, patch 격리, 장기 retrieval, OpenRouter routing은 후속 단계입니다. API 절감률이나 기본 Codex와의 품질 동등성은 아직 benchmark하지 않았습니다.
 
 ## Loom을 만드는 이유
 
@@ -32,16 +32,18 @@ Loom은 이 책임을 Core로 옮깁니다.
 
 | 영역 | 이번 구현에서 제공하는 기능 |
 | --- | --- |
-| TUI | 대화 스트리밍, Unicode 편집, 여러 줄 붙여넣기, 키보드·마우스, 반응형 패널, resize, 터미널 복구 |
+| TUI | 대화 구분선, Markdown 제목·강조·목록·링크·표·코드, Unicode 편집, 붙여넣기, 키보드·마우스, 반응형 패널 |
 | UI/Core 경계 | typed `AgentEvent` / `AgentCommand`; provider JSON과 승인 payload는 backend adapter가 처리 |
 | 질문 | 명시적 선택지, 설명, 직접 입력, 여러 질문, 민감한 입력 마스킹, 숨기기·다시 열기, 검증, 중복 제출 방지 |
-| 작업 표시 | 모델 출력이 없어도 움직이는 애니메이션; 승인·blocking 질문·완료·연결 오류에는 정지 |
+| 작업 표시 | 스피너와 상태별 문구 32개; 추론·출력·탐색·테스트·수정·도구 실행을 구분하고 입력 대기·완료에는 정지 |
 | 세션 | Codex 기반 목록·전환·새 대화·분기·작업 폴더의 최근 대화 복원 |
 | 작업 조작 | 메시지 대기열, 중단, 우선 실행, 권한·신뢰 설정, 도구 출력 페이지, 보고된 diff 검토 |
+| Activity 관찰 | typed Task·worker·상태 projection, 대기 이유, Core가 지정한 critical 표시, 작업 상세; 실제 LOCAL 이벤트와 Mock TaskGraph |
 | 자체 LOCAL 실행 | `/explore QUERY`와 오프라인 `--explore QUERY`; Core 인스턴스 안에서 저장소 index와 query cache 공유 |
+| 모델·운영 표시 | 모델이 제공한 effort 선택, 지시별 설정 보존, 실제 보고된 토큰·cached input·할당량, 명시적 제한 시 대기열 정지 |
 | 검증 | 로컬 protocol fixture, Rust 회귀 테스트, 실제 PTY 조작 테스트, 모델 호출 없는 실제 runtime probe |
 
-현재 Activity 패널은 과도기 Codex 활동을 표시합니다. dependency graph, critical path, worker 선택 이유, 비용 profiler는 후속 작업입니다. 평소 사용에 패널을 열 필요는 없습니다.
+Activity 패널은 자체 Task projection과 과도기 Codex 활동을 함께 표시합니다. LOCAL 탐색에는 실제 상태·시간·evidence reference를 연결했습니다. Mock TaskGraph로 dependency와 Core가 지정한 critical 표시를 확인할 수 있으며, 실제 멀티 worker scheduling·선택 이유·비용 profiler는 후속 작업입니다. 평소 사용에 패널을 열 필요는 없습니다.
 
 ### 같은 코드를 반복 탐색하지 않는 공유 자원
 
@@ -62,9 +64,9 @@ Loom은 이 책임을 Core로 옮깁니다.
 
 - stable Rust toolchain과 Cargo, Git, ripgrep(`rg`).
 - UTF-8과 일반적인 ANSI 터미널 조작을 지원하는 터미널.
-- **원격 코딩을 사용할 때만** 설치·인증된 Codex CLI가 필요합니다. `codex-cli 0.151.0`으로 adapter를 검증했으며 모든 버전의 호환성을 가정하지 않습니다.
+- **원격 코딩을 사용할 때만** 설치·인증된 Codex CLI가 필요합니다. `codex-cli 0.151.0`과 `0.159.3`의 protocol을 대상으로 adapter를 검증하며 모든 버전의 호환성을 가정하지 않습니다.
 
-데모와 오프라인 탐색에는 Codex나 API 인증 정보가 필요하지 않습니다. macOS에서 로컬 검증했으며 CI는 macOS·Linux 대상으로 구성했습니다. 별도 창 실행은 현재 macOS Terminal.app을 대상으로 합니다. Linux 클립보드 연동에는 `xclip`, macOS에서는 `pbcopy`/`pbpaste`를 사용합니다. Windows 지원은 아직 검증하지 않았습니다.
+데모와 오프라인 탐색에는 Codex나 API 인증 정보가 필요하지 않습니다. macOS에서 로컬 검증했으며 CI는 macOS·Linux·Windows 대상으로 구성했습니다. 별도 창 실행은 macOS Terminal.app과 Windows 콘솔을 대상으로 합니다. Linux 클립보드 연동에는 `xclip`, macOS에서는 `pbcopy`/`pbpaste`를 사용합니다. Windows 실행 파일 탐색·npm shim 처리·PowerShell/CMD 시작·클립보드·별도 콘솔 경로를 추가했습니다. Windows CI에서 빌드와 모델 호출 없는 runtime 검증을 수행하며 실제 대화형 콘솔 조작은 추가 검증 대상입니다.
 
 ```sh
 git clone https://github.com/CREE1116/Loom.git
@@ -109,7 +111,30 @@ CUSTOM_TUI_PROFILE=debug ./scripts/loom --demo
 
 일반 실행은 해당 작업 폴더의 최근 저장된 대화를 찾으면 다시 엽니다. 현재 세션 복원은 Codex history를 사용하며, 자체 Canonical State에서의 복구는 아직 아닙니다. runtime metadata·최근 세션 pointer·UI 설정은 작업 폴더의 `.custom-tui/`에 저장합니다. 기존 Codex 인증을 사용합니다.
 
+### Windows 실행
+
+```powershell
+# Rust, Git, ripgrep 설치 후 새 터미널에서 실행합니다.
+.\scripts\loom.cmd --demo
+.\scripts\loom.cmd --cwd C:\projects\my-app --explore refresh_session
+
+# 원격 코딩에는 별도로 Codex 설치·인증이 필요합니다.
+npm.cmd install -g @openai/codex
+codex.cmd login
+.\scripts\loom.cmd --cwd C:\projects\my-app
+```
+
+`.cmd`는 PowerShell 시작 파일에 인수를 전달합니다. `codex`를 찾지 못하면 터미널을 다시 열거나 `--codex-bin`으로 실제 `codex.exe` 또는 npm Codex 진입점을 지정하세요. WSL/Git Bash는 기존 셸 스크립트를 사용할 수 있습니다.
+
 ## TUI 사용법
+
+상단 메뉴는 모델 다음에 세션을 둡니다. 명령은 `/`로 검색하며 도움말은 `/help`에 있습니다. `── 사용자 ──`와 `── Loom ──`으로 발화 묶음을 나누고, 같은 응답의 설명·도구·최종 답변은 이어서 표시합니다. 좁은 표는 열별 항목으로 펼칩니다. 복사·분기는 Markdown 원문을 사용합니다.
+
+`/effort high`처럼 runtime이 제공한 선택지만 지정합니다. `/effort default`는 모델 기본값, `/effort runtime`은 현재 runtime 설정을 상속합니다. effort override는 Codex의 후속 턴 설정에도 영향을 줍니다. 대기열 항목은 전송 당시의 model/effort를 보존합니다.
+
+토큰 요약은 입력창 아래, 상세는 `/usage`에 표시합니다. 보고되지 않은 값과 API 비용은 미계측으로 남깁니다. 명시적 할당량 소진·호출 제한 시 원격 전송을 멈추고 지시를 유지합니다. `/usage refresh`로 가능 여부를 확인한 뒤 `/queue resume`로 직접 재개합니다.
+
+메인 Loom을 종료하면 실행 중단·구독 해제를 요청하고 직접 띄운 runtime의 프로세스 트리를 종료합니다. 저장된 기록은 유지하며 다음 실행에서 새 연결로 복원합니다. 열람용 창은 메인 작업을 중단하지 않습니다. 외부 `--endpoint` 서버는 종료하지 않습니다. 한 폴더의 관리형 메인 창은 하나입니다.
 
 메인 화면은 대화와 하단 고정 입력창입니다. 넓은 터미널에서는 Activity·상세 패널을 옆에 열고, 좁은 터미널에서는 별도 상세 화면을 사용합니다. 상세를 열어도 초안과 읽던 위치가 유지됩니다.
 
@@ -126,6 +151,7 @@ CUSTOM_TUI_PROFILE=debug ./scripts/loom --demo
 | 로컬 코드 증거 탐색 | `/explore QUERY` |
 | 숨긴 질문 다시 열기 | `/questions` 또는 질문 알림 |
 | 세션·새 대화 | `/sessions`, `/new` |
+| 활동·작업 상세 | `/agents`, `/task N` |
 | 보고된 변경·도구 출력 | `/diff`, `/tool N` |
 | 승인·권한 정책 | `/approvals`, `/permissions` |
 | 대기열 조작 | `/queue drop N`, `/queue force N`, `/queue resume`, `/queue clear` |
@@ -138,7 +164,9 @@ CUSTOM_TUI_PROFILE=debug ./scripts/loom --demo
 
 기본 선택지가 강조되어 있어도 **제출된 답변은 아닙니다.** Esc·나중에로 숨겨도 질문에 답하지 않으며 `/questions`로 다시 엽니다. 전송 실패 시 답변을 유지하여 재시도할 수 있습니다. 민감한 입력은 화면에서 마스킹합니다. blocking 질문은 작업 애니메이션을 멈추고, nonblocking 질문은 실행을 계속 표시합니다. 타이머로 기본값을 자동 제출하지 않습니다.
 
-모델 없이 체험하려면 `--demo`에서 예시 승인을 처리한 뒤 **`질문 데모`**를 전송합니다. 이 trigger는 UI를 영어로 설정해도 현재 한국어이며, 일부 질문·화면 문구의 전체 번역은 후속 작업입니다.
+모델 없이 체험하려면 `--demo`에서 예시 승인을 처리한 뒤 **`질문 데모`**를 전송합니다. 이 trigger는 UI를 영어로 설정해도 현재 한국어이며, 일부 질문·활동·화면 문구의 전체 번역은 후속 작업입니다.
+
+활동 fixture는 예시 승인을 처리한 뒤 **`활동 데모`**를 보내고 `/agents` 또는 `/task 4`로 확인합니다. worker label·dependency 대기·취소를 보여주며 실제 원격 worker 모델을 실행하지 않습니다.
 
 명령의 세부 형태·세션 규칙·runtime 동작은 [TUI 상세 사용 가이드](custom-tui/README.md)에 있습니다.
 
@@ -161,7 +189,7 @@ flowchart TD
 | 모듈 | 책임 |
 | --- | --- |
 | `custom-tui/src/agent.rs` | typed UI/Core command·event·projection·질문 계약 |
-| `custom-tui/src/app/` | 이벤트 반영과 독립 질문 form 상태 |
+| `custom-tui/src/app/` | 이벤트 반영·질문 form 상태·Task/Activity 관찰 |
 | `custom-tui/src/app.rs` | 대화 상태·입력·동작·화면 구성 |
 | `custom-tui/src/engine.rs` | 문자 셀·Unicode 배치·변경 영역 렌더링·클릭 영역 |
 | `custom-tui/src/core/` | 자체 LOCAL 실행·저장소 snapshot·공유 query 결과 |
@@ -203,7 +231,7 @@ LOCAL cache는 동작하는 기반 기능이며, 원격 토큰 절감률을 측�
 우선 TUI의 조작과 경계를 완성한 뒤 자체 Core의 책임을 늘립니다.
 
 1. **질문·입력 상호작용:** 구현·테스트 완료. 번역과 사용성은 계속 개선합니다.
-2. **Activity 관찰:** Task·worker 상태, dependency, 대기 이유, 단계별 상세. Mock TaskGraph로 먼저 완성하고 실제 Core 이벤트를 연결합니다.
+2. **Activity 관찰:** 초기 Task projection·대기 이유·Core의 critical 표시·상세를 LOCAL/Mock TaskGraph에 구현했습니다. 전체 scheduler가 준비되면 연결합니다.
 3. **오류·세션 복구:** 명시적 reconnect·오류 복구, 미전송 작업 보존, 검토·탐색 경험 개선.
 4. **Single Worker Core:** TaskGraph·durable Canonical State·WorkerTask/Result·revision·event bus.
 5. **자체 worker 실행:** LOCAL 도구·persistent remote session·독립 Task scheduling.

@@ -184,43 +184,38 @@ pub fn output_page(
     (rows, has_next)
 }
 
-/// Render fenced snippets incrementally; an unfinished streamed fence stays code.
+#[path = "markdown.rs"]
+mod markdown;
+pub use markdown::{Span, StyledRow, styled_message_rows};
+
+/// Plain projection retained for consumers that do not paint styles.
 pub fn message_rows(text: &str, width: usize) -> Vec<Row> {
-    let mut rows = Vec::new();
-    let mut fence: Option<(char, usize, String)> = None;
-    let mut block = String::new();
-    for line in text.lines() {
-        let trimmed = line.trim_start();
-        let marker = trimmed.chars().next().unwrap_or(' ');
-        let length = trimmed.chars().take_while(|c| *c == marker).count();
-        if matches!(marker, '`' | '~') && length >= 3 {
-            if let Some((active, count, language)) = &fence {
-                if marker == *active && length >= *count && trimmed[length..].trim().is_empty() {
-                    append_block(&mut rows, &block, language, width);
-                    block.clear();
-                    fence = None;
-                    continue;
-                }
-            } else {
-                fence = Some((marker, length, trimmed[length..].trim().into()));
-                continue;
+    styled_message_rows(text, width)
+        .into_iter()
+        .map(|row| (row.text, row.tone))
+        .collect()
+}
+
+pub fn paint_message(canvas: &mut Canvas, row: &StyledRow, prefix: &str) {
+    if matches!(row.tone, Tone::Code | Tone::CodeAdded | Tone::CodeRemoved) {
+        paint(canvas, &format!("{prefix}{}", row.text), row.tone);
+        return;
+    }
+    let mut x = canvas.text(0, 0, prefix, Tone::Normal);
+    for span in &row.spans {
+        let start = x;
+        x = canvas.text(x, 0, &span.text, span.tone);
+        if span.tone == Tone::InlineCode {
+            for cell in canvas
+                .cells
+                .iter_mut()
+                .take(usize::from(x))
+                .skip(usize::from(start))
+            {
+                cell.background = Background::Code;
             }
         }
-        if fence.is_some() {
-            block.push_str(line);
-            block.push('\n');
-        } else {
-            rows.extend(
-                wrap(line, width)
-                    .into_iter()
-                    .map(|line| (line, Tone::Normal)),
-            );
-        }
     }
-    if let Some((_, _, language)) = fence {
-        append_block(&mut rows, &block, &language, width);
-    }
-    rows
 }
 
 fn append_block(rows: &mut Vec<Row>, block: &str, language: &str, width: usize) {

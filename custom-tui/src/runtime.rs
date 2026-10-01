@@ -6,10 +6,13 @@ use std::{
     fs::{self, OpenOptions},
     net::{TcpListener, TcpStream},
     path::{Path, PathBuf},
-    process::{Command, Stdio},
+    process::{Child, Stdio},
     thread,
     time::{Duration, Instant},
 };
+
+#[path = "runtime_launch.rs"]
+mod launch;
 
 #[derive(Serialize, Deserialize, Debug)]
 pub struct RuntimeInfo {
@@ -22,29 +25,16 @@ pub struct RuntimeInfo {
 }
 /// Prefer this checkout's installed runtime; explicit --codex-bin always wins.
 pub fn default_binary() -> String {
-    let local = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../.custom-tui/codex-runtime/node_modules/.bin/codex");
+    let local = Path::new(env!("CARGO_MANIFEST_DIR")).join(if cfg!(windows) {
+        "../.custom-tui/codex-runtime/node_modules/.bin/codex.cmd"
+    } else {
+        "../.custom-tui/codex-runtime/node_modules/.bin/codex"
+    });
     if local.is_file() {
         local.to_string_lossy().into_owned()
     } else {
         "codex".into()
     }
-}
-fn executable_path(binary: &str) -> Result<PathBuf> {
-    let path = Path::new(binary);
-    if path.components().count() > 1 {
-        return path
-            .canonicalize()
-            .with_context(|| format!("Cannot find {binary}"));
-    }
-    std::env::var_os("PATH")
-        .into_iter()
-        .flat_map(|paths| std::env::split_paths(&paths).collect::<Vec<_>>())
-        .map(|dir| dir.join(binary))
-        .find(|path| path.is_file())
-        .context("Cannot find Codex; install it or pass --codex-bin")?
-        .canonicalize()
-        .context("Cannot resolve Codex executable")
 }
 fn matches_runtime(info: &RuntimeInfo, executable: &str, version: &str) -> bool {
     info.executable == executable && info.version == version
@@ -62,13 +52,90 @@ fn private_dir(path: &Path) -> Result<()> {
     Ok(())
 }
 pub fn ensure(cwd: &Path, codex_bin: &str) -> Result<RuntimeInfo> {
-    let executable = executable_path(codex_bin)?;
-    let output = Command::new(&executable).arg("--version").output()?;
+    Ok(start(cwd, codex_bin, false)?.0)
+}
+
+/// Own a fresh runtime; closing the main TUI ends this process tree only.
+pub struct OwnedRuntime {
+    pub info: RuntimeInfo,
+    child: Child,
+    _owner: std::fs::File,
+    directory: PathBuf,
+}
+pub fn ensure_owned(cwd: &Path, codex_bin: &str) -> Result<OwnedRuntime> {
+    let directory = state_dir(cwd);
+    private_dir(&directory)?;
+    let owner = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(directory.join("ui-owner.lock"))?;
+    owner.try_lock_exclusive().context("A main Loom window already owns this workspace. Use its Session menu or open a read-only activity window")?;
+    let (info, child) = start(cwd, codex_bin, true)?;
+    Ok(OwnedRuntime {
+        info,
+        child: child.context("Missing owned runtime process")?,
+        _owner: owner,
+        directory,
+    })
+}
+impl Drop for OwnedRuntime {
+    fn drop(&mut self) {
+        stop_tree(&mut self.child);
+        let pointer = self.directory.join("runtime.json");
+        if fs::read_to_string(&pointer)
+            .ok()
+            .and_then(|s| serde_json::from_str::<RuntimeInfo>(&s).ok())
+            .is_some_and(|info| info.pid == self.child.id())
+        {
+            let _ = fs::remove_file(pointer);
+        }
+    }
+}
+fn stop_tree(child: &mut Child) {
+    #[cfg(unix)]
+    {
+        // The group was created by process_group(0) at spawn. It contains only
+        // this runtime and its descendants, including npm's native Codex child.
+        unsafe {
+            libc::kill(-(child.id() as i32), libc::SIGTERM);
+        }
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline {
+            let _ = child.try_wait();
+            if unsafe { libc::kill(-(child.id() as i32), 0) } != 0 {
+                let _ = child.wait();
+                return;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        unsafe {
+            libc::kill(-(child.id() as i32), libc::SIGKILL);
+        }
+    }
+    #[cfg(windows)]
+    {
+        let _ = std::process::Command::new("taskkill.exe")
+            .args(["/PID", &child.id().to_string(), "/T", "/F"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+fn start(cwd: &Path, codex_bin: &str, fresh: bool) -> Result<(RuntimeInfo, Option<Child>)> {
+    let executable = launch::Executable::resolve(codex_bin)?;
+    let output = executable.command().arg("--version").output()?;
     if !output.status.success() {
-        bail!("Cannot read Codex version from {}", executable.display());
+        bail!(
+            "Cannot read Codex version from {}",
+            executable.path.display()
+        );
     }
     let version = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-    let executable = executable.to_string_lossy().into_owned();
+    let executable_path = executable.path.to_string_lossy().into_owned();
     let dir = state_dir(cwd);
     private_dir(&dir)?;
     let lock = OpenOptions::new()
@@ -79,12 +146,13 @@ pub fn ensure(cwd: &Path, codex_bin: &str) -> Result<RuntimeInfo> {
         .open(dir.join("runtime.lock"))?;
     lock.lock_exclusive()?;
     let info_path = dir.join("runtime.json");
-    if let Ok(text) = fs::read_to_string(&info_path)
+    if !fresh
+        && let Ok(text) = fs::read_to_string(&info_path)
         && let Ok(info) = serde_json::from_str::<RuntimeInfo>(&text)
-        && matches_runtime(&info, &executable, &version)
+        && matches_runtime(&info, &executable_path, &version)
         && crate::transport::connect_socket(&info.endpoint).is_ok()
     {
-        return Ok(info);
+        return Ok((info, None));
     }
     let listener = TcpListener::bind("127.0.0.1:0")?;
     let address = listener.local_addr()?;
@@ -95,7 +163,7 @@ pub fn ensure(cwd: &Path, codex_bin: &str) -> Result<RuntimeInfo> {
         .create(true)
         .append(true)
         .open(dir.join("runtime.log"))?;
-    let mut command = Command::new(&executable);
+    let mut command = executable.command();
     command
         .args(["app-server", "--listen", &endpoint])
         .current_dir(cwd)
@@ -107,6 +175,12 @@ pub fn ensure(cwd: &Path, codex_bin: &str) -> Result<RuntimeInfo> {
         use std::os::unix::process::CommandExt;
         command.process_group(0);
     }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        // Keep the loopback runtime alive independently of its TUI console.
+        command.creation_flags(0x00000008 | 0x00000200);
+    }
     let mut child = command
         .spawn()
         .with_context(|| format!("Cannot start {codex_bin}; install Codex or pass --codex-bin"))?;
@@ -116,11 +190,11 @@ pub fn ensure(cwd: &Path, codex_bin: &str) -> Result<RuntimeInfo> {
             let info = RuntimeInfo {
                 endpoint,
                 pid: child.id(),
-                executable,
+                executable: executable_path,
                 version,
             };
             fs::write(&info_path, serde_json::to_vec(&info)?)?;
-            return Ok(info);
+            return Ok((info, Some(child)));
         }
         if let Some(status) = child.try_wait()? {
             bail!(
@@ -130,8 +204,7 @@ pub fn ensure(cwd: &Path, codex_bin: &str) -> Result<RuntimeInfo> {
         }
         thread::sleep(Duration::from_millis(100));
     }
-    let _ = child.kill();
-    let _ = child.wait();
+    stop_tree(&mut child);
     bail!(
         "Runtime startup timed out; see {}",
         dir.join("runtime.log").display()

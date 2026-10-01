@@ -23,6 +23,8 @@ pub struct MockCore {
     approval: bool,
     readonly: bool,
     input: Option<InputRequest>,
+    tasks: Vec<ActivityTask>,
+    activity_turn: Option<String>,
 }
 
 fn entry(id: &str, kind: Kind, title: &str, body: impl Into<String>) -> Entry {
@@ -99,12 +101,16 @@ impl MockCore {
             approval: !readonly,
             readonly,
             input: None,
+            tasks: Vec::new(),
+            activity_turn: None,
         };
         core.loaded(false, "fixture");
         core.emit(AgentUpdate::ModelsLoaded(vec![
             "fixture".into(),
             "fixture-fast".into(),
         ]));
+        core.emit(AgentUpdate::ModelProfilesLoaded(fixture_profiles()));
+        core.emit(AgentUpdate::EffortObserved(Some("medium".into())));
         core.emit(AgentUpdate::SkillsLoaded {
             skills: vec![Skill {
                 name: "demo-review".into(),
@@ -193,11 +199,30 @@ impl AgentBackend for MockCore {
                     | AgentCommand::MoreSessions(_)
                     | AgentCommand::RefreshSkills
                     | AgentCommand::RefreshModels
+                    | AgentCommand::RefreshUsage
             )
         {
             bail!("열람 창에서는 실행을 변경할 수 없습니다.");
         }
         match command {
+            AgentCommand::RefreshUsage => {
+                self.emit(AgentUpdate::QuotaUpdated(QuotaSnapshot {
+                    id: "fixture".into(),
+                    label: "데모 할당량".into(),
+                    model: None,
+                    primary: Some(QuotaWindow {
+                        used_percent: 20,
+                        duration_minutes: Some(300),
+                        resets_at: None,
+                    }),
+                    secondary: None,
+                    credits_available: None,
+                    credits_unlimited: None,
+                    spend_control_reached: Some(false),
+                    reached: None,
+                }));
+                self.emit(AgentUpdate::ExecutionLimitCleared);
+            }
             AgentCommand::Answer {
                 request_id,
                 answers,
@@ -222,9 +247,123 @@ impl AgentBackend for MockCore {
             }
             AgentCommand::Explore(_) => bail!("Code exploration is owned by the native Core"),
             AgentCommand::Submit { text, .. } => {
-                if self.stream.is_some() || self.approval || self.input.is_some() {
+                if self.stream.is_some()
+                    || self.approval
+                    || self.input.is_some()
+                    || self.activity_turn.is_some()
+                {
                     self.scoped(AgentUpdate::SubmissionFailed(
                         "현재 실행 또는 승인 처리가 끝나지 않았습니다.".into(),
+                    ));
+                    return Ok(());
+                }
+                if matches!(text.trim(), "사용량 데모" | "할당량 데모") {
+                    self.scoped(AgentUpdate::TokenUsageUpdated(TokenUsage {
+                        total: Some(12400),
+                        input: Some(10000),
+                        cached_input: Some(7000),
+                        output: Some(2400),
+                        reasoning_output: Some(400),
+                        last: Some(3200),
+                        context_window: Some(128000),
+                    }));
+                    self.scoped(AgentUpdate::TurnSubmitted {
+                        id: None,
+                        status: "idle".into(),
+                    });
+                    if text.trim() == "할당량 데모" {
+                        self.scoped(AgentUpdate::ExecutionLimited {
+                            kind: LimitKind::UsageExhausted,
+                            reason: "데모 소진 상태 · 실제 요금/사용량 아님".into(),
+                        });
+                    } else {
+                        self.emit(AgentUpdate::Notice(
+                            "사용량 데모 · fixture 값이며 실제 모델 사용량이 아닙니다.".into(),
+                        ));
+                    }
+                    return Ok(());
+                }
+                if text.trim() == "활동 데모" {
+                    self.activity_turn = Some("demo-activity-turn".into());
+                    self.scoped(AgentUpdate::TurnStarted {
+                        id: self.activity_turn.clone(),
+                    });
+                    self.tasks = vec![
+                        ActivityTask {
+                            id: "demo-root".into(),
+                            parent: None,
+                            title: "로그인 오류 수정 (예시)".into(),
+                            worker: None,
+                            status: TaskStatus::Running,
+                            dependencies: vec![],
+                            reason: None,
+                            critical: true,
+                            elapsed_ms: None,
+                            inputs: vec!["사용자 요청 (fixture)".into()],
+                            outputs: vec![],
+                        },
+                        ActivityTask {
+                            id: "demo-explore".into(),
+                            parent: Some("demo-root".into()),
+                            title: "관련 코드 탐색".into(),
+                            worker: Some(WorkerKind::Local),
+                            status: TaskStatus::Completed,
+                            dependencies: vec![],
+                            reason: None,
+                            critical: false,
+                            elapsed_ms: None,
+                            inputs: vec![],
+                            outputs: vec!["F1 (fixture)".into()],
+                        },
+                        ActivityTask {
+                            id: "demo-analysis".into(),
+                            parent: Some("demo-root".into()),
+                            title: "원인 분석".into(),
+                            worker: Some(WorkerKind::Medium),
+                            status: TaskStatus::Running,
+                            dependencies: vec!["demo-explore".into()],
+                            reason: None,
+                            critical: true,
+                            elapsed_ms: None,
+                            inputs: vec!["F1 (fixture)".into()],
+                            outputs: vec![],
+                        },
+                        ActivityTask {
+                            id: "demo-patch".into(),
+                            parent: Some("demo-root".into()),
+                            title: "수정안 작성".into(),
+                            worker: Some(WorkerKind::Small),
+                            status: TaskStatus::Blocked,
+                            dependencies: vec!["demo-analysis".into()],
+                            reason: Some("원인 분석 결과가 patch 제약을 결정함".into()),
+                            critical: true,
+                            elapsed_ms: None,
+                            inputs: vec![],
+                            outputs: vec![],
+                        },
+                        ActivityTask {
+                            id: "demo-test".into(),
+                            parent: Some("demo-root".into()),
+                            title: "회귀 테스트".into(),
+                            worker: Some(WorkerKind::Local),
+                            status: TaskStatus::Blocked,
+                            dependencies: vec!["demo-patch".into()],
+                            reason: Some("수정안 작성 완료 대기".into()),
+                            critical: true,
+                            elapsed_ms: None,
+                            inputs: vec![],
+                            outputs: vec![],
+                        },
+                    ];
+                    for task in self.tasks.clone() {
+                        self.scoped(AgentUpdate::TaskUpdated(task));
+                    }
+                    self.scoped(AgentUpdate::TurnSubmitted {
+                        id: self.activity_turn.clone(),
+                        status: "inProgress".into(),
+                    });
+                    self.emit(AgentUpdate::Notice(
+                        "활동 그래프 데모 · 모델/도구 실제 실행 없음".into(),
                     ));
                     return Ok(());
                 }
@@ -283,6 +422,7 @@ impl AgentBackend for MockCore {
                 self.scoped(AgentUpdate::TurnStarted {
                     id: Some(turn.clone()),
                 });
+                let markdown = text.trim() == "마크다운 데모";
                 self.add_entry(entry(
                     &format!("demo-user-{}", self.serial),
                     Kind::User,
@@ -303,14 +443,42 @@ impl AgentBackend for MockCore {
                 self.stream = Some(Stream {
                     turn,
                     entry: id,
-                    text:
+                    text: if markdown {
+                        "## 구현 결과\n\n**중요한 변경**과 *설명*, `refresh_session()` 코드입니다.\n\n- [x] 한글 표시\n- [ ] 회귀 검사\n\n> 원문은 복사할 때 유지됩니다.\n\n| 항목 | 상태 | 비고 |\n| --- | --- | --- |\n| Markdown | 정상 | 파서 |\n| 한글 | 유지 | UTF-8 |\n\n```rust\nlet 값 = 42;\n```\n[파일](src/app.rs)".into()
+                    } else {
                         "예시 응답이야. 대기열에 넣은 메시지는 이전 답변이 끝나면 순서대로 처리돼."
-                            .into(),
+                            .into()
+                    },
                     offset: 0,
                     tick: Instant::now(),
                 });
             }
             AgentCommand::Interrupt => {
+                let updates = self
+                    .tasks
+                    .iter_mut()
+                    .filter(|t| {
+                        !matches!(
+                            t.status,
+                            TaskStatus::Completed | TaskStatus::Failed | TaskStatus::Cancelled
+                        )
+                    })
+                    .map(|t| {
+                        t.status = TaskStatus::Cancelled;
+                        t.reason = Some("사용자 중단 (fixture)".into());
+                        t.clone()
+                    })
+                    .collect::<Vec<_>>();
+                for task in updates {
+                    self.scoped(AgentUpdate::TaskUpdated(task));
+                }
+                if let Some(turn) = self.activity_turn.take() {
+                    self.scoped(AgentUpdate::TurnCompleted {
+                        id: Some(turn),
+                        status: "interrupted".into(),
+                        error: None,
+                    });
+                }
                 if let Some(input) = self.input.take() {
                     self.scoped(AgentUpdate::InputResolved(input.id));
                 }
@@ -356,7 +524,11 @@ impl AgentBackend for MockCore {
                 })
             }
             AgentCommand::OpenSession { id, model } => {
-                if self.stream.is_some() || self.approval || self.input.is_some() {
+                if self.stream.is_some()
+                    || self.approval
+                    || self.input.is_some()
+                    || self.activity_turn.is_some()
+                {
                     bail!("실행과 승인 처리를 끝낸 뒤 대화를 전환하세요.");
                 }
                 let title = match id.as_deref() {
@@ -364,6 +536,7 @@ impl AgentBackend for MockCore {
                     Some(_) => "예시 · 이전 화면 검토",
                     None => "새 대화",
                 };
+                self.tasks.clear();
                 self.session = SessionSnapshot {
                     id: id.unwrap_or_else(|| "demo-new".into()),
                     title: Some(title.into()),
@@ -376,7 +549,11 @@ impl AgentBackend for MockCore {
                 ));
             }
             AgentCommand::Fork { turn_id, model } => {
-                if self.stream.is_some() || self.approval || self.input.is_some() {
+                if self.stream.is_some()
+                    || self.approval
+                    || self.input.is_some()
+                    || self.activity_turn.is_some()
+                {
                     bail!("완료된 대화만 분기할 수 있습니다.");
                 }
                 let turns = self.session.turns.get_or_insert_with(Vec::new);
@@ -407,10 +584,13 @@ impl AgentBackend for MockCore {
                     .collect(),
             }),
             AgentCommand::UpdatePermission { .. } => self.scoped(AgentUpdate::PermissionApplied),
-            AgentCommand::RefreshModels => self.emit(AgentUpdate::ModelsLoaded(vec![
-                "fixture".into(),
-                "fixture-fast".into(),
-            ])),
+            AgentCommand::RefreshModels => {
+                self.emit(AgentUpdate::ModelsLoaded(vec![
+                    "fixture".into(),
+                    "fixture-fast".into(),
+                ]));
+                self.emit(AgentUpdate::ModelProfilesLoaded(fixture_profiles()));
+            }
             AgentCommand::RefreshSkills => {}
             AgentCommand::TrustWorkspace(trusted) => self.emit(AgentUpdate::TrustResolved(trusted)),
         }
@@ -442,4 +622,25 @@ impl AgentBackend for MockCore {
         }
         Ok(self.events.pop_front())
     }
+}
+
+fn fixture_profiles() -> Vec<ModelProfile> {
+    ["fixture", "fixture-fast"]
+        .into_iter()
+        .map(|id| ModelProfile {
+            id: id.into(),
+            default_effort: Some("medium".into()),
+            efforts: [
+                ("low", "짧고 빠른 추론"),
+                ("medium", "기본 추론"),
+                ("high", "더 깊은 추론"),
+            ]
+            .into_iter()
+            .map(|(value, description)| EffortOption {
+                value: value.into(),
+                description: description.into(),
+            })
+            .collect(),
+        })
+        .collect()
 }

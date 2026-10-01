@@ -152,16 +152,22 @@ pub fn notification(method: &str, params: &Value) -> Vec<AgentEvent> {
         "turn/started" => vec![AgentUpdate::TurnStarted {
             id: params["turn"]["id"].as_str().map(str::to_owned),
         }],
-        "turn/completed" => vec![AgentUpdate::TurnCompleted {
-            id: params["turn"]["id"].as_str().map(str::to_owned),
-            status: params["turn"]["status"]
-                .as_str()
-                .unwrap_or("completed")
-                .into(),
-            error: params["turn"]["error"]["message"]
-                .as_str()
-                .map(str::to_owned),
-        }],
+        "turn/completed" => {
+            let mut updates = vec![AgentUpdate::TurnCompleted {
+                id: params["turn"]["id"].as_str().map(str::to_owned),
+                status: params["turn"]["status"]
+                    .as_str()
+                    .unwrap_or("completed")
+                    .into(),
+                error: params["turn"]["error"]["message"]
+                    .as_str()
+                    .map(str::to_owned),
+            }];
+            if let Some((kind, reason)) = execution_limit(&params["turn"]["error"]) {
+                updates.push(AgentUpdate::ExecutionLimited { kind, reason });
+            }
+            updates
+        }
         "item/started" | "item/completed" => item_events(&params["item"]),
         "item/agentMessage/delta" | "item/commandExecution/outputDelta" | "item/plan/delta" => {
             vec![AgentUpdate::EntryDelta {
@@ -177,11 +183,12 @@ pub fn notification(method: &str, params: &Value) -> Vec<AgentEvent> {
         "turn/diff/updated" => vec![AgentUpdate::DiffUpdated(
             params["diff"].as_str().unwrap_or("").into(),
         )],
-        "thread/tokenUsage/updated" => vec![AgentUpdate::UsageUpdated(format!(
-            "tokens {} · context {}",
-            params["tokenUsage"]["total"]["totalTokens"],
-            params["tokenUsage"]["last"]["totalTokens"]
+        "thread/tokenUsage/updated" => vec![AgentUpdate::TokenUsageUpdated(token_usage(
+            &params["tokenUsage"],
         ))],
+        "item/reasoning/summaryTextDelta" | "item/reasoning/textDelta" => {
+            vec![AgentUpdate::WorkPhaseUpdated(WorkPhase::Thinking)]
+        }
         "thread/status/changed" => {
             let status = params["status"]["type"].as_str().unwrap_or("unknown");
             vec![AgentUpdate::StatusUpdated {
@@ -189,16 +196,35 @@ pub fn notification(method: &str, params: &Value) -> Vec<AgentEvent> {
                 busy: status == "active",
             }]
         }
-        "thread/settings/updated" => vec![AgentUpdate::PermissionsUpdated {
-            permissions: permissions(&params["threadSettings"], false),
-            defaults_only: false,
-        }],
-        "error" => vec![AgentUpdate::Error(
-            params["error"]["message"]
-                .as_str()
-                .unwrap_or("Runtime error")
-                .into(),
-        )],
+        "thread/settings/updated" => {
+            let settings = &params["threadSettings"];
+            let mut updates = vec![AgentUpdate::PermissionsUpdated {
+                permissions: permissions(settings, false),
+                defaults_only: false,
+            }];
+            if let Some(effort) = settings["effort"].as_str() {
+                updates.push(AgentUpdate::EffortObserved(Some(effort.into())));
+            }
+            updates
+        }
+        "error" => {
+            if let Some((kind, reason)) = execution_limit(&params["error"]) {
+                if params["willRetry"].as_bool() == Some(true) {
+                    vec![AgentUpdate::Notice(format!(
+                        "호출 제한 · runtime이 재시도 중입니다. {reason}"
+                    ))]
+                } else {
+                    vec![AgentUpdate::ExecutionLimited { kind, reason }]
+                }
+            } else {
+                vec![AgentUpdate::Error(
+                    params["error"]["message"]
+                        .as_str()
+                        .unwrap_or("Runtime error")
+                        .into(),
+                )]
+            }
+        }
         _ => vec![],
     };
     updates
@@ -500,4 +526,126 @@ pub fn input_request(id: &Value, params: &Value) -> anyhow::Result<InputRequest>
         questions: decoded,
         blocking: params["isBlocking"].as_bool().unwrap_or(true),
     })
+}
+
+pub fn token_usage(value: &Value) -> TokenUsage {
+    let total = &value["total"];
+    TokenUsage {
+        total: total["totalTokens"].as_u64(),
+        input: total["inputTokens"].as_u64(),
+        cached_input: total["cachedInputTokens"].as_u64(),
+        output: total["outputTokens"].as_u64(),
+        reasoning_output: total["reasoningOutputTokens"].as_u64(),
+        last: value["last"]["totalTokens"].as_u64(),
+        context_window: value["modelContextWindow"].as_u64(),
+    }
+}
+pub fn execution_limit(error: &Value) -> Option<(LimitKind, String)> {
+    let info = if error["codexErrorInfo"].is_null() {
+        &error["data"]["codexErrorInfo"]
+    } else {
+        &error["codexErrorInfo"]
+    };
+    let code = info.as_str().or_else(|| info["type"].as_str())?;
+    let kind = match code {
+        "usageLimitExceeded" => LimitKind::UsageExhausted,
+        "rateLimitExceeded" => LimitKind::RateLimited,
+        _ => return None,
+    };
+    Some((
+        kind,
+        error["message"]
+            .as_str()
+            .unwrap_or("Runtime resource limit")
+            .into(),
+    ))
+}
+pub fn quota_snapshots(params: &Value) -> Vec<QuotaSnapshot> {
+    fn window(value: &Value) -> Option<QuotaWindow> {
+        Some(QuotaWindow {
+            used_percent: value["usedPercent"].as_u64()?.try_into().ok()?,
+            duration_minutes: value["windowDurationMins"].as_u64(),
+            resets_at: value["resetsAt"].as_u64(),
+        })
+    }
+    fn snapshot(value: &Value, fallback: Option<&str>) -> Option<QuotaSnapshot> {
+        if !value.is_object() {
+            return None;
+        }
+        let id = value["limitId"]
+            .as_str()
+            .or(fallback)
+            .unwrap_or("runtime")
+            .to_owned();
+        let reached = match value["rateLimitReachedType"].as_str() {
+            Some("rate_limit_reached") => Some(LimitKind::RateLimited),
+            Some(
+                "workspace_owner_credits_depleted"
+                | "workspace_member_credits_depleted"
+                | "workspace_owner_usage_limit_reached"
+                | "workspace_member_usage_limit_reached",
+            ) => Some(LimitKind::UsageExhausted),
+            _ if value["spendControlReached"].as_bool() == Some(true) => {
+                Some(LimitKind::UsageExhausted)
+            }
+            _ => None,
+        };
+        Some(QuotaSnapshot {
+            label: value["limitName"].as_str().unwrap_or(&id).into(),
+            id,
+            model: value["normalModelSlug"].as_str().map(str::to_owned),
+            primary: window(&value["primary"]),
+            secondary: window(&value["secondary"]),
+            credits_available: value["credits"]["hasCredits"].as_bool(),
+            credits_unlimited: value["credits"]["unlimited"].as_bool(),
+            spend_control_reached: value["spendControlReached"].as_bool(),
+            reached,
+        })
+    }
+    let mut results = Vec::new();
+    if let Some(main) = snapshot(&params["rateLimits"], None) {
+        results.push(main);
+    }
+    if let Some(by_id) = params["rateLimitsByLimitId"].as_object() {
+        for (id, value) in by_id {
+            if let Some(next) = snapshot(value, Some(id)) {
+                if let Some(old) = results.iter_mut().find(|old| old.id == next.id) {
+                    *old = next;
+                } else {
+                    results.push(next);
+                }
+            }
+        }
+    }
+    results
+}
+
+pub fn model_profiles(result: &Value) -> Vec<ModelProfile> {
+    result["data"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|model| {
+            let id = model["model"]
+                .as_str()
+                .or_else(|| model["id"].as_str())?
+                .to_owned();
+            let efforts = model["supportedReasoningEfforts"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|option| {
+                    Some(EffortOption {
+                        value: option["reasoningEffort"].as_str()?.into(),
+                        description: option["description"].as_str().unwrap_or("").into(),
+                    })
+                })
+                .collect();
+            Some(ModelProfile {
+                id,
+                efforts,
+                default_effort: model["defaultReasoningEffort"].as_str().map(str::to_owned),
+            })
+        })
+        .collect()
 }

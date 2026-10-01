@@ -29,6 +29,9 @@ struct Fixture {
 
 impl Fixture {
     fn new(readonly: bool) -> Self {
+        Self::with_restore(readonly, false)
+    }
+    fn with_restore(readonly: bool, occupied: bool) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let endpoint = format!("ws://{}", listener.local_addr().unwrap());
         let (wire_tx, wire) = mpsc::channel();
@@ -77,6 +80,10 @@ impl Fixture {
                         json!({"thread":{"id":"main","status":{"type":"idle"}},"model":"fixture"})
                     }
                     "thread/resume" => {
+                        if occupied {
+                            socket.send(Message::Text(json!({"id":message["id"],"error":{"message":"thread-store conflict: thread occupied already has an active writer"}}).to_string())).unwrap();
+                            continue;
+                        }
                         json!({"thread":{"id":message["params"]["threadId"],"status":{"type":"idle"}},"model":"fixture"})
                     }
                     "thread/fork" => {
@@ -85,13 +92,22 @@ impl Fixture {
                     "thread/read" => {
                         json!({"thread":{"id":message["params"]["threadId"],"status":{"type":"idle"},"turns":[]}})
                     }
-                    "skills/list" | "model/list" | "thread/list" => json!({"data":[]}),
+                    "skills/list" | "thread/list" => json!({"data":[]}),
+                    "model/list" => {
+                        json!({"data":[{"model":"fixture","supportedReasoningEfforts":[{"reasoningEffort":"low","description":"Fast"},{"reasoningEffort":"high","description":"Deep"}],"defaultReasoningEffort":"low"}]})
+                    }
+                    "account/rateLimits/read" => {
+                        json!({"rateLimits":{"limitId":"fixture","normalModelSlug":"fixture","primary":{"usedPercent":20,"windowDurationMins":300,"resetsAt":1990000000}}})
+                    }
                     "turn/start" => {
                         // Completion is allowed to arrive before the start reply.
                         socket.send(Message::Text(json!({"method":"turn/completed","params":{"threadId":"main","turn":{"id":"short-turn","status":"completed"}}}).to_string())).unwrap();
                         json!({"turn":{"id":"short-turn","status":"inProgress"}})
                     }
-                    "thread/settings/update" | "turn/interrupt" | "config/value/write" => json!({}),
+                    "thread/settings/update"
+                    | "turn/interrupt"
+                    | "thread/unsubscribe"
+                    | "config/value/write" => json!({}),
                     _ => panic!("Unexpected RPC: {method}"),
                 };
                 socket
@@ -107,9 +123,9 @@ impl Fixture {
             Options {
                 cwd: directory.path().into(),
                 model: None,
-                initial_session: None,
+                initial_session: occupied.then(|| "occupied".into()),
                 readonly,
-                auto_restore: false,
+                auto_restore: occupied,
             },
         )
         .unwrap();
@@ -121,6 +137,11 @@ impl Fixture {
             server: Some(server),
             _directory: directory,
         };
+        if occupied {
+            custom_tui::runtime::remember_thread(fixture._directory.path(), "occupied").unwrap();
+            fixture.app.editor.insert("preserved instruction");
+            fixture.app.activate(custom_tui::engine::Action::Send);
+        }
         if !readonly {
             fixture
                 .backend
@@ -175,6 +196,7 @@ fn codex_backend_preserves_permissions_and_authoritative_completion() {
         .command(AgentCommand::Submit {
             text: "short request".into(),
             model: "fixture".into(),
+            effort: None,
             skills: vec![],
         })
         .unwrap();
@@ -246,6 +268,7 @@ fn readonly_backend_rejects_mutation_and_events_do_not_cross_sessions() {
             .command(AgentCommand::Submit {
                 text: "no".into(),
                 model: String::new(),
+                effort: None,
                 skills: vec![]
             })
             .is_err()
@@ -382,6 +405,17 @@ fn local_exploration_runs_through_core_without_a_remote_command() {
     assert!(app.entries[0].body.contains("refresh_session"));
     assert!(app.entries[0].body.contains("API 호출 0"));
     assert_eq!(core.repository().counts(), (1, 1));
+    assert_eq!(app.tasks.len(), 1);
+    assert_eq!(
+        app.tasks[0].status,
+        custom_tui::agent::TaskStatus::Completed
+    );
+    assert_eq!(
+        app.tasks[0].worker,
+        Some(custom_tui::agent::WorkerKind::Local)
+    );
+    assert!(app.tasks[0].elapsed_ms.is_some());
+    assert!(app.tasks[0].outputs[0].starts_with("repo://"));
 }
 
 #[test]
@@ -549,4 +583,150 @@ fn malformed_and_foreign_question_requests_are_rejected() {
         thread::sleep(Duration::from_millis(2));
     }
     assert!(fixture.app.input_forms.is_empty());
+}
+
+#[test]
+fn selected_effort_is_validated_and_forwarded_to_the_runtime() {
+    let mut fixture = Fixture::new(false);
+    fixture.until(|app| !app.model_profiles.is_empty());
+    fixture
+        .backend
+        .command(AgentCommand::Submit {
+            text: "request".into(),
+            model: "fixture".into(),
+            effort: Some("unsupported".into()),
+            skills: vec![],
+        })
+        .unwrap();
+    fixture.until(|app| app.notice.contains("reasoning effort"));
+    fixture
+        .backend
+        .command(AgentCommand::Submit {
+            text: "request".into(),
+            model: "fixture".into(),
+            effort: Some("high".into()),
+            skills: vec![],
+        })
+        .unwrap();
+    fixture.until(|app| app.finished_turns.contains("short-turn") && app.pending.is_empty());
+    let turns: Vec<_> = fixture
+        .wire
+        .try_iter()
+        .filter(|m| m["method"] == "turn/start")
+        .collect();
+    assert_eq!(turns.len(), 1);
+    assert_eq!(turns[0]["params"]["effort"], "high");
+}
+
+#[test]
+fn quota_failures_pause_remote_work_preserve_queue_and_require_manual_resume() {
+    use custom_tui::{agent::LimitKind, app::QueuedMessage, engine::Action};
+    let mut fixture = Fixture::new(false);
+    fixture.send(json!({"method":"thread/tokenUsage/updated","params":{"threadId":"main","tokenUsage":{
+        "total":{"totalTokens":12400,"inputTokens":10000,"cachedInputTokens":7000,"outputTokens":2400,"reasoningOutputTokens":400},"last":{"totalTokens":3200},"modelContextWindow":128000}}}));
+    fixture.until(|app| app.tokens.total == Some(12400));
+    fixture.app.queued.push_back(QueuedMessage {
+        text: "preserve this".into(),
+        model: "fixture".into(),
+        effort: Some("high".into()),
+        skills: vec![],
+    });
+    fixture.send(json!({"method":"error","params":{"threadId":"main","turnId":"limited","willRetry":false,"error":{"message":"Quota exhausted","codexErrorInfo":"usageLimitExceeded"}}}));
+    fixture.until(|app| app.execution_limit == Some(LimitKind::UsageExhausted));
+    assert!(fixture.app.next_queued().is_none());
+    fixture.app.activate(Action::ResumeQueue);
+    assert!(fixture.app.queue_paused);
+    fixture
+        .backend
+        .command(AgentCommand::Submit {
+            text: "must not send".into(),
+            model: "fixture".into(),
+            effort: None,
+            skills: vec![],
+        })
+        .unwrap();
+    fixture.until(|app| app.notice.contains("제한"));
+    fixture.backend.command(AgentCommand::RefreshUsage).unwrap();
+    fixture.until(|app| app.execution_limit.is_none() && app.pending.is_empty());
+    assert!(fixture.app.queue_paused && fixture.app.next_queued().is_none());
+    assert_eq!(fixture.app.queued[0].text, "preserve this");
+    assert!(!fixture.wire.try_iter().any(|m| m["method"] == "turn/start"));
+}
+
+#[test]
+fn runtime_retry_is_distinct_from_hard_quota_exhaustion() {
+    let mut fixture = Fixture::new(false);
+    fixture.send(json!({"method":"error","params":{"threadId":"main","turnId":"retry","willRetry":true,"error":{"message":"Retry soon","codexErrorInfo":"rateLimitExceeded"}}}));
+    fixture.until(|app| app.notice.contains("재시도"));
+    assert!(fixture.app.execution_limit.is_none());
+    assert!(!fixture.app.queue_paused);
+}
+
+#[test]
+fn occupied_recent_session_recovers_without_losing_unsent_work_or_history() {
+    let mut fixture = Fixture::with_restore(false, true);
+    assert_eq!(fixture.app.thread.as_deref(), Some("main"));
+    assert_eq!(
+        custom_tui::runtime::last_thread(fixture._directory.path()).unwrap(),
+        "occupied"
+    );
+    let messages: Vec<_> = fixture.wire.try_iter().collect();
+    assert_eq!(
+        messages
+            .iter()
+            .filter(|m| m["method"] == "thread/resume")
+            .count(),
+        1
+    );
+    assert_eq!(
+        messages
+            .iter()
+            .filter(|m| m["method"] == "thread/start")
+            .count(),
+        1
+    );
+    assert!(!messages.iter().any(|m| m["method"] == "turn/start"));
+    assert_eq!(
+        fixture.app.next_queued(),
+        Some(custom_tui::app::Intent::Submit(
+            "preserved instruction".into()
+        ))
+    );
+}
+
+#[test]
+fn shutdown_interrupts_owned_turn_then_detaches_without_archiving_history() {
+    let mut fixture = Fixture::new(false);
+    fixture.control.send(Control::Send(json!({"method":"turn/started","params":{"threadId":"main","turn":{"id":"running","status":"inProgress"}}}))).unwrap();
+    fixture.until(|app| app.turn.as_deref() == Some("running"));
+    let _ = fixture.wire.try_iter().collect::<Vec<_>>();
+    fixture.backend.shutdown().unwrap();
+    let messages: Vec<_> = fixture.wire.try_iter().collect();
+    let interruption = messages
+        .iter()
+        .position(|m| m["method"] == "turn/interrupt")
+        .unwrap();
+    let detach = messages
+        .iter()
+        .position(|m| m["method"] == "thread/unsubscribe")
+        .unwrap();
+    assert!(interruption < detach);
+    assert!(!messages.iter().any(|m| m["method"] == "thread/archive"));
+    assert!(
+        fixture
+            .backend
+            .command(AgentCommand::RefreshModels)
+            .is_err()
+    );
+}
+#[test]
+fn closing_readonly_view_does_not_interrupt_main_work() {
+    let mut fixture = Fixture::new(true);
+    fixture.control.send(Control::Send(json!({"method":"turn/started","params":{"threadId":"main","turn":{"id":"running","status":"inProgress"}}}))).unwrap();
+    fixture.until(|app| app.turn.as_deref() == Some("running"));
+    let _ = fixture.wire.try_iter().collect::<Vec<_>>();
+    fixture.backend.shutdown().unwrap();
+    let messages: Vec<_> = fixture.wire.try_iter().collect();
+    assert!(!messages.iter().any(|m| m["method"] == "turn/interrupt"));
+    assert!(messages.iter().any(|m| m["method"] == "thread/unsubscribe"));
 }

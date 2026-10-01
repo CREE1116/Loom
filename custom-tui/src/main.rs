@@ -66,10 +66,7 @@ struct Args {
 
 fn main() -> Result<()> {
     let mut args = Args::parse();
-    args.cwd = args
-        .cwd
-        .canonicalize()
-        .context("Working directory does not exist")?;
+    args.cwd = dunce::canonicalize(&args.cwd).context("Working directory does not exist")?;
     if args.list_skills {
         return diagnostics::list_skills(&args.cwd, &args.codex_bin, args.endpoint.as_deref());
     }
@@ -87,12 +84,20 @@ fn main() -> Result<()> {
     if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
         bail!("Run in an interactive terminal, or use --probe to check the runtime");
     }
+    let owned_runtime = if !args.demo && args.endpoint.is_none() && args.agent.is_none() {
+        Some(runtime::ensure_owned(&args.cwd, &args.codex_bin)?)
+    } else {
+        None
+    };
     let endpoint = if args.demo {
         String::new()
     } else {
         match &args.endpoint {
             Some(endpoint) => endpoint.clone(),
-            None => runtime::ensure(&args.cwd, &args.codex_bin)?.endpoint,
+            None => match &owned_runtime {
+                Some(runtime) => runtime.info.endpoint.clone(),
+                None => runtime::ensure(&args.cwd, &args.codex_bin)?.endpoint,
+            },
         }
     };
     let initial = initial_thread(&args)?;
@@ -342,9 +347,15 @@ fn main() -> Result<()> {
         }
     }
     drop(terminal);
+    let shutdown = backend.shutdown();
+    drop(backend);
+    drop(owned_runtime);
+    if let Err(error) = shutdown {
+        eprintln!("Session cleanup: {error}");
+    }
     if !args.demo {
         println!(
-            "화면 연결을 닫았습니다. 저장된 대화는 다음 실행 시 자동으로 복원됩니다.\n서버가 실행 중인 동안 진행 중인 작업도 계속됩니다.\n새 대화: custom-tui --cwd {} --new",
+            "실행 세션과 연결을 닫았습니다. 저장된 대화는 다음 실행에서 새 연결로 복원됩니다.\n새 대화: custom-tui --cwd {} --new",
             window::shell_quote(&args.cwd.to_string_lossy())
         );
     }

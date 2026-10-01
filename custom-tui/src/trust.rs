@@ -18,7 +18,9 @@ pub fn local_trust(cwd: &Path) -> Option<bool> {
     let config = std::env::var_os("CODEX_HOME")
         .map(std::path::PathBuf::from)
         .or_else(|| {
-            std::env::var_os("HOME").map(|home| std::path::PathBuf::from(home).join(".codex"))
+            std::env::var_os("HOME")
+                .or_else(|| std::env::var_os("USERPROFILE"))
+                .map(|home| std::path::PathBuf::from(home).join(".codex"))
         })?
         .join("config.toml");
     project_trust(cwd, &config)
