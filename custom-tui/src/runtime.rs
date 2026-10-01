@@ -130,8 +130,14 @@ fn start(cwd: &Path, codex_bin: &str, fresh: bool) -> Result<(RuntimeInfo, Optio
     let output = executable.command().arg("--version").output()?;
     if !output.status.success() {
         bail!(
-            "Cannot read Codex version from {}",
-            executable.path.display()
+            "Cannot read Codex version from {} ({}): {}",
+            executable.path.display(),
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+                .chars()
+                .filter(|c| !c.is_control() || *c == '\n')
+                .take(2000)
+                .collect::<String>()
         );
     }
     let version = String::from_utf8_lossy(&output.stdout).trim().to_owned();

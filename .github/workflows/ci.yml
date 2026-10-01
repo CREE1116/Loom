@@ -59,7 +59,9 @@ jobs:
         run: |
           npm.cmd install --global @openai/codex@0.159.3
           if ($LASTEXITCODE -ne 0) { throw 'Codex installation failed' }
-          $loomProbeDir = Join-Path $env:RUNNER_TEMP 'loom-runtime-probe'
+          codex.cmd --version
+          if ($LASTEXITCODE -ne 0) { throw 'Installed Codex npm launcher failed' }
+          $loomProbeDir = Join-Path $env:RUNNER_TEMP 'loom runtime probe'
           New-Item -ItemType Directory -Force $loomProbeDir | Out-Null
           & .\scripts\loom.cmd --cwd $loomProbeDir --probe
           if ($LASTEXITCODE -ne 0) { throw 'Windows Codex runtime probe failed' }

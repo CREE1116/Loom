@@ -26,10 +26,11 @@ fn resolve(binary: &str, paths: &[PathBuf], windows: bool) -> Result<PathBuf> {
     } else {
         paths.to_vec()
     };
-    roots.iter().flat_map(|root| names.iter().map(move |name| root.join(name)))
+    let path = roots.iter().flat_map(|root| names.iter().map(move |name| root.join(name)))
         .find(|path| path.is_file())
         .with_context(|| format!("Cannot find {binary}. Install Codex (npm install -g @openai/codex), reopen the terminal, or pass --codex-bin PATH"))?
-        .canonicalize().context("Cannot resolve executable")
+        ;
+    dunce::canonicalize(path).context("Cannot resolve executable")
 }
 fn npm_entry(shim: &Path) -> Option<PathBuf> {
     let parent = shim.parent()?;
@@ -104,6 +105,11 @@ mod tests {
         std::fs::write(dir.path().join("codex.cmd"), "not executed").unwrap();
         let shim = resolve("codex", &[dir.path().into()], true).unwrap();
         assert_eq!(shim.file_name().unwrap(), "codex.cmd");
+        #[cfg(windows)]
+        assert!(
+            !shim.to_string_lossy().starts_with(r"\\?\"),
+            "Node/npm requires a normal Windows path"
+        );
         let entry = dir.path().join("node_modules/@openai/codex/bin/codex.js");
         std::fs::create_dir_all(entry.parent().unwrap()).unwrap();
         std::fs::write(&entry, "not executed").unwrap();
