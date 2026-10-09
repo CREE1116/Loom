@@ -1,0 +1,9 @@
+{
+  "status": "incomplete_checkpoint",
+  "shard": "model-00001-of-00003.safetensors",
+  "actual_bytes": 2456331462,
+  "expected_bytes": 5324399729,
+  "missing_bytes": 2868068267,
+  "resume_result": "connection timeout followed by DNS resolution failure",
+  "real_model_inference_verified": false
+}

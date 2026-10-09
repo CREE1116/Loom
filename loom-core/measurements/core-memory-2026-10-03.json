@@ -1,0 +1,313 @@
+{
+  "conditions": {
+    "fixtures": [
+      "expr-precedence",
+      "token-bucket"
+    ],
+    "jobs": 1,
+    "timeout_seconds": 180,
+    "comparison_valid": false,
+    "reason": "Gateway/catalog errors prevented a complete paired model run; no quality or speed improvement established."
+  },
+  "runs": {
+    "before_gemini": {
+      "summary": {
+        "passed": 0,
+        "total": 2,
+        "input_tokens": 4800,
+        "output_tokens": 78,
+        "seconds": 177,
+        "mean_steps": 3.5,
+        "orient_bytes": 2997,
+        "validate_bytes": 557,
+        "remote_input_tokens": 4800,
+        "remote_calls": 3,
+        "contract_recall": 0.5,
+        "scope_events": 1,
+        "slice_rereads": 0,
+        "slice_bytes": 0,
+        "validated": 0,
+        "false_finish": 0,
+        "escalated": 0
+      },
+      "results": [
+        {
+          "task": "expr-precedence",
+          "passed": false,
+          "finished": false,
+          "stop": "Unresolved",
+          "steps": 4,
+          "seconds": 62,
+          "input_tokens": 3421,
+          "remote_input_tokens": 3421,
+          "remote_calls": 2,
+          "output_tokens": 51,
+          "phase_bytes": {
+            "message": 0,
+            "orient": 1832,
+            "validate": 557
+          },
+          "contract_recall": 0.0,
+          "scope_events": 1,
+          "slice_bytes": 0,
+          "slice_rereads": 0,
+          "validated": false,
+          "tiers": [
+            "Local"
+          ],
+          "models": {
+            "omniroute/gemini-3.8-flash": 2
+          },
+          "diff": "",
+          "test_tail": "\n\nfailures:\n    errors\n    precedence\n    unary\n\ntest result: FAILED. 2 passed; 3 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\nerror: test failed, to rerun pass `--test hidden`\n\nworker made no source changes",
+          "trace_tail": [
+            "read: src/parser.rs lines 1-51 of 51\n    1| use crate::lexer::{tokenize, Token};\n    2| \n    3| /// Evaluate an arithmetic expression with + - * / and parentheses.\n    4| pub fn eval(src: &str) -> Result<f6",
+            "check: {\"commands\":[{\"artifact\":{\"bytes\":22,\"id\":\"83aa059287b57176a5ac99c90ef40d6cdb7ecf29ae0d2d70c8032324157686b5\"},\"artifact_path\":\"83aa059287b57176a5ac99c90ef40d6cdb7ecf29ae0d2d70c8032324157686b5\",\"failed"
+          ]
+        },
+        {
+          "task": "token-bucket",
+          "passed": false,
+          "finished": false,
+          "stop": "Unresolved",
+          "steps": 3,
+          "seconds": 115,
+          "input_tokens": 1379,
+          "remote_input_tokens": 1379,
+          "remote_calls": 1,
+          "output_tokens": 27,
+          "phase_bytes": {
+            "message": 0,
+            "orient": 1165
+          },
+          "contract_recall": 1.0,
+          "scope_events": 0,
+          "slice_bytes": 0,
+          "slice_rereads": 0,
+          "validated": false,
+          "tiers": [
+            "Local"
+          ],
+          "models": {
+            "omniroute/gemini-3.8-flash": 1
+          },
+          "diff": "",
+          "test_tail": "  |\n4 | pub struct Bucket<C: Clock> {\n  |            ------ field in this struct\n5 |     clock: C,\n6 |     capacity: u64,\n  |     ^^^^^^^^\n  |\n  = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default\n\nerror: test failed, to rerun pass `--test hidden`\n\nworker made no source changes",
+          "trace_tail": [
+            "read: src/bucket.rs lines 1-35 of 35\n    1| use crate::clock::Clock;\n    2| \n    3| /// Token bucket: holds up to `capacity` tokens, refilled at `per_second` tokens/s.\n    4| pub struct Bucket<C: Clock> {\n "
+          ]
+        }
+      ]
+    },
+    "after_gemini": {
+      "summary": {
+        "passed": 0,
+        "total": 2,
+        "input_tokens": 4800,
+        "output_tokens": 76,
+        "seconds": 239,
+        "mean_steps": 3.5,
+        "orient_bytes": 2997,
+        "validate_bytes": 557,
+        "remote_input_tokens": 4800,
+        "remote_calls": 3,
+        "contract_recall": 0.5,
+        "scope_events": 1,
+        "slice_rereads": 0,
+        "slice_bytes": 0,
+        "validated": 0,
+        "false_finish": 0,
+        "escalated": 0
+      },
+      "results": [
+        {
+          "task": "expr-precedence",
+          "passed": false,
+          "finished": false,
+          "stop": "Unresolved",
+          "steps": 4,
+          "seconds": 120,
+          "input_tokens": 3421,
+          "remote_input_tokens": 3421,
+          "remote_calls": 2,
+          "output_tokens": 49,
+          "phase_bytes": {
+            "message": 0,
+            "orient": 1832,
+            "validate": 557
+          },
+          "contract_recall": 0.0,
+          "scope_events": 1,
+          "slice_bytes": 0,
+          "slice_rereads": 0,
+          "validated": false,
+          "tiers": [
+            "Local"
+          ],
+          "models": {
+            "omniroute/gemini-3.8-flash": 2
+          },
+          "diff": "",
+          "test_tail": "\n\nfailures:\n    errors\n    precedence\n    unary\n\ntest result: FAILED. 2 passed; 3 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\nerror: test failed, to rerun pass `--test hidden`\n\nworker made no source changes",
+          "trace_tail": [
+            "read: src/parser.rs lines 1-51 of 51\n    1| use crate::lexer::{tokenize, Token};\n    2| \n    3| /// Evaluate an arithmetic expression with + - * / and parentheses.\n    4| pub fn eval(src: &str) -> Result<f6",
+            "check: {\"commands\":[{\"artifact\":{\"bytes\":22,\"id\":\"83aa059287b57176a5ac99c90ef40d6cdb7ecf29ae0d2d70c8032324157686b5\"},\"artifact_path\":\"83aa059287b57176a5ac99c90ef40d6cdb7ecf29ae0d2d70c8032324157686b5\",\"failed"
+          ]
+        },
+        {
+          "task": "token-bucket",
+          "passed": false,
+          "finished": false,
+          "stop": "Unresolved",
+          "steps": 3,
+          "seconds": 119,
+          "input_tokens": 1379,
+          "remote_input_tokens": 1379,
+          "remote_calls": 1,
+          "output_tokens": 27,
+          "phase_bytes": {
+            "message": 0,
+            "orient": 1165
+          },
+          "contract_recall": 1.0,
+          "scope_events": 0,
+          "slice_bytes": 0,
+          "slice_rereads": 0,
+          "validated": false,
+          "tiers": [
+            "Local"
+          ],
+          "models": {
+            "omniroute/gemini-3.8-flash": 1
+          },
+          "diff": "",
+          "test_tail": "  |\n4 | pub struct Bucket<C: Clock> {\n  |            ------ field in this struct\n5 |     clock: C,\n6 |     capacity: u64,\n  |     ^^^^^^^^\n  |\n  = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default\n\nerror: test failed, to rerun pass `--test hidden`\n\nworker made no source changes",
+          "trace_tail": [
+            "read: src/bucket.rs lines 1-35 of 35\n    1| use crate::clock::Clock;\n    2| \n    3| /// Token bucket: holds up to `capacity` tokens, refilled at `per_second` tokens/s.\n    4| pub struct Bucket<C: Clock> {\n "
+          ]
+        }
+      ]
+    },
+    "sonnet_4_6": {
+      "summary": {
+        "passed": 0,
+        "total": 2,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "seconds": 2,
+        "mean_steps": 1.0,
+        "orient_bytes": 0,
+        "validate_bytes": 0,
+        "remote_input_tokens": 0,
+        "remote_calls": 0,
+        "contract_recall": 1.0,
+        "scope_events": 0,
+        "slice_rereads": 0,
+        "slice_bytes": 0,
+        "validated": 0,
+        "false_finish": 0,
+        "escalated": 0
+      },
+      "results": [
+        {
+          "task": "expr-precedence",
+          "passed": false,
+          "finished": false,
+          "stop": "Unresolved",
+          "steps": 1,
+          "seconds": 1,
+          "input_tokens": 0,
+          "remote_input_tokens": 0,
+          "remote_calls": 0,
+          "output_tokens": 0,
+          "phase_bytes": {},
+          "contract_recall": 1.0,
+          "scope_events": 0,
+          "slice_bytes": 0,
+          "slice_rereads": 0,
+          "validated": false,
+          "tiers": [
+            "Local"
+          ],
+          "models": {},
+          "diff": "",
+          "test_tail": "\n\nfailures:\n    errors\n    precedence\n    unary\n\ntest result: FAILED. 2 passed; 3 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\nerror: test failed, to rerun pass `--test hidden`\n\nworker made no source changes",
+          "trace_tail": []
+        },
+        {
+          "task": "token-bucket",
+          "passed": false,
+          "finished": false,
+          "stop": "Unresolved",
+          "steps": 1,
+          "seconds": 1,
+          "input_tokens": 0,
+          "remote_input_tokens": 0,
+          "remote_calls": 0,
+          "output_tokens": 0,
+          "phase_bytes": {},
+          "contract_recall": 1.0,
+          "scope_events": 0,
+          "slice_bytes": 0,
+          "slice_rereads": 0,
+          "validated": false,
+          "tiers": [
+            "Local"
+          ],
+          "models": {},
+          "diff": "",
+          "test_tail": "  |\n4 | pub struct Bucket<C: Clock> {\n  |            ------ field in this struct\n5 |     clock: C,\n6 |     capacity: u64,\n  |     ^^^^^^^^\n  |\n  = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default\n\nerror: test failed, to rerun pass `--test hidden`\n\nworker made no source changes",
+          "trace_tail": []
+        }
+      ]
+    },
+    "sonnet_5_5": {
+      "summary": {
+        "passed": 0,
+        "total": 1,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "seconds": 93,
+        "mean_steps": 2.0,
+        "orient_bytes": 0,
+        "validate_bytes": 0,
+        "remote_input_tokens": 0,
+        "remote_calls": 0,
+        "contract_recall": 1.0,
+        "scope_events": 0,
+        "slice_rereads": 0,
+        "slice_bytes": 0,
+        "validated": 0,
+        "false_finish": 0,
+        "escalated": 0
+      },
+      "results": [
+        {
+          "task": "token-bucket",
+          "passed": false,
+          "finished": false,
+          "stop": "Unresolved",
+          "steps": 2,
+          "seconds": 93,
+          "input_tokens": 0,
+          "remote_input_tokens": 0,
+          "remote_calls": 0,
+          "output_tokens": 0,
+          "phase_bytes": {},
+          "contract_recall": 1.0,
+          "scope_events": 0,
+          "slice_bytes": 0,
+          "slice_rereads": 0,
+          "validated": false,
+          "tiers": [
+            "Local"
+          ],
+          "models": {},
+          "diff": "",
+          "test_tail": "  |\n4 | pub struct Bucket<C: Clock> {\n  |            ------ field in this struct\n5 |     clock: C,\n6 |     capacity: u64,\n  |     ^^^^^^^^\n  |\n  = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default\n\nerror: test failed, to rerun pass `--test hidden`\n\nworker made no source changes",
+          "trace_tail": []
+        }
+      ]
+    }
+  }
+}

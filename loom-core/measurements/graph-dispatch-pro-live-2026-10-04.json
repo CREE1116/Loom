@@ -1,0 +1,131 @@
+{
+  "date": "2026-10-04",
+  "kind": "live Native Core graph dispatch with strong model, independent hidden grading and approval/application",
+  "requested_model": "omniroute/agy/gemini-3.1-pro-high",
+  "fixture": {
+    "left.py": "def clamp_score(value): return value",
+    "right.py": "def slugify(text): return text.strip().lower()"
+  },
+  "result_before_approval": {
+    "cached_input_tokens": 0,
+    "contract_recall": 1.0,
+    "decision": {
+      "estimated_work": 4,
+      "groups": [
+        {
+          "anchors": [
+            "left.py::clamp_score"
+          ],
+          "read_files": [],
+          "write_files": [
+            "left.py"
+          ]
+        },
+        {
+          "anchors": [
+            "right.py::slugify"
+          ],
+          "read_files": [],
+          "write_files": [
+            "right.py"
+          ]
+        }
+      ],
+      "mode": "Split",
+      "observed_fixed_ms": null,
+      "reason": "AST 그래프에서 쓰기·의존 범위가 분리된 2개 작업을 병렬 배분합니다. 병합 후 Core가 검증합니다."
+    },
+    "finished": false,
+    "id": "task-18db145809f6dcb8-9615",
+    "input_tokens": 10014,
+    "models": {
+      "omniroute/gemini-3.1-pro-high": 6
+    },
+    "output_tokens": 999,
+    "phase_bytes": {
+      "edit": 108,
+      "message": 4,
+      "orient": 167,
+      "validate": 128
+    },
+    "remote_calls": 6,
+    "remote_input_tokens": 10014,
+    "scope_events": [],
+    "slice_bytes": 0,
+    "slice_rereads": 0,
+    "status": "AwaitingApproval",
+    "steps": 6,
+    "stop_reason": "AwaitingApproval",
+    "summary": "Updated `clamp_score` in `left.py` to clamp values between 0 and 10 using `max(0, min(10, value))`.\nUpdated `slugify` to lowercase, trim, and join whitespace-separated words with a single hyphen by using `split()` and `\"-\".join()`.",
+    "tiers": [
+      "Local"
+    ],
+    "validated": true
+  },
+  "originals_unchanged_before_approval": true,
+  "result_after_approval": {
+    "cached_input_tokens": 0,
+    "contract_recall": 1.0,
+    "decision": {
+      "estimated_work": 4,
+      "groups": [
+        {
+          "anchors": [
+            "left.py::clamp_score"
+          ],
+          "read_files": [],
+          "write_files": [
+            "left.py"
+          ]
+        },
+        {
+          "anchors": [
+            "right.py::slugify"
+          ],
+          "read_files": [],
+          "write_files": [
+            "right.py"
+          ]
+        }
+      ],
+      "mode": "Split",
+      "observed_fixed_ms": null,
+      "reason": "AST 그래프에서 쓰기·의존 범위가 분리된 2개 작업을 병렬 배분합니다. 병합 후 Core가 검증합니다."
+    },
+    "finished": true,
+    "id": "task-18db145809f6dcb8-9615",
+    "input_tokens": 10014,
+    "models": {
+      "omniroute/gemini-3.1-pro-high": 6
+    },
+    "output_tokens": 999,
+    "phase_bytes": {
+      "edit": 108,
+      "message": 4,
+      "orient": 167,
+      "validate": 128
+    },
+    "remote_calls": 6,
+    "remote_input_tokens": 10014,
+    "scope_events": [],
+    "slice_bytes": 0,
+    "slice_rereads": 0,
+    "status": "Accepted",
+    "steps": 6,
+    "stop_reason": "Accepted",
+    "summary": "Updated `clamp_score` in `left.py` to clamp values between 0 and 10 using `max(0, min(10, value))`.\nUpdated `slugify` to lowercase, trim, and join whitespace-separated words with a single hyphen by using `split()` and `\"-\".join()`.",
+    "tiers": [
+      "Local"
+    ],
+    "validated": true
+  },
+  "hidden_grade_after_apply": {
+    "exit_code": 0,
+    "output": "9 hidden cases passed"
+  },
+  "limits": [
+    "One small fixture, not a Codex baseline or general quality/latency/token-efficiency evaluation.",
+    "Different model from preceding Groq failures; model difference prevents attributing a completion-rate gain solely to Core changes.",
+    "General semantic request decomposition, over-four-group scheduling and provider throughput backpressure remain unimplemented."
+  ]
+}

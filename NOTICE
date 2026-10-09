@@ -4,4 +4,9 @@ Copyright 2026 Loom contributors
 Development began in an OpenAI Codex source checkout.
 OpenAI Codex: Copyright 2025 OpenAI, Apache License 2.0.
 The original upstream notice is preserved in licenses/CODEX-NOTICE.
-The optional Codex runtime is not bundled in this source distribution.
+Loom does not depend on or bundle Codex.
+
+Third-party components:
+- crossterm (MIT), vendored with changes in loom-tui/third_party/crossterm.
+- llama.cpp / ggml (MIT), built through the llama-cpp-2 crates.
+- MLX (MIT), downloaded by scripts/fetch-mlx on Apple silicon; not in this repository.

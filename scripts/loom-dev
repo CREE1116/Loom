@@ -1,0 +1,9 @@
+#!/bin/sh
+set -eu
+loom_repo_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+# Keep the interactive UI optimized; opt into the faster-to-build debug binary
+# explicitly when iterating on Rust code.
+if [ "${LOOM_PROFILE:-${CUSTOM_TUI_PROFILE:-release}}" = debug ]; then
+    exec cargo run --quiet --manifest-path "$loom_repo_root/loom-tui/Cargo.toml" -- "$@"
+fi
+exec cargo run --release --quiet --manifest-path "$loom_repo_root/loom-tui/Cargo.toml" -- "$@"

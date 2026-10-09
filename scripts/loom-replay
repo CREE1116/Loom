@@ -1,0 +1,272 @@
+#!/usr/bin/env python3
+"""Replay real requests that went wrong, at the repository state they were made in.
+
+Each task in bench/replay/*.json names a Core revision (a tree in this repository's
+object store), the request, and how to grade the outcome. The runner restores that
+tree into a scratch repository, runs the Native engine on it, and grades:
+
+    answer_regex   regexes the final answer must match
+    files_regex    {path: regex} the changed files must match
+    commands       shell commands that must pass in the result (e.g. a hidden test)
+    max_steps      the engine must finish within this many model steps
+    status         expected Core status (default Accepted)
+
+    scripts/loom-replay                          # build loom-core, run all tasks
+    scripts/loom-replay --engine PATH --only find-exit-print --json out.json
+"""
+
+from __future__ import annotations
+
+import argparse
+import collections
+import json
+import os
+import re
+import signal
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+TASKS = ROOT / "bench" / "replay"
+TARGET = ROOT / "bench" / "replay" / ".target"
+
+
+def git(cwd: Path, *args: str, env=None) -> subprocess.CompletedProcess:
+    return subprocess.run(["git", "-C", str(cwd), *args], capture_output=True, text=True, env=env)
+
+
+def materialize(tree: str, dest: Path):
+    """A fresh repository holding exactly `tree`, borrowing this repository's objects."""
+    if git(dest, "init", "-q").returncode:
+        raise RuntimeError("could not initialize replay repository")
+    (dest / ".git" / "objects" / "info").mkdir(parents=True, exist_ok=True)
+    (dest / ".git" / "objects" / "info" / "alternates").write_text(str(ROOT / ".git" / "objects") + "\n")
+    if git(dest, "read-tree", tree).returncode != 0:
+        raise RuntimeError(f"revision {tree} is not in this repository")
+    if git(dest, "checkout-index", "-a", "-f").returncode:
+        raise RuntimeError(f"could not restore {tree}")
+    if git(dest, "-c", "user.name=replay", "-c", "user.email=replay@localhost", "commit", "-qm", "replay base").returncode:
+        raise RuntimeError(f"could not commit replay base {tree}")
+
+
+def run_bounded(command, *, cwd: Path, env: dict, timeout: int, shell=False):
+    """Reap the engine and its cargo/test descendants when a replay times out."""
+    process = subprocess.Popen(command, cwd=cwd, env=env, shell=shell, start_new_session=True,
+                               stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    try:
+        stdout, stderr = process.communicate(timeout=timeout)
+        return process.returncode, stdout, stderr
+    except subprocess.TimeoutExpired:
+        os.killpg(process.pid, signal.SIGKILL)
+        process.communicate()
+        raise
+
+
+def grade_result(task: dict, report: dict, repo: Path, env: dict) -> list[str]:
+    """Reject missing telemetry and unchanged source; score only explicit fixture oracles."""
+    grade = task.get("grade", {})
+    reasons = []
+    expected = grade.get("status", "Accepted")
+    if report.get("status") != expected:
+        reasons.append(f"status {report.get('status')} (expected {expected})")
+    if "max_steps" in grade and (not isinstance(report.get("steps"), int) or report["steps"] > grade["max_steps"]):
+        reasons.append(f"steps {report.get('steps')} (max {grade['max_steps']})")
+    for metric, maximum in grade.get("trace_constraints", {}).items():
+        measured = (report.get("trace_metrics") or {}).get(metric)
+        if measured is None or measured > maximum:
+            reasons.append(f"trace {metric} {measured} (max {maximum})")
+    for pattern in grade.get("answer_regex", []):
+        if not re.search(pattern, report.get("summary") or "", re.S):
+            reasons.append(f"answer lacks /{pattern}/")
+    for location in grade.get("source_locations", []):
+        path = repo / location["path"]
+        if not path.is_file():
+            reasons.append(f"ground-truth source missing: {location['path']}")
+            continue
+        matches = [i for i, line in enumerate(path.read_text(errors="replace").splitlines(), 1)
+                   if location["needle"] in line]
+        summary = report.get("summary") or ""
+        # A guessed filename alone cannot pass a request for the exact location: the
+        # answer must name the file and a line (or range) within 3 lines of the truth.
+        cited = []
+        for m in re.finditer(rf"{re.escape(path.name)}\D{{0,20}}(\d+)(?:\s*[-~–]\s*(\d+))?", summary):
+            start = int(m.group(1))
+            cited.append((start, int(m.group(2)) if m.group(2) else start))
+        grounded = len(matches) == 1 and any(a - 3 <= matches[0] <= b + 3 for a, b in cited)
+        if not grounded:
+            reasons.append(f"answer lacks grounded source location for {location['path']}")
+    for path, pattern in grade.get("files_regex", {}).items():
+        file = repo / path
+        if not file.is_file() or not re.search(pattern, file.read_text(errors="replace"), re.S):
+            reasons.append(f"{path} lacks /{pattern}/")
+        if grade.get("must_change"):
+            if not git(repo, "status", "--porcelain", "--untracked-files=all", "--", path).stdout.strip():
+                reasons.append(f"{path} was not changed by this run")
+    for check in grade.get("commands", []):
+        try:
+            rc, stdout, stderr = run_bounded(check, cwd=repo, env=env, shell=True, timeout=grade.get("check_timeout", 300))
+        except subprocess.TimeoutExpired:
+            reasons.append(f"`{check}` timed out")
+            continue
+        if rc:
+            reasons.append(f"`{check}` failed: {(stdout + stderr).strip().splitlines()[-1:]}")
+    return reasons
+
+
+def trace_metrics(path: Path) -> dict:
+    """Observable failure modes, measured from the actual call and tool trace."""
+    counts = collections.Counter()
+    commands = collections.Counter()
+    models = []
+    check_repeat = 0
+    checks_since_change = 0
+    for line in path.read_text(errors="replace").splitlines() if path.exists() else []:
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if event.get("model") and "calls" in event:
+            models.append(event["model"])
+        for call in event.get("calls") or []:
+            tool = call.get("tool")
+            args = call.get("args") or {}
+            if tool not in ("finish", "check"):
+                counts[(tool, json.dumps(args, sort_keys=True, ensure_ascii=False))] += 1
+            if tool == "exec_command":
+                command = (args.get("command") or "").strip()
+                if command:
+                    commands[command] += 1
+            if tool in ("edit", "write", "rename_symbol", "replace_symbol", "insert_after_symbol"):
+                checks_since_change = 0
+            if tool == "check":
+                checks_since_change += 1
+                check_repeat += checks_since_change > 1
+    return {
+        "max_repeated_call": max(counts.values(), default=0),
+        "rerun_command": sum(n - 1 for n in commands.values() if n > 1),
+        "check_without_change": check_repeat,
+        "model_switches": sum(left != right for left, right in zip(models, models[1:])),
+    }
+
+
+def trace_evidence(path: Path) -> list[dict]:
+    """Small replay-derived evidence packet for a subsequent repair worker."""
+    events = []
+    for line in path.read_text(errors="replace").splitlines() if path.exists() else []:
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if "calls" in event:
+            events.append({"step": event.get("step"), "model": event.get("model"),
+                           "calls": [{"tool": c.get("tool"), "args": str(c.get("args", {}))[:150]}
+                                     for c in (event.get("calls") or [])]})
+    return events if len(events) <= 8 else events[:3] + events[-5:]
+
+
+def run_task(task: dict, engine: Path, args) -> dict:
+    work = Path(tempfile.mkdtemp(prefix=f"loom-replay-{task['id']}-"))
+    repo = work / "repo"
+    repo.mkdir()
+    result = {"task": task["id"], "passed": False, "reasons": []}
+    try:
+        materialize(task["base"], repo)
+        target = Path(os.environ.get("LOOM_REPLAY_TARGET_ROOT", str(TARGET)))
+        env = {**os.environ, "LOOM_TEMPERATURE": "0", "CARGO_TARGET_DIR": str(target / task["id"]), **task.get("env", {})}
+        trace = work / "trace.jsonl"
+        command = [str(engine), "run", task["goal"], "--cwd", str(repo), "--json", "--trace", str(trace),
+                   "--max-seconds", str(task.get("seconds", max(args.timeout - 30, 1))),
+                   "--max-cost", args.max_cost]
+        if args.model:
+            command += ["--model", args.model]
+        if task.get("read_only"):
+            command += ["--read-only"]
+        started = time.time()
+        try:
+            code, stdout, stderr = run_bounded(command, cwd=repo, env=env, timeout=args.timeout)
+            report = json.loads(stdout.strip().splitlines()[-1]) if stdout.strip() else {}
+            if not report:
+                result["reasons"].append(f"engine returned {code}: {stderr.strip()[-240:]}")
+        except (subprocess.TimeoutExpired, json.JSONDecodeError, IndexError) as error:
+            report = {"status": "Timeout" if isinstance(error, subprocess.TimeoutExpired) else "NoReport"}
+            result["reasons"].append(str(error)[:200])
+        result.update({
+            "seconds": round(time.time() - started),
+            "status": report.get("status"),
+            "steps": report.get("steps"),
+            "input_tokens": report.get("input_tokens"),
+            "models": report.get("models"),
+            "summary": (report.get("summary") or "")[:400],
+            "trace_metrics": trace_metrics(trace),
+            "trace_evidence": trace_evidence(trace),
+        })
+        result["reasons"].extend(grade_result(task, {**report, "trace_metrics": result["trace_metrics"]}, repo, env))
+        result["passed"] = not result["reasons"]
+    except Exception as error:  # a broken task must not stop the bench
+        result["reasons"].append(f"runner error: {error}")
+    finally:
+        if not args.keep and not (args.keep_failures and not result["passed"]):
+            shutil.rmtree(work, ignore_errors=True)
+        else:
+            result["workdir"] = str(work)
+    return result
+
+
+def summarize(results: list[dict]) -> dict:
+    return {
+        "passed": sum(r["passed"] for r in results),
+        "total": len(results),
+        "steps": sum(r.get("steps") or 0 for r in results),
+        "input_tokens": sum(r.get("input_tokens") or 0 for r in results),
+        "seconds": sum(r.get("seconds") or 0 for r in results),
+    }
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--engine", help="loom binary (default: build loom-core release)")
+    ap.add_argument("--crate", default=str(ROOT / "loom-core"), help="crate to build when --engine is not given")
+    ap.add_argument("--model", help="pin a model, e.g. omniroute/agy/claude-sonnet-4-6")
+    ap.add_argument("--only", nargs="*")
+    ap.add_argument("--max-cost", choices=["local", "free", "subscription"], default="subscription")
+    ap.add_argument("--jobs", type=int, default=1)
+    ap.add_argument("--timeout", type=int, default=1200)
+    ap.add_argument("--json")
+    ap.add_argument("--keep", action="store_true")
+    ap.add_argument("--keep-failures", action="store_true")
+    args = ap.parse_args()
+    if args.engine:
+        engine = Path(args.engine).resolve()
+    else:
+        target = Path(args.crate) / "target-replay"
+        build = subprocess.run(["cargo", "build", "-q", "--release", "--bin", "loom"], cwd=args.crate,
+                               env={**os.environ, "CARGO_TARGET_DIR": str(target)}, capture_output=True, text=True)
+        if build.returncode != 0:
+            sys.exit(f"build failed:\n{build.stderr[-2000:]}")
+        engine = target / "release" / "loom"
+    tasks = [json.loads(p.read_text()) for p in sorted(TASKS.glob("*.json"))]
+    tasks = [t for t in tasks if not args.only or t["id"] in args.only]
+    if not tasks:
+        sys.exit("no matching replay tasks")
+    with ThreadPoolExecutor(args.jobs) as pool:
+        results = list(pool.map(lambda t: run_task(t, engine, args), tasks))
+    summary = summarize(results)
+    print(f"replay: {summary['passed']}/{summary['total']} passed · {summary['steps']} steps · "
+          f"input {summary['input_tokens']} tokens · {summary['seconds']}s")
+    for r in results:
+        print(f"  {'✓' if r['passed'] else '✗'} {r['task']:<20} {r.get('status')} · {r.get('steps')} steps · "
+              f"{r.get('seconds')}s · {list((r.get('models') or {}).keys())[:2]}")
+        for reason in r["reasons"]:
+            print(f"      - {reason[:160]}")
+    if args.json:
+        Path(args.json).write_text(json.dumps({"summary": summary, "results": results}, ensure_ascii=False, indent=2))
+    sys.exit(0 if summary["passed"] == summary["total"] else 1)
+
+
+if __name__ == "__main__":
+    main()

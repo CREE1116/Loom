@@ -1,0 +1,1 @@
+LruCache in src/lru.rs evicts the wrong entry and `get` does not count as a use. Fix it so the least recently used entry (by get or put) is evicted when full, updating an existing key never evicts, and a capacity of 0 stores nothing.

@@ -1,0 +1,183 @@
+#!/usr/bin/env python3
+"""Status of every loom-selfimprove loop: what runs, what it is doing, what it achieved.
+
+    scripts/loom-status            # once
+    scripts/loom-status --watch    # refresh every 5 seconds (Ctrl+C to stop)
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import re
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+RUNS = ROOT / ".custom-tui" / "selfimprove"
+COLOR = sys.stdout.isatty() and not os.environ.get("NO_COLOR")
+
+
+def c(code, text):
+    return f"\033[{code}m{text}\033[0m" if COLOR else text
+
+
+def running() -> dict[str, tuple[int, str, str]]:
+    """run dir name → (pid, target, elapsed) for live loops."""
+    out = subprocess.run(["ps", "-o", "pid=,etime=,command=", "-ax"], capture_output=True, text=True).stdout
+    live = {}
+    for line in out.splitlines():
+        if "loom-selfimprove" not in line or "caffeinate" in line or "grep" in line:
+            continue
+        parts = line.split(None, 2)
+        m = re.search(r"--run-dir \S*/(\d{8}-\d{6})", parts[2])
+        target = re.search(r"--target (\w+)", parts[2])
+        if m:
+            live[m.group(1)] = (int(parts[0]), target.group(1) if target else "ui", parts[1])
+    return live
+
+
+def last_board(report: Path) -> list[str]:
+    if not report.exists():
+        return []
+    blocks = re.findall(r"```\n(━━ 반복.*?)\n```", report.read_text(), re.S)
+    return blocks[-1].splitlines() if blocks else []
+
+
+def kept_reverted(report: Path) -> tuple[int, int]:
+    text = report.read_text() if report.exists() else ""
+    return len(re.findall(r"성과 · KEPT", text)), len(re.findall(r"성과 · REVERTED", text))
+
+
+def current(run_log: Path) -> tuple[str, str]:
+    """(iteration header, what it is doing now)."""
+    if not run_log.exists():
+        return "", ""
+    lines = [l for l in run_log.read_text(errors="replace").splitlines() if l.strip()]
+    header = next((l for l in reversed(lines) if re.match(r"^\[\d+\] \d\d:\d\d ", l)), "")
+    doing = next((l for l in reversed(lines) if re.match(r"^\[\d+\] (fix|improve|feature|implementing|UX review|roadmap|exploring|exploration)", l)), "")
+    phase = next((l for l in reversed(lines) if l.startswith("[phase] ")), "")
+    if phase and (not doing or lines.index(phase) > lines.index(doing)):
+        doing = phase.removeprefix("[phase] ")
+    if lines and ("final:" in lines[-1] or any("patch:" in l for l in lines[-12:])):
+        doing = "finished"
+    elif not header and not phase:
+        doing = "first inspection (build · tests · checks)"
+    return header, doing
+
+
+def bench_progress(run: Path) -> list[str]:
+    """Live engine bench of a core/engine loop: one line per task."""
+    import json
+    live = run / "bench-live"
+    try:
+        tasks = json.loads((live / "tasks.json").read_text())
+    except (OSError, json.JSONDecodeError):
+        return []
+    done = [json.loads((live / f"{t}.result.json").read_text()) for t in tasks if (live / f"{t}.result.json").exists()]
+    if len(done) == len(tasks):
+        return []
+    running_now = [t for t in tasks if (live / f"{t}.trace.jsonl").exists() and not (live / f"{t}.result.json").exists()]
+    out = [f"bench {len(done)}/{len(tasks)} done · {sum(r['passed'] for r in done)} passed · running: {', '.join(running_now) or '-'}"]
+    for t in running_now:
+        last = ""
+        for line in (live / f"{t}.trace.jsonl").read_text(errors="replace").splitlines():
+            try:
+                ev = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if ev.get("calls"):
+                last = f"step {ev.get('step')} → " + ", ".join(c.get("tool", "?") for c in ev["calls"])
+        out.append(f"  {t}: {last or 'starting'}")
+    return out
+
+
+def recent_events(path: Path, n: int) -> list[str]:
+    """Last few things the agent did, from a Codex or Loom trace."""
+    import json
+    events = []
+    try:
+        with open(path, "rb") as f:
+            f.seek(max(0, path.stat().st_size - 200_000))
+            lines = f.read().decode(errors="replace").splitlines()[1:]
+    except OSError:
+        return []
+    for line in lines:
+        try:
+            ev = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        item = ev.get("item") or {}
+        if ev.get("type") == "item.started" and item.get("type") == "command_execution":
+            cmd = re.sub(r"^/bin/(?:ba|z)?sh -lc ['\"]?", "", item.get("command", "")).rstrip("'\"")
+            events.append("$ " + cmd)
+        elif ev.get("type") == "item.completed" and item.get("type") == "file_change":
+            events.append("✎ " + ", ".join(os.path.basename(ch.get("path", "")) for ch in item.get("changes", [])))
+        elif ev.get("type") == "item.completed" and item.get("type") == "agent_message":
+            events.append("● " + item.get("text", "").replace("\n", " "))
+        elif "calls" in ev:
+            events += [f"→ {c['tool']} {json.dumps(c.get('args', {}), ensure_ascii=False)}" for c in ev["calls"]]
+    return [e[:150] for e in events[-n:]]
+
+
+def show(feed: int = 0):
+    live = running()
+    runs = sorted((p for p in RUNS.glob("2*") if p.is_dir()), key=lambda p: p.name, reverse=True)
+    shown = sorted([r for r in runs if r.name in live], key=lambda r: live[r.name][1]) or runs[:1]
+    print(c("1", f"Loom self-improve · {time.strftime('%H:%M:%S')} · {len(live)} running"))
+    for run in shown:
+        pid, target, elapsed = live.get(run.name, (None, "?", "-"))
+        state = c("32", f"running pid {pid}") if pid else c("2", "stopped")
+        kept, reverted = kept_reverted(run / "REPORT.md")
+        print()
+        print(c("1;36", f"■ {target.upper()} loop") + f"  {run.name} · {state} · elapsed {elapsed} · kept {kept} · reverted {reverted}")
+        header, doing = current(run / "run.log")
+        if header:
+            print("  " + c("2", re.sub(r"^\[(\d+)\] ", r"iteration \1 · ", header)[:160]))
+        if doing:
+            print("  " + c("33", "now: ") + re.sub(r"^\[\d+\] ", "", doing)[:150])
+        if pid:
+            for line in bench_progress(run):
+                print("  " + c("36", line))
+        agent = sorted(run.glob("agent-*.jsonl"), key=lambda p: p.stat().st_mtime)
+        if agent and pid:
+            age = int(time.time() - agent[-1].stat().st_mtime)
+            print("  " + c("2", f"agent log {agent[-1].name} · last activity {age}s ago"))
+            for event in recent_events(agent[-1], feed):
+                color = "34" if event.startswith("✎") else "1" if event.startswith("●") else "2"
+                print("    " + c(color, event))
+        board = last_board(run / "REPORT.md")
+        if board:
+            print("  " + c("2", "last result:"))
+            for line in board:
+                print("    " + (c("1;32", line) if "KEPT" in line else c("1;31", line) if "REVERTED" in line else line))
+        print("  " + c("2", f"live: scripts/loom-watch {run}"))
+    stages = sorted((ROOT / ".custom-tui" / "stage").glob("*/loop.pid"))
+    if stages:
+        print()
+        for lock in stages:
+            print(c("2", f"stage [{lock.parent.name}]: LOOM_STAGE_NAME={lock.parent.name} scripts/loom-stage open"))
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--watch", action="store_true")
+    ap.add_argument("--feed", type=int, default=6, help="recent agent events per loop")
+    args = ap.parse_args()
+    if not args.watch:
+        show(args.feed)
+        return
+    try:
+        while True:
+            sys.stdout.write("\033[H\033[2J")
+            show(args.feed)
+            sys.stdout.flush()
+            time.sleep(5)
+    except KeyboardInterrupt:
+        print()
+
+
+if __name__ == "__main__":
+    main()

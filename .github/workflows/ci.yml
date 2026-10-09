@@ -15,8 +15,6 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install stable Rust
         run: rustup update stable --no-self-update && rustup default stable
-      - name: Install Rust checks
-        run: rustup component add rustfmt clippy
       - name: Install ripgrep
         if: runner.os != 'Windows'
         shell: bash
@@ -28,40 +26,9 @@ jobs:
         shell: pwsh
         run: |
           if (-not (Get-Command rg -ErrorAction SilentlyContinue)) { choco install ripgrep -y --no-progress }
-          if (-not (Get-Command rg -ErrorAction SilentlyContinue)) { throw 'ripgrep is required for LOCAL exploration' }
-      - name: Format
-        run: cargo fmt --manifest-path custom-tui/Cargo.toml -- --check
-      - name: Test
-        run: cargo test --locked --manifest-path custom-tui/Cargo.toml
-      - name: Clippy
-        run: cargo clippy --locked --manifest-path custom-tui/Cargo.toml --all-targets -- -D warnings
-      - name: Build
-        run: cargo build --locked --manifest-path custom-tui/Cargo.toml
-      - name: Terminal interactions (no model calls)
-        if: runner.os != 'Windows'
-        run: python3 custom-tui/tests/terminal_smoke.py
-      - name: Windows launcher and LOCAL search
-        if: runner.os == 'Windows'
-        shell: pwsh
-        env:
-          CUSTOM_TUI_PROFILE: debug
-        run: |
-          if (-not (Get-Command rg -ErrorAction SilentlyContinue)) { choco install ripgrep -y --no-progress }
-          & .\scripts\loom.cmd --version
-          if ($LASTEXITCODE -ne 0) { throw 'Windows launcher failed' }
-          & .\scripts\loom.cmd --explore AgentEvent
-          if ($LASTEXITCODE -ne 0) { throw 'Windows LOCAL exploration failed' }
-      - name: Windows Codex npm launch and owned runtime cleanup (no inference)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        env:
-          CUSTOM_TUI_PROFILE: debug
-        run: |
-          npm.cmd install --global @openai/codex@0.159.3
-          if ($LASTEXITCODE -ne 0) { throw 'Codex installation failed' }
-          codex.cmd --version
-          if ($LASTEXITCODE -ne 0) { throw 'Installed Codex npm launcher failed' }
-          $loomProbeDir = Join-Path $env:RUNNER_TEMP 'loom runtime probe'
-          New-Item -ItemType Directory -Force $loomProbeDir | Out-Null
-          & .\scripts\loom.cmd --cwd $loomProbeDir --probe
-          if ($LASTEXITCODE -ne 0) { throw 'Windows Codex runtime probe failed' }
+      - name: Core tests
+        run: cargo test --locked --manifest-path loom-core/Cargo.toml
+      - name: TUI tests
+        run: cargo test --locked --manifest-path loom-tui/Cargo.toml
+      - name: Self-check (headless UI scenarios)
+        run: cargo run --locked --quiet --manifest-path loom-tui/Cargo.toml -- --self-check

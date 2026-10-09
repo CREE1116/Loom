@@ -1,0 +1,48 @@
+{
+  "summary": {
+    "passed": 0,
+    "total": 1,
+    "input_tokens": 0,
+    "output_tokens": 0,
+    "seconds": 85,
+    "mean_steps": 1.0,
+    "orient_bytes": 0,
+    "validate_bytes": 0,
+    "remote_input_tokens": 0,
+    "remote_calls": 0,
+    "contract_recall": 1.0,
+    "scope_events": 0,
+    "slice_rereads": 0,
+    "slice_bytes": 0,
+    "validated": 0,
+    "false_finish": 0,
+    "escalated": 0
+  },
+  "results": [
+    {
+      "task": "average-empty",
+      "passed": false,
+      "finished": false,
+      "stop": "Unresolved",
+      "steps": 1,
+      "seconds": 85,
+      "input_tokens": 0,
+      "remote_input_tokens": 0,
+      "remote_calls": 0,
+      "output_tokens": 0,
+      "phase_bytes": {},
+      "contract_recall": 1.0,
+      "scope_events": 0,
+      "slice_bytes": 0,
+      "slice_rereads": 0,
+      "validated": false,
+      "tiers": [
+        "Local"
+      ],
+      "models": {},
+      "diff": "",
+      "test_tail": " --> tests/hidden.rs:3:46\n  |\n3 | #[test] fn none() { assert_eq!(average(&[]), None); }\n  |                                              ^^^^ expected `f64`, found `Option<_>`\n  |\n  = note: expected type `f64`\n             found enum `Option<_>`\n\nFor more information about this error, try `rustc --explain E0308`.\nerror: could not compile `bench_task` (test \"hidden\") due to 2 previous errors\n\nworker made no source changes",
+      "trace_tail": []
+    }
+  ]
+}

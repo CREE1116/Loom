@@ -1,0 +1,179 @@
+#!/usr/bin/env python3
+"""One command for the improvement loops: start them and watch them in this terminal.
+
+    scripts/loom-night                     # ui + core loops, 8 hours, live stage windows
+    scripts/loom-night --hours 6 --targets ui core engine
+    scripts/loom-night --no-stage          # no stage windows
+
+The loops belong to this dashboard: press Ctrl+C (or close the terminal) and every loop,
+its agent, builds and stage windows are stopped. Work kept so far is still reported
+(REPORT.md and changes.patch in each run directory).
+
+    scripts/loom-night --detach            # run in the background instead (no dashboard)
+    scripts/loom-night status              # dashboard for background loops (Ctrl+C leaves them running)
+    scripts/loom-night stop                # stop background loops
+"""
+
+from __future__ import annotations
+
+import argparse
+import importlib.machinery
+import importlib.util
+import os
+import re
+import signal
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+SCRIPTS = ROOT / "scripts"
+RUNS = ROOT / ".custom-tui" / "selfimprove"
+
+
+def load_status():
+    loader = importlib.machinery.SourceFileLoader("loom_status", str(SCRIPTS / "loom-status"))
+    spec = importlib.util.spec_from_loader("loom_status", loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+def live_targets() -> dict[str, int]:
+    out = subprocess.run(["ps", "-o", "pid=,command=", "-ax"], capture_output=True, text=True).stdout
+    live = {}
+    for line in out.splitlines():
+        if "loom-selfimprove" in line and "--run-dir" in line and "caffeinate" not in line:
+            pid, cmd = line.strip().split(None, 1)
+            m = re.search(r"--target (\w+)", cmd)
+            live[m.group(1) if m else "ui"] = int(pid)
+    return live
+
+
+def start_attached(targets, hours, stage) -> list[tuple[str, subprocess.Popen, Path]]:
+    children = []
+    running = live_targets()
+    for target in targets:
+        if target in running:
+            print(f"{target}: a background loop is already running (pid {running[target]}); "
+                  f"stop it with `scripts/loom-night stop` first")
+            continue
+        run_dir = RUNS / time.strftime("%Y%m%d-%H%M%S")
+        while run_dir.exists():
+            time.sleep(1)
+            run_dir = RUNS / time.strftime("%Y%m%d-%H%M%S")
+        run_dir.mkdir(parents=True)
+        cmd = [sys.executable, str(SCRIPTS / "loom-selfimprove"), "--target", target, "--hours", str(hours),
+               "--run-dir", str(run_dir)] + (["--stage"] if stage else [])
+        log = open(run_dir / "run.log", "a")
+        # Own process group: the dashboard stops the loop and everything it started together.
+        proc = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+                                cwd=ROOT, start_new_session=True)
+        children.append((target, proc, run_dir))
+        time.sleep(1.2)
+    return children
+
+
+def stop_all(children):
+    alive = [(t, p, d) for t, p, d in children if p.poll() is None]
+    if not alive:
+        return
+    print(f"\nstopping {len(alive)} loop(s); kept work is reported first…", flush=True)
+    for _, proc, _ in alive:
+        try:
+            os.killpg(proc.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+    deadline = time.time() + 90
+    while time.time() < deadline and any(p.poll() is None for _, p, _ in alive):
+        time.sleep(0.5)
+    for _, proc, _ in alive:
+        if proc.poll() is None:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+
+
+def summary(children):
+    status = load_status()
+    print()
+    for target, _, run_dir in children:
+        kept, reverted = status.kept_reverted(run_dir / "REPORT.md")
+        patch = run_dir / "changes.patch"
+        print(f"{target}: kept {kept} · reverted {reverted} · {run_dir}")
+        if patch.exists() and patch.stat().st_size:
+            print(f"   patch: {patch}")
+
+
+def dashboard(children=None):
+    status = load_status()
+    while True:
+        sys.stdout.write("\033[H\033[2J")
+        status.show(6)
+        if children is not None:
+            print("\n\033[2mCtrl+C or closing this terminal stops these loops.\033[0m")
+            if all(p.poll() is not None for _, p, _ in children):
+                print("all loops finished")
+                return
+        else:
+            print("\n\033[2mCtrl+C closes the dashboard; background loops keep running.\033[0m")
+        sys.stdout.flush()
+        time.sleep(5)
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("action", nargs="?", choices=["start", "status", "stop"], default="start")
+    ap.add_argument("--hours", type=float, default=8)
+    ap.add_argument("--targets", nargs="+", default=["ui", "core"], choices=["ui", "core", "engine"])
+    ap.add_argument("--no-stage", action="store_true")
+    ap.add_argument("--detach", action="store_true", help="run loops in the background without a dashboard")
+    args = ap.parse_args()
+
+    if args.action == "stop":
+        for target, pid in live_targets().items():
+            os.kill(pid, signal.SIGTERM)
+            print(f"stopped {target} loop (pid {pid})")
+        return
+    if args.action == "status":
+        try:
+            dashboard()
+        except KeyboardInterrupt:
+            print()
+        return
+    if args.detach:
+        for target in args.targets:
+            if target in live_targets():
+                print(f"{target} loop already running")
+                continue
+            cmd = [sys.executable, str(SCRIPTS / "loom-selfimprove"), "--target", target, "--hours", str(args.hours), "--detach"]
+            subprocess.run(cmd + ([] if args.no_stage else ["--stage"]), cwd=ROOT)
+            time.sleep(2)
+        print("background loops started; watch with `scripts/loom-night status`, stop with `scripts/loom-night stop`")
+        return
+
+    children = start_attached(args.targets, args.hours, not args.no_stage)
+    if not children:
+        return
+    if sys.platform == "darwin":
+        # keep the Mac awake exactly as long as this dashboard lives
+        subprocess.Popen(["caffeinate", "-i", "-w", str(os.getpid())], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    def on_signal(*_):
+        raise KeyboardInterrupt
+
+    signal.signal(signal.SIGTERM, on_signal)
+    signal.signal(signal.SIGHUP, on_signal)  # the terminal window was closed
+    try:
+        dashboard(children)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        stop_all(children)
+        summary(children)
+
+
+if __name__ == "__main__":
+    main()

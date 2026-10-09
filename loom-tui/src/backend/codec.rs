@@ -1,0 +1,843 @@
+//! Codex protocol decoding. The renderer never receives JSON payloads.
+use crate::agent::*;
+use serde_json::{Value, json};
+use std::collections::HashMap;
+
+pub fn summary(thread: &Value) -> Option<SessionSummary> {
+    let title = thread["name"]
+        .as_str()
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| thread["preview"].as_str())
+        .unwrap_or("제목 없는 대화");
+    Some(SessionSummary {
+        id: thread["id"].as_str()?.into(),
+        title: title
+            .lines()
+            .next()
+            .unwrap_or(title)
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" "),
+        status: thread["status"]["type"].as_str().unwrap_or("").into(),
+        updated_at: thread["updatedAt"].as_u64(),
+    })
+}
+
+pub fn snapshot(thread: &Value) -> Option<SessionSnapshot> {
+    Some(SessionSnapshot {
+        id: thread["id"].as_str()?.into(),
+        title: thread["name"]
+            .as_str()
+            .filter(|s| !s.trim().is_empty())
+            .or_else(|| thread["preview"].as_str().filter(|s| !s.trim().is_empty()))
+            .map(str::to_owned),
+        status: thread["status"]["type"].as_str().map(str::to_owned),
+        turns: thread["turns"].as_array().map(|turns| {
+            turns
+                .iter()
+                .map(|turn| TurnSnapshot {
+                    id: turn["id"].as_str().map(str::to_owned),
+                    status: turn["status"].as_str().unwrap_or("").into(),
+                    entries: turn["items"]
+                        .as_array()
+                        .map(|items| items.iter().filter_map(entry_from_item).collect())
+                        .unwrap_or_default(),
+                    activities: turn["items"]
+                        .as_array()
+                        .map(|items| items.iter().flat_map(activities).collect())
+                        .unwrap_or_default(),
+                })
+                .collect()
+        }),
+    })
+}
+
+pub fn permissions(settings: &Value, defaults: bool) -> Permissions {
+    if defaults {
+        Permissions {
+            approval: settings["approval_policy"]
+                .as_str()
+                .map(str::to_owned)
+                .or_else(|| {
+                    settings["approval_policy"]
+                        .is_object()
+                        .then(|| "granular".into())
+                }),
+            sandbox: settings["sandbox_mode"].as_str().map(|s| {
+                match s {
+                    "read-only" => "readOnly",
+                    "workspace-write" => "workspaceWrite",
+                    "danger-full-access" => "dangerFullAccess",
+                    other => other,
+                }
+                .into()
+            }),
+            network: None,
+        }
+    } else {
+        Permissions {
+            approval: (!settings["approvalPolicy"].is_null()).then(|| {
+                settings["approvalPolicy"]
+                    .as_str()
+                    .unwrap_or("granular")
+                    .into()
+            }),
+            sandbox: settings["sandboxPolicy"]["type"]
+                .as_str()
+                .or_else(|| settings["sandbox"]["type"].as_str())
+                .map(str::to_owned),
+            network: None,
+        }
+    }
+}
+
+pub fn activities(item: &Value) -> Vec<Agent> {
+    if !matches!(
+        item["type"].as_str(),
+        Some("collabAgentToolCall" | "collabToolCall")
+    ) {
+        return vec![];
+    }
+    let mut ids: Vec<String> = item["receiverThreadIds"]
+        .as_array()
+        .map(|ids| {
+            ids.iter()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default();
+    for key in ["receiverThreadId", "newThreadId"] {
+        if let Some(id) = item[key].as_str() {
+            ids.push(id.into());
+        }
+    }
+    ids.into_iter()
+        .map(|id| {
+            let state = &item["agentsStates"][&id];
+            Agent {
+                status: state["status"]
+                    .as_str()
+                    .or_else(|| item["agentStatus"].as_str())
+                    .unwrap_or("working")
+                    .into(),
+                detail: state["message"]
+                    .as_str()
+                    .or_else(|| item["prompt"].as_str())
+                    .unwrap_or("")
+                    .into(),
+                id,
+                name: String::new(),
+            }
+        })
+        .collect()
+}
+
+pub fn item_events(item: &Value) -> Vec<AgentUpdate> {
+    let mut updates: Vec<_> = entry_from_item(item)
+        .map(AgentUpdate::EntryUpdated)
+        .into_iter()
+        .collect();
+    if item["type"] == "commandExecution" {
+        updates.push(AgentUpdate::WorkPhaseUpdated(if item["status"] == "inProgress" {
+            WorkPhase::Command
+        } else {
+            WorkPhase::Thinking
+        }));
+    }
+    match async_input_request(item) {
+        Ok(Some(request)) => updates.push(AgentUpdate::InputRequested(request)),
+        Err(error) => updates.push(AgentUpdate::Error(format!(
+            "비동기 질문 형식 오류: {error}"
+        ))),
+        Ok(None) => {}
+    }
+    updates.extend(
+        activities(item)
+            .into_iter()
+            .map(AgentUpdate::ActivityUpdated),
+    );
+    updates
+}
+
+pub fn goal_state(value: &Value) -> Option<GoalState> {
+    Some(GoalState {
+        objective: value["objective"].as_str()?.into(),
+        status: value["status"].as_str()?.into(),
+        tokens_used: value["tokensUsed"].as_u64(),
+        token_budget: value["tokenBudget"].as_u64(),
+    })
+}
+
+pub fn notification(method: &str, params: &Value) -> Vec<AgentEvent> {
+    let updates = match method {
+        "thread/goal/updated" => vec![AgentUpdate::GoalUpdated(goal_state(&params["goal"]))],
+        "thread/goal/cleared" => vec![AgentUpdate::GoalUpdated(None)],
+        "thread/compacted" => vec![AgentUpdate::CompressionState {
+            running: false,
+            error: None,
+        }],
+        "item/started" | "item/completed" if params["item"]["type"] == "contextCompaction" => {
+            vec![AgentUpdate::CompressionState {
+                running: method == "item/started",
+                error: None,
+            }]
+        }
+        "serverRequest/resolved" => vec![AgentUpdate::ApprovalResolved(
+            params["requestId"].to_string(),
+        )],
+        "turn/started" => vec![AgentUpdate::TurnStarted {
+            id: params["turn"]["id"].as_str().map(str::to_owned),
+        }],
+        "turn/completed" => {
+            let mut updates = vec![AgentUpdate::TurnCompleted {
+                id: params["turn"]["id"].as_str().map(str::to_owned),
+                status: params["turn"]["status"]
+                    .as_str()
+                    .unwrap_or("completed")
+                    .into(),
+                error: params["turn"]["error"]["message"]
+                    .as_str()
+                    .map(str::to_owned),
+            }];
+            if let Some((kind, reason)) = execution_limit(&params["turn"]["error"]) {
+                updates.push(AgentUpdate::ExecutionLimited { kind, reason });
+            }
+            updates
+        }
+        "item/started" | "item/completed" => item_events(&params["item"]),
+        "item/agentMessage/delta" | "item/commandExecution/outputDelta" | "item/plan/delta" => {
+            vec![AgentUpdate::EntryDelta {
+                id: params["itemId"].as_str().unwrap_or("stream").into(),
+                kind: if method.contains("commandExecution") {
+                    Kind::Tool
+                } else {
+                    Kind::Assistant
+                },
+                text: params["delta"].as_str().unwrap_or("").into(),
+            }]
+        }
+        "turn/diff/updated" => vec![AgentUpdate::DiffUpdated(
+            params["diff"].as_str().unwrap_or("").into(),
+        )],
+        "thread/tokenUsage/updated" => vec![AgentUpdate::TokenUsageUpdated(token_usage(
+            &params["tokenUsage"],
+        ))],
+        "item/reasoning/summaryTextDelta" | "item/reasoning/textDelta" => {
+            vec![AgentUpdate::WorkPhaseUpdated(WorkPhase::Thinking)]
+        }
+        "thread/status/changed" => {
+            let status = params["status"]["type"].as_str().unwrap_or("unknown");
+            vec![AgentUpdate::StatusUpdated {
+                status: status.into(),
+                busy: status == "active",
+            }]
+        }
+        "thread/settings/updated" => {
+            let settings = &params["threadSettings"];
+            let mut updates = vec![AgentUpdate::PermissionsUpdated {
+                permissions: permissions(settings, false),
+                defaults_only: false,
+            }];
+            if let Some(effort) = settings["effort"].as_str() {
+                updates.push(AgentUpdate::EffortObserved(Some(effort.into())));
+            }
+            updates
+        }
+        "error" => {
+            if let Some((kind, reason)) = execution_limit(&params["error"]) {
+                if params["willRetry"].as_bool() == Some(true) {
+                    vec![AgentUpdate::Notice(format!(
+                        "호출 제한 · runtime이 재시도 중입니다. {reason}"
+                    ))]
+                } else {
+                    vec![AgentUpdate::ExecutionLimited { kind, reason }]
+                }
+            } else {
+                vec![AgentUpdate::Error(
+                    params["error"]["message"]
+                        .as_str()
+                        .unwrap_or("Runtime error")
+                        .into(),
+                )]
+            }
+        }
+        _ => vec![],
+    };
+    updates
+        .into_iter()
+        .map(|update| AgentEvent {
+            session_id: params["threadId"].as_str().map(str::to_owned),
+            update,
+        })
+        .collect()
+}
+
+/// Reply payloads stay in the adapter; the UI sees only opaque choice tokens.
+pub fn approval(
+    id: &Value,
+    method: &str,
+    params: &Value,
+) -> Option<(Approval, HashMap<String, Value>)> {
+    let mut payloads = HashMap::new();
+    let mut choices = Vec::new();
+    let mut add = |label: &str, payload: Value| {
+        let token = choices.len().to_string();
+        payloads.insert(token.clone(), payload);
+        choices.push(Choice {
+            label: label.into(),
+            result: token,
+        });
+    };
+    let title = match method {
+        "item/commandExecution/requestApproval" | "item/fileChange/requestApproval" => {
+            let available = params["availableDecisions"].as_array();
+            for (decision, label) in [
+                ("accept", "이번 요청 허용"),
+                ("acceptForSession", "이 세션에서 허용"),
+                ("decline", "거절"),
+                ("cancel", "취소"),
+            ] {
+                if decision == "acceptForSession" && available.is_none() {
+                    continue;
+                }
+                if available.is_none_or(|list| list.iter().any(|v| v.as_str() == Some(decision))) {
+                    add(label, json!({"decision":decision}));
+                }
+            }
+            if method.contains("commandExecution") {
+                "명령 실행 승인"
+            } else {
+                "파일 변경 승인"
+            }
+        }
+        "item/permissions/requestApproval" => {
+            add(
+                "이번 턴 허용",
+                json!({"permissions":params["permissions"],"scope":"turn"}),
+            );
+            add("권한 거절", json!({"permissions":{},"scope":"turn"}));
+            "추가 권한 요청"
+        }
+        "mcpServer/elicitation/request" => {
+            add("거절", json!({"action":"decline","content":null}));
+            add("취소", json!({"action":"cancel","content":null}));
+            "MCP 입력 요청"
+        }
+        _ => return None,
+    };
+    let mut summary = Vec::new();
+    for (key, label) in [
+        ("command", "명령"),
+        ("cwd", "작업 위치"),
+        ("grantRoot", "접근 경로"),
+        ("reason", "요청 이유"),
+    ] {
+        if let Some(value) = params[key].as_str().filter(|s| !s.is_empty()) {
+            summary.push(format!("{label}: {value}"));
+        } else if let Some(values) = params[key].as_array() {
+            summary.push(format!(
+                "{label}: {}",
+                values
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            ));
+        }
+    }
+    if !params["permissions"].is_null() {
+        summary.push(format!("추가 권한: {}", params["permissions"]));
+    }
+    Some((
+        Approval {
+            id: id.to_string(),
+            title: title.into(),
+            summary: summary.join("\n"),
+            detail: serde_json::to_string_pretty(params).unwrap_or_default(),
+            choices,
+            answering: false,
+            expanded: false,
+        },
+        payloads,
+    ))
+}
+
+pub fn turn_input(text: &str, skills: &[Skill]) -> Value {
+    turn_input_with_images(text, skills, &[])
+}
+
+pub fn turn_input_with_images(
+    text: &str,
+    skills: &[Skill],
+    images: &[crate::attachment::ImageAttachment],
+) -> Value {
+    let mut input = Vec::new();
+    if !text.is_empty() {
+        input.push(json!({"type":"text", "text":text}));
+    }
+    input.extend(
+        images
+            .iter()
+            .map(|image| json!({"type":"localImage", "path":image.path()})),
+    );
+    input.extend(
+        skills
+            .iter()
+            .map(|s| json!({"type":"skill", "name":s.name, "path":s.path})),
+    );
+    Value::Array(input)
+}
+
+pub fn session_page(result: &Value, append: bool) -> AgentUpdate {
+    match result["data"].as_array() {
+        Some(data) => AgentUpdate::SessionsLoaded {
+            sessions: data.iter().filter_map(summary).collect(),
+            cursor: result["nextCursor"].as_str().map(str::to_owned),
+            append,
+        },
+        None => AgentUpdate::SessionsFailed(
+            "세션 목록 응답이 올바르지 않습니다. 이전 목록을 유지합니다.".into(),
+        ),
+    }
+}
+
+fn user_message_text(item: &Value) -> String {
+    let text = item["content"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|value| {
+            if let Some(text) = value["text"].as_str() {
+                return Some(text.to_owned());
+            }
+            match value["type"].as_str() {
+                Some("localImage") => {
+                    let name = value["path"]
+                        .as_str()
+                        .and_then(|path| std::path::Path::new(path).file_name())
+                        .map(|name| name.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| "첨부".into());
+                    Some(format!("[이미지 · {name}]"))
+                }
+                Some("image" | "inputImage") => Some("[이미지]".into()),
+                _ => None,
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    if let Some(payload) = text
+        .trim()
+        .strip_prefix("<send_user_message_question_reply>")
+        .and_then(|s| s.strip_suffix("</send_user_message_question_reply>"))
+        && let Ok(value) = serde_json::from_str::<Value>(payload.trim())
+    {
+        let replies = value.as_array().cloned().unwrap_or_else(|| vec![value]);
+        if !replies.is_empty()
+            && let Some(display) = replies
+                .iter()
+                .map(|reply| {
+                    Some(format!(
+                        "> {}\n\n{}",
+                        reply["question"].as_str()?,
+                        reply["answer"].as_str()?
+                    ))
+                })
+                .collect::<Option<Vec<_>>>()
+        {
+            return display.join("\n\n");
+        }
+    }
+    text
+}
+
+pub fn entry_from_item(item: &Value) -> Option<Entry> {
+    let id = item["id"].as_str()?.to_owned();
+    let typ = item["type"].as_str()?;
+    let (kind, title, body) = match typ {
+        "userMessage" => (Kind::User, "› 나".into(), user_message_text(item)),
+        "agentMessage" | "plan" => (
+            Kind::Assistant,
+            "● 에이전트".into(),
+            match async_input_request(item) {
+                Ok(Some(request)) => request
+                    .questions
+                    .iter()
+                    .map(|question| question.prompt.as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n\n"),
+                _ => item["text"].as_str().unwrap_or("").into(),
+            },
+        ),
+        "commandExecution" => (
+            Kind::Tool,
+            item["command"].as_str().unwrap_or("명령 실행").into(),
+            match item["cwd"].as_str().filter(|cwd| !cwd.is_empty()) {
+                Some(cwd) => format!(
+                    "위치: {cwd}\n{}",
+                    item["aggregatedOutput"].as_str().unwrap_or("")
+                ),
+                None => item["aggregatedOutput"].as_str().unwrap_or("").into(),
+            },
+        ),
+        "fileChange" => (
+            Kind::Change,
+            "파일 변경".into(),
+            item["changes"]
+                .as_array()
+                .map(|changes| {
+                    changes
+                        .iter()
+                        .map(|v| {
+                            format!(
+                                "+++ {}\n{}",
+                                v["path"].as_str().unwrap_or(""),
+                                v["diff"].as_str().unwrap_or("")
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                })
+                .unwrap_or_default(),
+        ),
+        "collabAgentToolCall" | "collabToolCall" => (
+            Kind::Tool,
+            "에이전트 작업".into(),
+            item["prompt"]
+                .as_str()
+                .unwrap_or("활동 탭에서 에이전트별 작업을 확인하세요.")
+                .into(),
+        ),
+        "reasoning" => return None,
+        _ => (
+            Kind::Tool,
+            typ.into(),
+            serde_json::to_string_pretty(item).unwrap_or_default(),
+        ),
+    };
+    Some(Entry {
+        id,
+        kind,
+        title,
+        body,
+        status: item["status"].as_str().unwrap_or("completed").into(),
+        expanded: false,
+    })
+}
+
+pub fn skills(result: &Value) -> (Vec<Skill>, Vec<String>) {
+    let mut skills_found = Vec::<Skill>::new();
+    let mut errors_found = Vec::new();
+    if let Some(data) = result["data"].as_array() {
+        for entry in data {
+            if let Some(skills) = entry["skills"].as_array() {
+                for skill in skills {
+                    if skill["enabled"] == false {
+                        continue;
+                    }
+                    if let (Some(name), Some(path)) =
+                        (skill["name"].as_str(), skill["path"].as_str())
+                        && !skills_found.iter().any(|s| s.path == path)
+                    {
+                        skills_found.push(Skill {
+                            name: name.into(),
+                            path: path.into(),
+                            description: skill["interface"]["shortDescription"]
+                                .as_str()
+                                .or_else(|| skill["shortDescription"].as_str())
+                                .or_else(|| skill["description"].as_str())
+                                .unwrap_or("")
+                                .into(),
+                        });
+                    }
+                }
+            }
+            if let Some(errors) = entry["errors"].as_array() {
+                for error in errors {
+                    errors_found.push(
+                        error["message"]
+                            .as_str()
+                            .unwrap_or("스킬을 읽지 못했습니다")
+                            .into(),
+                    );
+                }
+            }
+        }
+    }
+    skills_found.sort_by(|a, b| a.name.cmp(&b.name));
+    (skills_found, errors_found)
+}
+
+/// Async questions are assistant items, not JSON-RPC server requests.
+pub fn async_input_request(item: &Value) -> anyhow::Result<Option<InputRequest>> {
+    use anyhow::{Context, ensure};
+    if item["type"] != "agentMessage" || item["delivery"] != "async" || item["questions"].is_null()
+    {
+        return Ok(None);
+    }
+    let item_id = item["id"]
+        .as_str()
+        .filter(|id| !id.is_empty())
+        .context("Missing async item ID")?;
+    let questions = item["questions"]
+        .as_array()
+        .context("Missing async questions")?;
+    ensure!(
+        !questions.is_empty() && questions.len() <= 16,
+        "Expected 1–16 questions"
+    );
+    let mut decoded = Vec::new();
+    for (index, question) in questions.iter().enumerate() {
+        let prompt = question["title"]
+            .as_str()
+            .filter(|s| !s.trim().is_empty())
+            .context("Missing question title")?;
+        let options = match &question["options"] {
+            Value::Null => vec![],
+            Value::Array(options) => {
+                ensure!(options.len() <= 32, "Too many options");
+                options
+                    .iter()
+                    .map(|option| {
+                        Ok(QuestionOption {
+                            label: option
+                                .as_str()
+                                .filter(|s| !s.trim().is_empty())
+                                .context("Invalid option")?
+                                .into(),
+                            description: String::new(),
+                        })
+                    })
+                    .collect::<anyhow::Result<Vec<_>>>()?
+            }
+            _ => anyhow::bail!("Invalid async options"),
+        };
+        decoded.push(Question {
+            id: serde_json::json!(["request_user_input_async", item_id, index]).to_string(),
+            header: "질문".into(),
+            prompt: prompt.into(),
+            options,
+            allow_custom: true,
+            secret: false,
+        });
+    }
+    Ok(Some(InputRequest {
+        id: format!("async:{item_id}"),
+        questions: decoded,
+        blocking: false,
+    }))
+}
+
+pub fn pending_async_questions(thread: &Value) -> Vec<InputRequest> {
+    let items: Vec<&Value> = thread["turns"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .flat_map(|turn| turn["items"].as_array().into_iter().flatten())
+        .collect();
+    let mut answered = std::collections::HashSet::new();
+    for item in &items {
+        if item["type"] != "userMessage" {
+            continue;
+        }
+        for content in item["content"].as_array().into_iter().flatten() {
+            let text = content["text"].as_str().unwrap_or("").trim();
+            if let Some(payload) = text
+                .strip_prefix("<send_user_message_question_reply>")
+                .and_then(|s| s.strip_suffix("</send_user_message_question_reply>"))
+                && let Ok(value) = serde_json::from_str::<Value>(payload.trim())
+            {
+                let replies = value.as_array().cloned().unwrap_or_else(|| vec![value]);
+                for reply in replies {
+                    if let Some(id) = reply["questionItemId"].as_str() {
+                        answered.insert(id.to_owned());
+                    }
+                }
+            }
+        }
+    }
+    items
+        .into_iter()
+        .filter_map(|item| async_input_request(item).ok().flatten())
+        .filter(|request| !request.questions.iter().all(|q| answered.contains(&q.id)))
+        .collect()
+}
+
+/// Decode provider questions into a bounded, provider-independent form.
+pub fn input_request(id: &Value, params: &Value) -> anyhow::Result<InputRequest> {
+    use anyhow::{Context, ensure};
+    let questions = params["questions"]
+        .as_array()
+        .context("Missing questions")?;
+    ensure!(
+        !questions.is_empty() && questions.len() <= 16,
+        "Expected 1–16 questions"
+    );
+    let mut seen = std::collections::HashSet::new();
+    let mut decoded = Vec::new();
+    for question in questions {
+        let id = question["id"]
+            .as_str()
+            .filter(|id| !id.is_empty())
+            .context("Missing question ID")?;
+        ensure!(seen.insert(id.to_owned()), "Duplicate question ID");
+        let options = match &question["options"] {
+            Value::Null => vec![],
+            Value::Array(options) => {
+                ensure!(options.len() <= 32, "Too many options");
+                options
+                    .iter()
+                    .map(|option| {
+                        Ok(QuestionOption {
+                            label: option["label"]
+                                .as_str()
+                                .filter(|s| !s.trim().is_empty())
+                                .context("Missing option label")?
+                                .into(),
+                            description: option["description"].as_str().unwrap_or("").into(),
+                        })
+                    })
+                    .collect::<anyhow::Result<Vec<_>>>()?
+            }
+            _ => anyhow::bail!("Malformed options"),
+        };
+        decoded.push(Question {
+            id: id.into(),
+            header: question["header"].as_str().unwrap_or("질문").into(),
+            prompt: question["question"]
+                .as_str()
+                .context("Missing question text")?
+                .into(),
+            allow_custom: options.is_empty() || question["isOther"].as_bool().unwrap_or(false),
+            secret: question["isSecret"].as_bool().unwrap_or(false),
+            options,
+        });
+    }
+    Ok(InputRequest {
+        id: id.to_string(),
+        questions: decoded,
+        blocking: params["isBlocking"].as_bool().unwrap_or(true),
+    })
+}
+
+pub fn token_usage(value: &Value) -> TokenUsage {
+    let total = &value["total"];
+    TokenUsage {
+        total: total["totalTokens"].as_u64(),
+        input: total["inputTokens"].as_u64(),
+        cached_input: total["cachedInputTokens"].as_u64(),
+        output: total["outputTokens"].as_u64(),
+        reasoning_output: total["reasoningOutputTokens"].as_u64(),
+        last: value["last"]["totalTokens"].as_u64(),
+        context_window: value["modelContextWindow"].as_u64(),
+    }
+}
+pub fn execution_limit(error: &Value) -> Option<(LimitKind, String)> {
+    let info = if error["codexErrorInfo"].is_null() {
+        &error["data"]["codexErrorInfo"]
+    } else {
+        &error["codexErrorInfo"]
+    };
+    let code = info.as_str().or_else(|| info["type"].as_str())?;
+    let kind = match code {
+        "usageLimitExceeded" => LimitKind::UsageExhausted,
+        "rateLimitExceeded" => LimitKind::RateLimited,
+        _ => return None,
+    };
+    Some((
+        kind,
+        error["message"]
+            .as_str()
+            .unwrap_or("Runtime resource limit")
+            .into(),
+    ))
+}
+pub fn quota_snapshots(params: &Value) -> Vec<QuotaSnapshot> {
+    fn window(value: &Value) -> Option<QuotaWindow> {
+        Some(QuotaWindow {
+            used_percent: value["usedPercent"].as_u64()?.try_into().ok()?,
+            duration_minutes: value["windowDurationMins"].as_u64(),
+            resets_at: value["resetsAt"].as_u64(),
+        })
+    }
+    fn snapshot(value: &Value, fallback: Option<&str>) -> Option<QuotaSnapshot> {
+        if !value.is_object() {
+            return None;
+        }
+        let id = value["limitId"]
+            .as_str()
+            .or(fallback)
+            .unwrap_or("runtime")
+            .to_owned();
+        let reached = match value["rateLimitReachedType"].as_str() {
+            Some("rate_limit_reached") => Some(LimitKind::RateLimited),
+            Some(
+                "workspace_owner_credits_depleted"
+                | "workspace_member_credits_depleted"
+                | "workspace_owner_usage_limit_reached"
+                | "workspace_member_usage_limit_reached",
+            ) => Some(LimitKind::UsageExhausted),
+            _ if value["spendControlReached"].as_bool() == Some(true) => {
+                Some(LimitKind::UsageExhausted)
+            }
+            _ => None,
+        };
+        Some(QuotaSnapshot {
+            label: value["limitName"].as_str().unwrap_or(&id).into(),
+            id,
+            model: value["normalModelSlug"].as_str().map(str::to_owned),
+            primary: window(&value["primary"]),
+            secondary: window(&value["secondary"]),
+            credits_available: value["credits"]["hasCredits"].as_bool(),
+            credits_unlimited: value["credits"]["unlimited"].as_bool(),
+            spend_control_reached: value["spendControlReached"].as_bool(),
+            reached,
+        })
+    }
+    let mut results = Vec::new();
+    if let Some(main) = snapshot(&params["rateLimits"], None) {
+        results.push(main);
+    }
+    if let Some(by_id) = params["rateLimitsByLimitId"].as_object() {
+        for (id, value) in by_id {
+            if let Some(next) = snapshot(value, Some(id)) {
+                if let Some(old) = results.iter_mut().find(|old| old.id == next.id) {
+                    *old = next;
+                } else {
+                    results.push(next);
+                }
+            }
+        }
+    }
+    results
+}
+
+pub fn model_profiles(result: &Value) -> Vec<ModelProfile> {
+    result["data"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|model| {
+            let id = model["model"]
+                .as_str()
+                .or_else(|| model["id"].as_str())?
+                .to_owned();
+            let efforts = model["supportedReasoningEfforts"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|option| {
+                    Some(EffortOption {
+                        value: option["reasoningEffort"].as_str()?.into(),
+                        description: option["description"].as_str().unwrap_or("").into(),
+                    })
+                })
+                .collect();
+            Some(ModelProfile {
+                id,
+                efforts,
+                default_effort: model["defaultReasoningEffort"].as_str().map(str::to_owned),
+            })
+        })
+        .collect()
+}

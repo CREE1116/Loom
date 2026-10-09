@@ -1,0 +1,153 @@
+{
+  "items": [
+    {
+      "id": "core-1",
+      "title": "check가 구조화된 테스트 결과와 원문 ref를 반환",
+      "spec": "The `check` tool (src/core/tools.rs) should parse cargo build/test output into: overall status, failing test names, the first compiler error with file:line, counts of passed/failed. Store the full raw output as an artifact file under <workspace>/.loom/artifacts/<n>.log and return the summary plus the artifact path. Add a `read_artifact` tool (path, start, end) to read a range of an artifact.",
+      "acceptance": "Unit tests: summary for a failing test run lists the failing test names and counts; compile error summary includes file:line; read_artifact returns the requested lines; raw output is not inlined beyond the summary.",
+      "docs": "docs/loom-core-tools.md §3 (check), docs/loom-experiment-findings.md §5.5",
+      "status": "done",
+      "attempts": 1,
+      "run": "20261002-064747",
+      "note": "원인: `check`가 실패 로그를 직접 반환해 모델 입력 토큰을 낭비하고, 원문을 다시 조회할 방법이 없었음.\n\n변경: JSON 요약, 원문 로그 저장, `read_artifact` 구현. 빌드·관련 테스트 9개·자체 검사 138개 통과. Stage 재시작 완료. 전체 테스트 중 7개는 소켓 접근 권한 오류로 실패.\n\n벤치 예상: 검증 단계의 입력 토큰 감소 예상. 엔진 벤치는 실행하지 않아 실제 절감률과 채택 기준 충족 여부는 미확인."
+    },
+    {
+      "id": "core-2",
+      "title": "edit를 되돌리는 undo 도구",
+      "spec": "Add an `undo` tool: per-file stack of previous contents recorded by edit/write in Workspace; `undo(path)` restores the last version and updates the read digest. Not offered in read-only workspaces.",
+      "acceptance": "Unit tests: edit then undo restores the exact bytes; two edits then two undos restore the original; undo with no history is an error; read-only specs exclude undo.",
+      "docs": "docs/loom-core-tools.md §2 (OpenHands undo_edit)",
+      "status": "failed",
+      "attempts": 2,
+      "run": "20261002-064747",
+      "note": ""
+    },
+    {
+      "id": "core-3",
+      "title": "심볼 참조 관계를 보여주는 refs 도구",
+      "spec": "Add a `refs` tool: given a symbol id (path::Type::name), list symbols that reference it (callers/users) and the symbols it references, using CodeGraph::referrers and resolve. Group by file, cap the output, mark that references are name-resolved (approximate).",
+      "acceptance": "Unit tests on a small crate: callers and callees of a function are listed; unknown symbol id is a clear error.",
+      "docs": "docs/loom-core-tools.md §3 (refs)",
+      "status": "done",
+      "attempts": 1,
+      "run": "20261002-162034",
+      "note": "Cause: The worker lacked a `refs` tool to query callers and callees of a symbol from the code graph.\nChange: Added `refs` tool to `Workspace::specs`, implemented `Workspace::refs` resolving callers via `CodeGraph::referrers` and callees via `CodeGraph::resolve` grouped by file with capped output and approximate note, and added unit tests.\nExpected effect on the bench: Allows workers to discover symbol call hierarchies and usages directly without resorting to expensive ripgrep searches across the"
+    },
+    {
+      "id": "core-4",
+      "title": "작업 시작 시 관련 심볼 후보를 맥락에 주입 (Context Compiler v0)",
+      "spec": "Before the first model call, the worker derives anchor candidates from the task text: identifiers and quoted strings in the task are searched (ripgrep + code graph), ranked, and the top symbols with their file, line span and signature are appended to the task message as 'Likely relevant code'. Keep it under ~1500 bytes. Deterministic, no model call.",
+      "acceptance": "Unit tests: a task mentioning a function name yields that symbol first; empty or generic tasks add nothing; the section respects the byte cap.",
+      "docs": "docs/loom-experiment-findings.md §5.2, §5.5",
+      "status": "done",
+      "attempts": 1,
+      "run": "20261002-162034",
+      "note": "Implemented 'Context Compiler v0' to inject relevant symbol candidates into the task context at startup. Added `find_anchor_candidates` to `Workspace` (using identifier/quoted string extraction against `CodeGraph`) and `src/core/worker.rs` to prepend the results to the user prompt. Verified with new and existing unit tests."
+    },
+    {
+      "id": "core-8",
+      "title": "TUI 활동 패널에 모델별 사용량 통계",
+      "spec": "The activity panel shows a 'Models' section built from ~/.loom/model-usage.jsonl: per model calls, failure rate, input/cached/output tokens, cost (unknown shown as '미확인', never 0) and mean latency, most used first, max 8 rows. Add a self-check scenario for it.",
+      "acceptance": "A self-check scenario renders the section from a fixture ledger; unit test for aggregation already exists in router::stats.",
+      "docs": "docs/loom-core-tools.md §5",
+      "status": "done",
+      "note": "Implemented by hand 2026-10-02: /usage shows per-model usage today (Loom router ledger) and free-tier use; self-check model usage checks."
+    },
+    {
+      "id": "core-9",
+      "title": "Effect Contract 타입과 결정론적 도출",
+      "spec": "Add src/core/contract.rs with `EffectContract { anchor: Vec<SymbolId>, write_files: Vec<String>, write_hints: Vec<SymbolId>, test_slots: Vec<TestSlot{target, kind: Add|Modify}>, artifacts: Vec<Artifact{path, class: Mergeable|Exclusive}>, reads: Vec<SymbolId>, provenance: Rules }` (serde Serialize). `derive(task: &str, graph: &CodeGraph, files: &[String]) -> EffectContract`, no model call: anchors = top 1-3 candidates from the Context Compiler v0 anchor search; write_hints = anchors ∪ symbols adjacent to them in the same file (previous/next item) ∪ direct callers (graph.referrers); write_files = files of anchors and callers; reads = symbols the anchors reference directly; test_slots = the anchor file's #[cfg(test)] module (Modify) or tests/ of the crate (Add); artifacts = CHANGELOG*/README* Mergeable, Cargo.toml/Cargo.lock Exclusive, only when the task text mentions them or a dependency. The worker derives the contract before the first model call and writes it to the trace as {\"contract\": ...}. Empty/generic tasks yield an empty contract (Single mode, nothing claimed).",
+      "acceptance": "Unit tests on a small fixture crate: a task naming fn `foo` gives anchor foo, includes its caller's file in write_files and the caller in write_hints, the neighbouring item in write_hints, a Modify test slot when the file has a test module; a task mentioning CHANGELOG adds it as Mergeable; a generic task yields an empty contract; the trace of a worker run contains a contract event.",
+      "docs": "docs/loom-experiment-findings.md §5.1, §5.2, §5.8",
+      "status": "open",
+      "source": "design",
+      "attempts": 1,
+      "run": "20261002-162034",
+      "note": ""
+    },
+    {
+      "id": "core-10",
+      "title": "Scope Monitor: 계약 밖 수정 기록과 계약 사후 갱신",
+      "spec": "Workspace records every file it actually writes (touched_files). After the run, compare with contract.write_files: each touched file outside the contract becomes a ScopeEvent { file, kind: UndeclaredWrite } and the contract is revised (file appended, provenance revision+1). Single mode never blocks. Outcome gains `touched_files`, `scope_events`, and `contract_recall` = |touched ∩ declared| / |touched| (None when nothing touched). The trace ends with the revised contract. Also print contract recall in the `--run` summary line. scripts/loom-enginebench (outside this crate) already reports outcome.contract_recall and outcome.scope_events; use exactly these field names.",
+      "acceptance": "Unit tests: editing a declared file gives no scope event and recall 1.0; editing an undeclared file gives one UndeclaredWrite event, the revised contract contains it and recall < 1; no edits gives recall None.",
+      "docs": "docs/loom-experiment-findings.md §5.4, §5.8",
+      "status": "open",
+      "source": "design",
+      "attempts": 1,
+      "run": "20261002-162034",
+      "note": ""
+    },
+    {
+      "id": "core-11",
+      "title": "Context Compiler v1: 계약 기반 graph slice 주입",
+      "spec": "Replace the v0 'Likely relevant code' list with a slice compiled from the contract: full source of anchor symbols, signatures (first line through the opening brace) of write_hints and reads, grouped by file with line numbers, depth 1 only, capped at 6000 bytes (anchors first, then hints, then reads; drop signatures before bodies). Measure slice quality: Outcome gains `slice_bytes` and `slice_rereads` = number of read/outline calls whose range overlaps a symbol already in the slice (the model asking again for what it was given, §5.6). Record both in the trace outcome as `slice_bytes` and `slice_rereads` (scripts/loom-enginebench reads these names).",
+      "acceptance": "Unit tests: the slice contains the anchor body and only signatures of hints; it respects the byte cap by dropping reads first; a read of an injected symbol increments slice_rereads, a read of an unrelated file does not. Judge: bench input tokens must not rise (the goal is fewer orient tokens).",
+      "docs": "docs/loom-experiment-findings.md §5.5, §5.6, §7",
+      "status": "open",
+      "source": "design"
+    },
+    {
+      "id": "core-12",
+      "title": "Core 검증 일원화: finish 전 Core가 검증하고 실패를 구조화해 돌려줌",
+      "spec": "When the model calls `finish`, the Core (not the model) runs the workspace validation once (the same runner as the `check` tool: build, then tests; for Rust run only `cargo test` of the crates containing touched files). If it fails, finish is rejected: the model gets VALIDATION_FAILED with the structured check summary (failed count, first compiler error, failing tests, artifact ref) and the run continues; after 2 rejected finishes the run stops with stop_reason 'validation failed'. Outcome gains `validated: Option<bool>` and `validation_runs`. Skip validation when nothing was edited or in read-only mode. Use the outcome field names `validated` and `validation_runs` (scripts/loom-enginebench reads `validated`).",
+      "acceptance": "Unit tests with a scripted model: finish after a breaking edit is rejected with VALIDATION_FAILED and a summary; finish after a fix is accepted with validated=Some(true); two rejected finishes stop the run; no edits → no validation run.",
+      "docs": "docs/loom-experiment-findings.md §5.5, §5.6 (검증 행)",
+      "status": "open",
+      "source": "design"
+    },
+    {
+      "id": "core-13",
+      "title": "Tier escalation: 싼 tier부터, 실패 evidence를 넘겨 단조 승격",
+      "spec": "New `--escalate` mode for `--run` (and a worker API): try the run at the lowest tier with usable candidates within max_cost (Local → Small → Medium → Flagship). Escalate only on discrete states: UNRESOLVED (step/time budget ended without an accepted finish) or VALIDATION_FAILED (from core-12). The next tier does NOT start fresh: it receives the contract, the slice, the current diff (git diff of touched files) and the failure evidence (validation summary or the last model message), as a compact handoff section, and keeps the edits already made. Each attempt gets its own share of max_steps. Outcome gains `tiers: Vec<{tier, model, steps, result}>`. Never exceeds COST_CEILING. The outcome field is `tiers` (scripts/loom-enginebench reads it).",
+      "acceptance": "Unit tests with scripted providers on two tiers: a Local attempt that ends unresolved escalates to Small with a handoff message containing the failure evidence and diff; a Local success does not escalate; escalation never picks a candidate above max_cost; the tier list is recorded in the outcome.",
+      "docs": "docs/loom-experiment-findings.md §5.7, §5.5 (재시도·escalation 행)",
+      "status": "open",
+      "source": "design"
+    },
+    {
+      "id": "core-14",
+      "title": "LOCAL 기계적 수정: graph 기반 rename 도구 (모델 없이 Core가 적용)",
+      "spec": "Add a `rename` tool {symbol, new_name}: the Core resolves the symbol in the code graph, rewrites its definition and every reference found via graph.referrers plus identifier-boundary matches in those referrer bodies and `use` paths, applies the syn syntax guard to every changed file, and returns a compact list of changed places. No model reads or writes the files. Refuse when the name is ambiguous (several symbols) with the candidates listed. Phase: Edit.",
+      "acceptance": "Unit tests on a fixture crate: renaming a function updates its definition, a caller in another module and a `use` import, and the crate still parses; an ambiguous name is refused with candidates; a string literal containing the name is left unchanged.",
+      "docs": "docs/loom-experiment-findings.md §5.6 (기계적 수정 행)",
+      "status": "open",
+      "source": "design"
+    },
+    {
+      "id": "core-15",
+      "title": "Split Gate: 관측 고정비로 분할 여부 판정 (기록만, 실행은 Single)",
+      "spec": "Add `SplitDecision { mode: Single|Split{units}, reason, estimates }`. observed_fixed_cost(repo) = median orient+validate input tokens and seconds of past runs from the telemetry/trace history (~/.loom or <workspace>/.custom-tui/telemetry.jsonl; none → unknown). est_work(unit) from the contract: anchor body lines + write_hints count, weakly connected components of the contract's write_hints over graph edges give candidate units. Split iff every unit's est_work exceeds the observed fixed cost and units share no write_files; unknown estimates → Single. The worker computes and logs the decision to the trace at start, always runs Single for now, and records actual seconds/tokens so the estimate error can be measured later.",
+      "acceptance": "Unit tests: no history → Single with reason 'fixed cost unknown'; two independent components each larger than the fixed cost → Split with 2 units; components sharing a file → Single; one small component → Single. The decision appears in the trace.",
+      "docs": "docs/loom-experiment-findings.md §5.3, §4 원칙 1·6",
+      "status": "open",
+      "source": "design"
+    },
+    {
+      "id": "core-6",
+      "title": "lease 표와 Split 병렬 실행 (Split Gate가 Split일 때만)",
+      "spec": "Workers register the symbols they edit in <workspace>/.loom/leases.json (worker id, pid, symbols, updated time). Before an edit, the edit tool checks whether the edited symbol (from the code graph) is leased by another live worker (pid alive, updated < 10 min) and refuses with WRITE_SCOPE_CONFLICT naming that worker. Leases are released when the worker finishes. Then, when the Split Gate (core-15) decides Split, run one worker per unit concurrently on the same checkout, each with its unit's contract; a WRITE_SCOPE_CONFLICT serializes the two workers (the later one waits for the earlier to finish). Mergeable artifacts are merged by the Core.",
+      "acceptance": "Unit tests: two Workspaces on the same dir, the second edit of a leased symbol is refused; a dead pid's lease is ignored; finishing releases the lease.",
+      "docs": "docs/loom-experiment-findings.md §5.4, docs/loom-core-tools.md §3",
+      "status": "open"
+    },
+    {
+      "id": "core-5",
+      "title": "긴 작업에서 오래된 도구 결과 압축 (history compaction)",
+      "spec": "When the estimated request size exceeds 60% of the routed model's known context (or 24k tokens if unknown), the worker replaces tool results older than the last 6 steps with one-line summaries ('read src/x.rs 120-180: 61 lines'), keeping the system prompt and task unchanged so the cache prefix survives.",
+      "acceptance": "Unit tests: compaction triggers above the threshold, keeps the last results intact, keeps the first two messages byte-identical, and the request shrinks.",
+      "docs": "docs/orchestrator-implementation-plan.md §7 (cache, epoch)",
+      "status": "open",
+      "attempts": 0,
+      "run": "20261002-162034",
+      "note": ""
+    },
+    {
+      "id": "core-7",
+      "title": "모델 설정 파일 (~/.loom/models.toml)",
+      "spec": "Router discovery reads an optional ~/.loom/models.toml: per-model overrides (tier, cost class, tools, context), disabled models or endpoints, and extra OpenAI-compatible endpoints (name, protocol, base_url, api_key_env). Overrides apply after discovery. The cost ceiling for workers is unchanged.",
+      "acceptance": "Unit tests: parsing; an override changes a candidate's tier; a disabled model disappears from the plan; an extra endpoint is added; a paid override can never pass the worker ceiling.",
+      "docs": "docs/loom-core-models.md",
+      "status": "open"
+    }
+  ]
+}

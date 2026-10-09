@@ -1,0 +1,1 @@
+The token bucket in src/bucket.rs refills wrongly: partial seconds are lost (taking one token every 500 ms at 2 tokens/s fails), and it can hold more than `capacity` tokens after a long idle period. Fix refill so tokens accrue continuously without losing fractions and never exceed capacity.

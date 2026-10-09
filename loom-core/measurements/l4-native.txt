@@ -1,0 +1,13 @@
+engine bench: 12/12 passed · input 420778 tokens · 368s · mean 6.3 steps · orient 23062B · validate 10518B · contract_recall 0.472 · scope_events 13 · slice_rereads 9 · validated 12 · false_finish 0 · escalated 0
+  ✓ average-empty            6 steps   32s input   32698 · Accepted
+  ✓ clamp-range              6 steps   30s input   31060 · Accepted
+  ✓ config-merge             5 steps   30s input   27089 · Accepted
+  ✓ expr-precedence          8 steps   49s input   54340 · Accepted
+  ✓ fix-build                6 steps   26s input   32651 · Accepted
+  ✓ last-n                   4 steps   18s input   19306 · Accepted
+  ✓ lru-cache                7 steps   40s input   40897 · Accepted
+  ✓ median-even              4 steps   19s input   19876 · Accepted
+  ✓ parse-duration           5 steps   22s input   26140 · Accepted
+  ✓ shape-perimeter          6 steps   23s input   31058 · Accepted
+  ✓ token-bucket             7 steps   35s input   39965 · Accepted
+  ✓ word-freq-normalize     12 steps   44s input   65698 · Accepted

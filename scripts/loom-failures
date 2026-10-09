@@ -1,0 +1,196 @@
+#!/usr/bin/env python3
+"""Find how the Native engine fails in real use, from Core's own records.
+
+Reads <repo>/.loom/events.jsonl and each attempt's trace artifact, measures every task,
+and groups problems into patterns with evidence (task, step, tool call). This is the
+diagnosis a person otherwise does by reading traces; the self-improvement loop
+(scripts/loom-evolve) turns the top pattern into work.
+
+    scripts/loom-failures                      # this repository, last 30 tasks
+    scripts/loom-failures --cwd PATH --last 100 --json out.json
+"""
+
+from __future__ import annotations
+
+import argparse
+import collections
+import json
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+
+# pattern id → (title, why it matters)
+PATTERNS = {
+    "repeat_call": ("같은 도구 호출을 그대로 반복", "결과가 같은 호출을 다시 해서 단계와 token을 낭비"),
+    "rerun_command": ("실행 중이거나 방금 실행한 명령을 다시 실행", "결과를 기다리지 않고 같은 명령을 반복"),
+    "check_without_change": ("변경 없이 check 반복", "고친 것이 없는데 검증을 다시 돌림"),
+    "edit_mismatch": ("편집 텍스트 불일치 반복", "old 텍스트를 못 찾아 편집이 계속 실패"),
+    "model_switch": ("한 시도 안에서 모델이 바뀜", "생각의 흐름이 끊기고 품질이 흔들림"),
+    "budget_exhausted": ("단계 예산 소진", "결론 없이 탐색만 하다 끝남"),
+    "stalled": ("탐색 정체로 중단", "같은 질의만 반복하다 Core가 멈춤"),
+    "transient": ("모델 호출 일시 오류", "게이트웨이 시간 초과·5xx로 시도가 끊김"),
+    "gateway_delay": ("게이트웨이 내부 대기", "상류 모델 응답과 전체 호출 사이의 보고된 지연을 구분"),
+    "sandbox_denied": ("샌드박스 거부로 검증 실패", "변경과 무관하게 소켓·네트워크 테스트가 실패"),
+    "validation_failed": ("검증 실패", "제안이 build/test를 통과하지 못함"),
+    "no_edit_for_edit_task": ("수정 요청인데 변경 없이 끝남", "읽기만 하고 아무것도 고치지 않음"),
+    "escalated_same_model": ("승격해도 같은 모델", "tier를 올렸는데 실제 응답 모델이 그대로"),
+    "unresolved_text_only": ("도구 없이 끝낸 답변이 미해결로 처리됨", "완료 계약이 모호하여 단순 응답조차 성공으로 기록하지 못함"),
+}
+
+
+def load_events(repo: Path) -> dict:
+    tasks = {}
+    path = repo / ".loom" / "events.jsonl"
+    if not path.exists():
+        sys.exit(f"no Core records at {path}")
+    for line in path.read_text(errors="replace").splitlines():
+        try:
+            event = json.loads(line)["event"]
+        except (json.JSONDecodeError, KeyError):
+            continue
+        if "TaskSaved" in event:
+            task = event["TaskSaved"]
+            tasks[task["id"]] = task  # last saved state wins
+    return tasks
+
+
+def artifact(repo: Path, ref) -> bytes | None:
+    if not ref:
+        return None
+    path = repo / ".loom" / "artifacts" / (ref["id"] if isinstance(ref, dict) else ref)
+    return path.read_bytes() if path.exists() else None
+
+
+def trace_of(repo: Path, attempt: dict) -> list[dict]:
+    raw = artifact(repo, attempt.get("result"))
+    if not raw:
+        return []
+    try:
+        result = json.loads(raw)
+    except json.JSONDecodeError:
+        return []
+    raw = artifact(repo, result.get("trace"))
+    events = []
+    for line in (raw or b"").decode(errors="replace").splitlines():
+        try:
+            events.append(json.loads(line))
+        except json.JSONDecodeError:
+            pass
+    return events
+
+
+EDIT_WORDS = ("고쳐", "수정", "추가", "바꿔", "fix", "add ", "change", "implement", "구현", "만들어")
+
+
+def analyze_task(repo: Path, task: dict) -> list[dict]:
+    found = []
+    active_attempt = None
+
+    def hit(pattern, evidence):
+        found.append({"pattern": pattern, "task": task["id"], "base": task.get("base"),
+                      "attempt": active_attempt, "goal": task["goal"][:120], "evidence": evidence})
+
+    summaries = " ".join(a.get("summary", "") for a in task.get("attempts", []))
+    for active_attempt, attempt in enumerate(task.get("attempts", [])):
+        models_used = attempt.get("models") or {}
+        trace = trace_of(repo, attempt)
+        calls = [(e.get("step"), c.get("tool"), json.dumps(c.get("args"), sort_keys=True, ensure_ascii=False))
+                 for e in trace for c in (e.get("calls") or [])]
+        # identical calls (tool + arguments)
+        counts = collections.Counter((t, a) for _, t, a in calls if t not in ("finish", "check"))
+        for (tool, args), n in counts.items():
+            if n >= 3:
+                hit("repeat_call", f"{tool} {args[:90]} ×{n}")
+        # commands started again
+        commands = collections.Counter(json.loads(a).get("command", "").strip()
+                                       for _, t, a in calls if t == "exec_command")
+        for command, n in commands.items():
+            if command and n >= 2:
+                hit("rerun_command", f"exec_command `{command[:80]}` ×{n}")
+        # check without an edit in between
+        since_edit, repeats = 0, 0
+        for _, tool, _ in calls:
+            if tool in ("edit", "write", "rename_symbol", "replace_symbol", "insert_after_symbol"):
+                since_edit = 0
+            elif tool == "check":
+                since_edit += 1
+                if since_edit >= 2:
+                    repeats += 1
+        if repeats >= 2:
+            hit("check_without_change", f"check without a change in between ×{repeats}")
+        mismatches = sum(1 for e in trace if e.get("tool") == "edit" and e.get("error")
+                         and "not found" in str(e.get("result", "")))
+        if mismatches >= 2:
+            hit("edit_mismatch", f"edit old text not found ×{mismatches}")
+        served = [e.get("model") for e in trace if e.get("calls") is not None and e.get("model")]
+        if len(set(served)) >= 2:
+            hit("model_switch", f"models in one attempt: {dict(collections.Counter(served))}")
+        stop = attempt.get("summary", "")
+        overhead = attempt.get("gateway_overhead_ms")
+        if isinstance(overhead, (int, float)) and overhead >= 30_000:
+            hit("gateway_delay", f"reported gateway overhead {overhead}ms; "
+                f"total model wait {attempt.get('model_wait_ms', 'unknown')}ms")
+        if "budget exhausted" in stop or "model-call budget" in stop:
+            hit("budget_exhausted", f"{attempt.get('tier')} attempt: {attempt.get('steps')} steps, {models_used}")
+        if "exploration stalled" in stop:
+            hit("stalled", f"{attempt.get('tier')} attempt stalled after {attempt.get('steps')} steps")
+        if (task.get("status") == "Unresolved"
+            and "No file changes proposed for an edit task" in task.get("summary", "")
+            and calls and all(tool == "finish" for _, tool, _ in calls)):
+            hit("unresolved_text_only", f"finish produced a textual answer with no edits: {stop[:140]}")
+        if "Transient" in stop or any("Transient" in str(e.get("error", "")) for e in trace):
+            hit("transient", stop[:140] or "transient model error")
+        for v in attempt.get("validation") or []:
+            text = (artifact(repo, v.get("artifact")) or b"").decode(errors="replace")
+            if v.get("status") != "Passed":
+                if "Operation not permitted" in text or "PermissionDenied" in text:
+                    hit("sandbox_denied", f"{v.get('failing') or 'build'}")
+                else:
+                    hit("validation_failed", f"failing {v.get('failing') or v.get('first_error') or 'build'}")
+    attempts = task.get("attempts", [])
+    active_attempt = None
+    if len(attempts) >= 2:
+        last = [set((a.get("models") or {}).keys()) for a in attempts]
+        if any(last[i] & last[i + 1] and attempts[i].get("tier") != attempts[i + 1].get("tier") for i in range(len(last) - 1)):
+            hit("escalated_same_model", " → ".join(f"{a.get('tier')}:{list((a.get('models') or {}).keys())}" for a in attempts))
+    wants_edit = any(w in task["goal"].lower() for w in EDIT_WORDS)
+    if wants_edit and task.get("status") in ("Unresolved", "Accepted") and "No file changes" in task.get("summary", "") + summaries:
+        hit("no_edit_for_edit_task", task.get("summary", "")[:140])
+    return found
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--cwd", default=str(ROOT))
+    ap.add_argument("--last", type=int, default=30, help="most recent tasks to analyze")
+    ap.add_argument("--json", help="write the report here")
+    args = ap.parse_args()
+    repo = Path(args.cwd)
+    tasks = list(load_events(repo).values())[-args.last:]
+    problems = [p for task in tasks for p in analyze_task(repo, task)]
+    by = collections.defaultdict(list)
+    for p in problems:
+        by[p["pattern"]].append(p)
+    ranked = sorted(by.items(), key=lambda kv: (-len({p["task"] for p in kv[1]}), -len(kv[1])))
+    report = {
+        "tasks": len(tasks),
+        "statuses": dict(collections.Counter(t.get("status") for t in tasks)),
+        "patterns": [
+            {"pattern": key, "title": PATTERNS[key][0], "why": PATTERNS[key][1],
+             "tasks": len({p["task"] for p in items}), "occurrences": len(items), "examples": items[:4]}
+            for key, items in ranked
+        ],
+    }
+    print(f"{report['tasks']} tasks · {report['statuses']}")
+    for pattern in report["patterns"]:
+        print(f"\n■ {pattern['title']} ({pattern['pattern']}) · 작업 {pattern['tasks']}개 · {pattern['occurrences']}회")
+        print(f"  {pattern['why']}")
+        for example in pattern["examples"][:3]:
+            print(f"  - [{example['goal'][:50]}] {example['evidence'][:150]}")
+    if args.json:
+        Path(args.json).write_text(json.dumps(report, ensure_ascii=False, indent=2))
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,47 @@
+{
+  "after_resume": {
+    "budget_bytes": 3206550765,
+    "estimate_overruns": 0,
+    "inference_bytes": 0,
+    "over_budget_observations": 0,
+    "peak_reserved_bytes": 3198162157,
+    "resident_bytes": 2661291245,
+    "tool_reserved_bytes": 0,
+    "wait_ms": 84,
+    "waiting_inference": 0,
+    "waiting_tools": 0,
+    "waits": 1
+  },
+  "before_tool": {
+    "budget_bytes": 3206550765,
+    "estimate_overruns": 0,
+    "inference_bytes": 0,
+    "over_budget_observations": 0,
+    "peak_reserved_bytes": 2891977965,
+    "resident_bytes": 2661291245,
+    "tool_reserved_bytes": 0,
+    "wait_ms": 0,
+    "waiting_inference": 0,
+    "waiting_tools": 0,
+    "waits": 0
+  },
+  "greedy_output_matches": true,
+  "model": "mlx-community/Qwen3-4B-4bit",
+  "model_ms_including_wait": 165,
+  "process_lifetime_peak_footprint": 2494400960,
+  "purpose": "admission regression, not a performance comparison",
+  "tool_ms_including_fixture_hold": 710,
+  "while_waiting": {
+    "budget_bytes": 3206550765,
+    "estimate_overruns": 0,
+    "inference_bytes": 0,
+    "over_budget_observations": 0,
+    "peak_reserved_bytes": 3198162157,
+    "resident_bytes": 2661291245,
+    "tool_reserved_bytes": 536870912,
+    "wait_ms": 0,
+    "waiting_inference": 1,
+    "waiting_tools": 0,
+    "waits": 1
+  }
+}

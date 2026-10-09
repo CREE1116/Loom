@@ -1,0 +1,1414 @@
+#!/usr/bin/env python3
+"""Loom self-improvement loop: check the TUI, fix one thing, rebuild, run, repeat.
+
+Each iteration
+  1. builds the crate and runs `cargo test`
+  2. runs the headless self-check (`loom-tui --self-check --json`), which also renders
+     a tour of every main screen at a wide and a narrow size
+  3. runs the PTY suite against the freshly built binary (real terminal, demo mode)
+  4. if anything fails, a coding agent fixes the first problem
+  5. if everything passes, a reviewer agent looks at the screens as a user would and adds
+     "this would be better if..." improvements to a persistent backlog; the coding agent
+     then implements the most valuable one, adding a failing self-check first
+and stops after --iterations, or when everything passes and --no-improve is set.
+
+The backlog (.custom-tui/selfimprove/backlog.json) survives runs; edit it to reject or
+reprioritize ideas.
+
+Work happens in an isolated copy so concurrent Loom sessions are not disturbed; the
+result is a patch you review and apply. Use --in-place to edit loom-tui directly.
+
+    scripts/loom-selfimprove --hours 8 --detach     # leave it running overnight
+    scripts/loom-selfimprove --iterations 2          # short supervised run
+
+Unattended safety: every iteration is a git commit in the isolated copy. If an
+iteration breaks the build, tests or PTY suite, or increases self-check failures, it is
+reverted and the next problem is tried. Transient bridge errors and exhausted quota are
+retried with backoff. Results: <run>/REPORT.md, <run>/changes.patch, and
+`git -C <run>/work/loom-tui log` (one commit per kept change).
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+CRATE = ROOT / "loom-tui"
+BRIDGE = "http://127.0.0.1:17841/v1"  # gpt-web (codex-chatgpt-web)
+MODEL = "chatgpt-web/gpt-5.6-sol"
+
+PROMPT = """You are improving the Loom terminal UI: the Rust crate in the current directory.
+Iteration {i} of {n}. Work on ONE problem, then stop.
+
+## Current state
+{state}
+
+## What to do
+{task}
+
+## Rules
+- Fix the product, not the check. Do not delete or weaken checks in src/selfcheck.rs or
+  tests/terminal_smoke.py to make them pass. Change a check only if it is genuinely
+  wrong, and say why in your summary.
+- Smallest correct change that matches the surrounding code style.
+- Before finishing, run and make pass:
+    cargo build
+    cargo test -- --test-threads=1
+    cargo run -q -- --self-check
+- Stay inside this crate. Do not commit.
+- End with a 3-line summary: problem, change, checks now passing.
+"""
+
+FIX_TASK = "Fix the first problem listed under 'Problems', in that order of priority."
+IMPROVE_TASK = """Everything passes. Implement this improvement from the UX backlog:
+
+  {title}
+  Why it helps the user: {benefit}
+  Where: {screen}
+  How to verify: {verify}
+
+First add a check to src/selfcheck.rs that FAILS without the improvement, confirm it fails,
+then implement the improvement so it passes. If, after reading the code, the idea is wrong
+or harmful, do not implement it; explain why in your summary starting with "REJECT:"."""
+
+REVIEW_PROMPT = """You are a demanding product designer and performance engineer reviewing Loom, a terminal
+UI for a coding agent, as someone who works in it all day. You get two kinds of evidence:
+
+1. A RECORDED SESSION: a user walked through Loom's interfaces on the real app. For each step
+   you see what they did, how long the UI took to show the result, and the screen afterwards.
+2. Static screens of every main view at a wide and a narrow size. Styled runs appear as
+   [Tone:text] (Strong=bold, Emphasis=italic, Muted/Faint=dim, Accent=highlight).
+
+Do not report crashes or failed checks; those are handled elsewhere. Find what would make
+Loom better to USE, along four axes, and name the axis of every idea:
+- usability: steps or clicks a task needs, discoverability, error-prone paths, keyboard paths
+- visual: layout, alignment, density, emphasis, consistency, what a narrow terminal loses
+- feedback: whether the user can tell what is happening (progress, waiting, results, errors)
+- performance: slow steps in the recording (response_seconds), startup time, sluggish rendering
+Prefer ideas grounded in a concrete moment of the recording. You may read the source.
+
+Existing backlog (do not repeat these):
+{backlog}
+
+Recorded session (startup {startup}s):
+{tour}
+
+Static screens:
+{screens}
+
+Return up to 5 NEW ideas, most valuable first, in Korean, as one JSON object in a ```json
+block and nothing else:
+{{"items": [{{"title": "...", "axis": "usability|visual|feedback|performance",
+  "benefit": "사용자가 얻는 것", "screen": "근거: 녹화의 몇 번째 단계 또는 어느 화면 · 어떤 줄",
+  "verify": "self-check 또는 스테이지 투어에 추가할 검사", "value": 1-5, "effort": "S|M|L"}}]}}
+"""
+
+
+def run(cmd, cwd, env=None, timeout=1800):
+    t0 = time.time()
+    try:
+        p = subprocess.run(cmd, cwd=cwd, env=env, capture_output=True, text=True, timeout=timeout)
+        return p.returncode, p.stdout, p.stderr, time.time() - t0
+    except subprocess.TimeoutExpired:
+        return -9, "", "timeout", time.time() - t0
+
+
+def tail(text, lines=40):
+    return "\n".join(text.strip().splitlines()[-lines:])
+
+
+def inspect(crate: Path, env, pty: bool) -> dict:
+    state = {"build": None, "tests": None, "self_check": None, "pty": None}
+    phase("점검: cargo build")
+    rc, out, err, _ = run(["cargo", "build"], crate, env)
+    state["build"] = {"ok": rc == 0, "log": "" if rc == 0 else tail(err, 60)}
+    if rc != 0:
+        return state
+    phase("점검: cargo test")
+    rc, out, err, _ = run(["cargo", "test", "--", "--test-threads=1"], crate, env)
+    failed = re.findall(r"^test (\S+) \.\.\. FAILED", out, re.M)
+    state["tests"] = {"ok": rc == 0, "failed": failed, "log": "" if rc == 0 else tail(out + err, 60),
+                      "count": sum(int(n) for n in re.findall(r"test result: \w+\. (\d+) passed", out + err))}
+    phase("점검: self-check (화면 렌더링 검사)")
+    rc, out, err, _ = run(["cargo", "run", "-q", "--", "--self-check", "--json"], crate, env)
+    try:
+        report = json.loads(out)
+    except json.JSONDecodeError:
+        report = {"checks": [], "dumps": [], "error": tail(err)}
+    fails = [c for c in report["checks"] if not c["pass"]]
+    state["self_check"] = {"total": len(report["checks"]), "failed": fails,
+                           "dumps": [d for d in report.get("dumps", []) if any(f["scenario"] == d["scenario"] for f in fails)],
+                           "tour": [d for d in report.get("dumps", []) if d["scenario"] == "tour"]}
+    if pty:
+        phase("점검: PTY (실제 터미널에서 조작)")
+        binary = Path(env["CARGO_TARGET_DIR"]) / "debug" / "loom-tui"
+        rc, out, err, secs = run([sys.executable, "tests/terminal_smoke.py"], crate,
+                                 {**env, "CUSTOM_TUI_BINARY": str(binary)}, timeout=900)
+        passed = [l for l in out.splitlines() if l.endswith("OK")]
+        state["pty"] = {"ok": rc == 0, "passed": len(passed), "log": "" if rc == 0 else tail(out + err, 50)}
+    return state
+
+
+def problems(state) -> list[str]:
+    out = []
+    if not state["build"]["ok"]:
+        return [f"BUILD FAILS:\n{state['build']['log']}"]
+    if not state["tests"]["ok"]:
+        out.append(f"cargo test fails ({', '.join(state['tests']['failed']) or 'see log'}):\n{state['tests']['log']}")
+    if state["pty"] and not state["pty"]["ok"]:
+        out.append(f"PTY suite (tests/terminal_smoke.py, real terminal in demo mode) fails:\n{state['pty']['log']}")
+    for c in state["self_check"]["failed"]:
+        out.append(f"self-check [{c['scenario']}] {c['name']}: {c['detail']}")
+    for st in (state.get("tour") or {}).get("steps", []):
+        # A failed real request is usually the backend (capacity, quota), not something a code
+        # change can fix; the tester agent and the UX backlog cover how failures are shown.
+        if not st["ok"] and not st.get("live"):
+            screen = "\n".join(l for l in st.get("screen", "").splitlines() if l.strip())[-1800:]
+            out.append(f"stage tour step {st['step']} ({st['title']}; actions: {'; '.join(st.get('actions', []))}) "
+                       f"fails: {st.get('detail')}. Screen after the step:\n{screen}\n"
+                       f"(The tour is scripts/loom-stage, TOUR list; fix the product unless the step itself is wrong.)")
+    return out
+
+
+def describe(state) -> str:
+    sc = state["self_check"]
+    lines = [
+        f"build: {'ok' if state['build']['ok'] else 'FAIL'}",
+        f"cargo test: {'ok' if (state['tests'] or {}).get('ok') else 'FAIL'}",
+        f"self-check: {sc['total'] - len(sc['failed'])}/{sc['total']} pass" if sc else "self-check: not run",
+        f"PTY suite: {'ok' if state['pty']['ok'] else 'FAIL'} ({state['pty']['passed']} tests passed before stopping)" if state["pty"] else "PTY suite: skipped",
+    ]
+    probs = problems(state)
+    if probs:
+        lines.append("\n## Problems (priority order)")
+        lines += [f"{i + 1}. {p}" for i, p in enumerate(probs)]
+    if sc and sc["dumps"]:
+        lines.append("\n## Rendered screens of failing scenarios ([Tone:text] marks styled runs)")
+        for d in sc["dumps"]:
+            lines.append(f"--- {d.get('label', d['scenario'])}")
+            lines += d["rows"][:60]
+    return "\n".join(lines)
+
+
+TARGET = CRATE / "target-selfimprove"
+
+
+ENGINE = {"kind": "codex", "bin": None, "max_cost": "free"}
+
+
+def build_engine(source: Path) -> Path:
+    """A stable Loom binary built from the run's base snapshot: the loop never runs the
+    code it is in the middle of changing."""
+    target = CRATE / "target-selfimprove-engine"
+    p = subprocess.run(["cargo", "build", "--release", "-q"], cwd=source, capture_output=True, text=True,
+                       env={**os.environ, "CARGO_TARGET_DIR": str(target)})
+    if p.returncode != 0:
+        sys.exit(f"cannot build the Loom engine from {source}:\n{tail(p.stderr)}")
+    return target / "release" / "loom-tui"
+
+
+def loom_agent(prompt: str, crate: Path, log: Path, timeout: int, read_only: bool) -> dict:
+    summary = log.with_suffix(".last.txt")
+    cmd = [str(ENGINE["bin"]), "--run", "-", "--cwd", str(crate), "--max-cost", ENGINE["max_cost"],
+           "--max-steps", "60", "--trace", str(log), "--summary-file", str(summary)]
+    if read_only:
+        cmd.append("--read-only")
+    t0 = time.time()
+    try:
+        p = subprocess.run(cmd, input=prompt, text=True, capture_output=True, timeout=timeout,
+                           env={**os.environ, "CARGO_TARGET_DIR": str(TARGET)})
+        rc, err = p.returncode, p.stderr
+    except subprocess.TimeoutExpired:
+        rc, err = -9, "timeout"
+    tokens = 0
+    texts = []
+    for line in log.read_text().splitlines() if log.exists() else []:
+        try:
+            ev = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if "outcome" in ev:
+            tokens = ev["outcome"].get("input_tokens", 0)
+        elif ev.get("text"):
+            texts.append(ev["text"])
+    # Structured answers (the review's JSON) may come in an earlier message than `finish`.
+    final = summary.read_text().strip() if summary.exists() else ""
+    if "```json" not in final:
+        blocks = [t for t in texts if "```json" in t]
+        if blocks:
+            summary.write_text(final + "\n\n" + blocks[-1])
+    with open(log, "a") as f:
+        f.write(json.dumps({"stderr": err[-3000:]}) + "\n")
+    # exit 2 = worker stopped without finishing; that is a result, not an infrastructure error
+    return {"rc": 0 if rc in (0, 2) else rc, "finished": rc == 0, "seconds": round(time.time() - t0),
+            "input_tokens": tokens, "summary": summary.read_text().strip() if summary.exists() else err[-500:]}
+
+
+STAGE = {"on": False, "name": ""}
+STAGE_SCRIPT = ROOT / "scripts" / "loom-stage"
+STAGE_DIR = ROOT / ".custom-tui" / "stage"  # per-loop subdirectory chosen in main()
+STAGE_NOTE = """
+## Live stage (the user is watching)
+A real Loom window is open for the user: the stage. Use it to see and operate the actual UI.
+Every stage command needs the prefix shown (it selects this loop's stage).
+- {stage} screen                 — what is on screen now
+- {stage} click "label"          — click visible text (e.g. a tab or button)
+- {stage} send "text" / key Enter / key Escape / wait "text"
+- After `cargo build`, load your build so the user sees it:
+  {stage} restart --binary {binary}
+- Before each step, say what you are doing in one short Korean sentence:
+  {stage} say "세션 메뉴 클릭 동작 확인"
+Show the problem on the stage before fixing it, and show the fixed behavior after rebuilding.
+"""
+
+
+def stage(*argv: str):
+    if STAGE["on"]:
+        subprocess.run([sys.executable, str(STAGE_SCRIPT), *argv], capture_output=True, text=True,
+                       env={**os.environ, "LOOM_STAGE_NAME": STAGE["name"]})
+
+
+def agent(prompt: str, crate: Path, log: Path, model: str, timeout: int, sandbox: str = "workspace-write",
+          notes: bool = True) -> dict:
+    if ENGINE["kind"] == "loom":
+        return loom_agent(prompt, crate, log, timeout, sandbox == "read-only")
+    TARGET.mkdir(parents=True, exist_ok=True)
+    if sandbox == "workspace-write" and notes:
+        prompt += JUDGE_NOTE.format(tour=PROPOSALS / "tour", bench=PROPOSALS / "bench")
+    if STAGE["on"] and sandbox == "workspace-write" and notes:
+        prompt += STAGE_NOTE.format(stage=f"LOOM_STAGE_NAME={STAGE['name']} {STAGE_SCRIPT}", binary=TARGET / "debug" / "loom-tui")
+    cmd = ["codex", "exec", "--json", "--ephemeral", "--ignore-user-config", "--skip-git-repo-check",
+           "-s", sandbox, "--add-dir", str(TARGET), "--add-dir", str(PROPOSALS), *(["--add-dir", str(STAGE_DIR)] if STAGE["on"] else []), "-C", str(crate), "-c", f'openai_base_url="{BRIDGE}"', "-m", model,
+           "--add-dir", str(Path.home() / ".cargo"), "-o", str(log.with_suffix(".last.txt")), "-"]
+    t0 = time.time()
+    with open(log, "w") as f:
+        try:
+            # Builds go to the shared target dir, never into the crate copy (or the patch).
+            env = {**os.environ, "CARGO_TARGET_DIR": str(TARGET)}
+            p = subprocess.run(cmd, input=prompt, text=True, stdout=f, stderr=subprocess.PIPE, timeout=timeout, env=env)
+            rc = p.returncode
+        except subprocess.TimeoutExpired:
+            rc = -9
+    tokens = 0
+    for line in log.read_text().splitlines():
+        try:
+            ev = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if ev.get("type") == "turn.completed":
+            tokens += ev["usage"].get("input_tokens", 0)
+    summary = log.with_suffix(".last.txt")
+    return {"rc": rc, "seconds": round(time.time() - t0), "input_tokens": tokens,
+            "summary": summary.read_text().strip() if summary.exists() else ""}
+
+
+BACKLOG = ROOT / ".custom-tui" / "selfimprove" / "backlog.json"
+
+
+def load_backlog() -> list[dict]:
+    try:
+        return json.loads(BACKLOG.read_text())["items"]
+    except (FileNotFoundError, json.JSONDecodeError, KeyError):
+        return []
+
+
+def save_backlog(items: list[dict]):
+    BACKLOG.parent.mkdir(parents=True, exist_ok=True)
+    BACKLOG.write_text(json.dumps({"items": items}, ensure_ascii=False, indent=2))
+
+
+def open_items(items):
+    """Most valuable first, but the next item takes a different axis than the last one done,
+    so usability, visual, feedback and performance all get attention."""
+    order = {"S": 0, "M": 1, "L": 2}
+    pending = [x for x in items if x.get("status", "open") == "open"]
+    pending.sort(key=lambda x: (x.get("source") != "user", x.get("kind") != "bug",
+                                -int(x.get("value", 0)), order.get(x.get("effort"), 1)))
+    users = [x for x in pending if x.get("source") == "user" or x.get("kind") == "bug"]
+    if users:
+        return pending  # user reports first, regardless of axis rotation
+    done = [x for x in items if x.get("status") == "done" and x.get("run")]
+    last_axis = done[-1].get("axis") if done else None
+    other = [x for x in pending if x.get("axis") != last_axis]
+    return (other[:1] + [x for x in pending if x is not (other[:1] or [None])[0]]) if other else pending
+
+
+def review(state, crate, run_dir, i, model, timeout) -> int:
+    """Ask a reviewer for 'this would be better if...' ideas; returns how many were added."""
+    items = load_backlog()
+    known = "\n".join(f"- [{x.get('status', 'open')}] {x['title']}" for x in items) or "(empty)"
+    screens = []
+    for d in state["self_check"]["tour"]:
+        if "48x" in d.get("label", "") or "승인" in d.get("label", ""):
+            screens.append(f"--- {d.get('label', d['scenario'])}")
+            screens += d["rows"]
+    tour = state.get("tour") or {}
+    steps = []
+    for st in tour.get("steps", []):
+        lines = [l for l in st.get("screen", "").splitlines() if l.strip()]
+        steps.append(f"--- step {st['step']}: {st['title']} · actions: {'; '.join(st.get('actions', []))} · "
+                     f"response {st.get('response_seconds')}s · {'ok' if st['ok'] else 'FAILED: ' + st.get('detail', '')}")
+        steps += lines[:28]
+    prompt = REVIEW_PROMPT.format(backlog=known, screens="\n".join(screens),
+                                  tour="\n".join(steps) or "(no recording: run with --stage)",
+                                  startup=tour.get("startup_seconds", "?"))
+    (run_dir / f"review-{i}.md").write_text(prompt)
+    result = agent(prompt, crate, run_dir / f"review-{i}.jsonl", model, timeout, sandbox="read-only")
+    text = result["summary"]
+    blocks = re.findall(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.S) or [text[text.find("{"): text.rfind("}") + 1]]
+    for block in reversed(blocks):
+        try:
+            new = json.loads(block)["items"]
+            break
+        except (json.JSONDecodeError, KeyError, TypeError):
+            continue
+    else:
+        print(f"[{i}] review returned no parsable ideas", flush=True)
+        return 0
+    seen = {x["title"] for x in items}
+    added = 0
+    for idea in new:
+        if idea.get("title") and idea["title"] not in seen:
+            items.append({**idea, "id": f"ux-{len(items) + 1}", "status": "open", "found": run_dir.name})
+            added += 1
+    save_backlog(items)
+    return added
+
+
+# ------------------------------------------------------------------ exploration
+# A tester agent occupies the stage: it uses the real product the way a person would, looks
+# at what happens and reports what is wrong or could be better. Its findings feed the
+# backlog (ui) or the roadmap (core), so the loop works on problems found in real use, not
+# only on what the scripted checks cover.
+
+EXPLORE_UI_PROMPT = """You are a demanding QA tester and heavy user of Loom, a terminal UI for coding agents.
+The real Loom (real backend, real model) is yours to use on the stage; the user is watching it.
+Every stage command needs this prefix:  {stage}
+
+  {stage} start --live --binary {binary}   — fresh real Loom in a scratch git repo (do this first)
+  {stage} screen                           — print what is on screen now (do this after EVERY action)
+  {stage} send "text"  then  {stage} key Enter      — type and submit
+  {stage} key Escape | Tab | Up | Down | C-c ...    — keys
+  {stage} click "visible label"                     — click text on screen
+  {stage} wait "text" --timeout 120                 — wait until text appears
+  {stage} say "지금 하는 일 한 문장"                  — narrate in Korean before each scenario
+The scratch repo is {repo} (you may read it to check what the model changed).
+Your working directory is a notes folder; you cannot change Loom's code and must not try.
+
+Use Loom for ~{minutes} minutes the way a developer does all day, and LOOK at every screen.
+Pick scenarios most likely to break or annoy (vary them; earlier sessions covered: {covered}):
+- real coding requests that edit files, run commands and produce long tool output
+- answers with rich markdown: Korean text with **bold**/*italic*/~~strike~~ next to brackets
+  and particles, nested lists, tables, code blocks, links, math, long lines
+- multi-turn work: follow-ups, sending while a turn runs, interrupting (Esc / C-c), errors
+  (a missing file, a failing command), approvals, retries
+- navigation: sessions, branching, the activity/task panel, entering and leaving a session,
+  scrolling a long conversation, copying, narrow terminals (start --live --size 70x30)
+- feedback: can you always tell what Loom is doing, how long it takes, why something failed?
+Report only what you saw on screen. Quote the screen lines as evidence.
+
+Existing backlog (do not repeat):
+{backlog}
+
+Finish with one JSON object in a ```json block (Korean text), nothing after it:
+{{"covered": ["짧은 시나리오 이름", ...],
+  "items": [{{"kind": "bug|idea", "title": "...", "axis": "usability|visual|feedback|performance",
+  "benefit": "사용자가 얻는 것", "screen": "근거: 재현 단계와 화면 인용",
+  "verify": "self-check 또는 스테이지 투어로 확인하는 방법", "value": 1-5, "effort": "S|M|L"}}]}}
+Bugs first. Up to 6 items, each one you actually reproduced.
+"""
+
+EXPLORE_CORE_PROMPT = """You are testing Loom's native coding-agent engine (the worker: `loom-tui --run`) on
+real work, as its toughest user. The freshly built engine runs on the stage; the user watches
+each step there. Every stage command needs this prefix:  {stage}
+
+  {stage} worker --repo DIR [--max-steps 30] [--timeout 900] "task"
+      runs the worker on DIR (free models only) and prints exit, diff, output and the trace path
+  {stage} say "지금 하는 일 한 문장"     — narrate in Korean before each experiment
+
+Projects must live under {repos}. Create small realistic ones there, or copy real code
+(e.g. cp -R from {samples} — skip target/ directories). Read the trace JSONL after each run:
+every model turn ("text", "calls") and every tool result ("tool", "result", "error").
+Your working directory is a notes folder; you cannot change Loom's code and must not try.
+
+For ~{minutes} minutes, give the worker 3-5 tasks of the kind a developer really delegates,
+harder than toy fixes (vary them; earlier sessions covered: {covered}):
+multi-file changes, renames across a crate, a bug whose cause is far from the symptom,
+adding a feature with tests, reading a large file, a task with a misleading description,
+a failing build it must repair. Then judge the ENGINE, not the model:
+- wrong or wasted tool calls caused by tool design, unclear tool output, missing tools
+- context waste (re-reading, huge outputs), loops, giving up early, false "finished"
+- routing: which models served it, failures, fallbacks, slow steps
+- a roadmap feature that should exist but does not, judged by a concrete failure you saw
+Quote trace lines as evidence.
+
+Existing roadmap (do not repeat):
+{roadmap}
+
+Finish with one JSON object in a ```json block, nothing after it:
+{{"covered": ["짧은 실험 이름", ...],
+  "items": [{{"kind": "bug|feature", "title": "...(Korean)", "evidence": "작업, 무슨 일이 있었는지, trace 인용",
+  "spec": "what to change in the engine (files, behavior)", "acceptance": "unit tests that would fail today"}}]}}
+Up to 4 items, most damaging first.
+"""
+
+EXPLORED = ROOT / ".custom-tui" / "selfimprove" / "explored.json"
+
+
+def parse_items(text: str) -> dict | None:
+    blocks = re.findall(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.S) or [text[text.find("{"): text.rfind("}") + 1]]
+    for block in reversed(blocks):
+        try:
+            data = json.loads(block)
+            if isinstance(data.get("items"), list):
+                return data
+        except (json.JSONDecodeError, AttributeError):
+            continue
+    return None
+
+
+def explore(target: str, run_dir: Path, i: int, model: str, timeout: int, minutes: int = 20) -> int:
+    """A tester agent uses the real product on the stage; returns how many findings were added."""
+    try:
+        covered_all = json.loads(EXPLORED.read_text())
+    except (FileNotFoundError, json.JSONDecodeError):
+        covered_all = {}
+    covered = ", ".join(covered_all.get(target, [])[-15:]) or "(none yet)"
+    notes = run_dir / f"explore-{i}"
+    notes.mkdir(parents=True, exist_ok=True)
+    prefix = f"LOOM_STAGE_NAME={STAGE['name']} {STAGE_SCRIPT}"
+    binary = TARGET / "debug" / "loom-tui"
+    if target == "ui":
+        known = "\n".join(f"- [{x.get('status', 'open')}] {x['title']}" for x in load_backlog()) or "(empty)"
+        prompt = EXPLORE_UI_PROMPT.format(stage=prefix, binary=binary, repo=STAGE_DIR / "live-repo",
+                                          minutes=minutes, covered=covered, backlog=known)
+    else:
+        (STAGE_DIR / "repos").mkdir(parents=True, exist_ok=True)
+        known = "\n".join(f"- [{x.get('status', 'open')}] {x['title']}" for x in load_roadmap()) or "(empty)"
+        prompt = EXPLORE_CORE_PROMPT.format(stage=prefix, repos=STAGE_DIR / "repos", minutes=minutes, covered=covered,
+                                            samples=f"{ROOT / 'bench' / 'engine' / 'tasks'}/*/repo, {ROOT / 'experiments'}",
+                                            roadmap=known)
+    (run_dir / f"explore-{i}.md").write_text(prompt)
+    print(f"[{i}] exploring: a tester agent uses the real {'Loom' if target == 'ui' else 'worker'} on the stage (~{minutes} min)", flush=True)
+    stage("say", f"반복 {i}: 탐색 테스트 시작 · 실제 사용으로 문제 찾기")
+    result = agent(prompt, notes, run_dir / f"explore-{i}.jsonl", model, timeout, notes=False)
+    if target == "ui":
+        stage("restart", "--binary", str(binary))  # back to the demo stage the tour uses
+    data = parse_items(result["summary"])
+    if not data:
+        failure = classify_failure(result, run_dir / f"explore-{i}.jsonl")
+        print(f"[{i}] exploration returned no parsable findings (rc {result['rc']}, {result['seconds']}s"
+              f"{', ' + failure if failure else ''}); retrying next iteration", flush=True)
+        EXPLORE_RETRY["due"] = True
+        return 0
+    EXPLORE_RETRY["due"] = False
+    covered_all.setdefault(target, []).extend(str(c) for c in data.get("covered", []))
+    EXPLORED.write_text(json.dumps(covered_all, ensure_ascii=False, indent=2))
+    added = 0
+    if target == "ui":
+        items = load_backlog()
+        seen = {x["title"] for x in items}
+        for x in data["items"]:
+            if x.get("title") and x["title"] not in seen:
+                items.append({**x, "id": f"ux-{len(items) + 1}", "status": "open", "source": "explore",
+                              "found": f"{run_dir.name}/explore-{i}"})
+                added += 1
+        save_backlog(items)
+    else:
+        items = load_roadmap()
+        seen = {x["title"] for x in items}
+        for x in data["items"]:
+            if x.get("title") and x["title"] not in seen:
+                items.append({"title": x["title"], "kind": x.get("kind", "feature"), "spec": x.get("spec", ""),
+                              "acceptance": x.get("acceptance", ""), "docs": "Found in real use: " + x.get("evidence", ""),
+                              "id": f"core-{len(items) + 1}", "status": "open", "source": "explore",
+                              "proposed": f"{run_dir.name}/explore-{i}"})
+                added += 1
+        save_roadmap(items)
+    for x in data["items"]:
+        report_line(run_dir, f"  - 탐색 발견 [{x.get('kind', '?')}] {x.get('title', '')}")
+    return added
+
+
+EXPLORE_RETRY = {"due": False}
+CODEX_PAUSE = {"until": 0}
+
+
+def explore_due(i: int, args) -> bool:
+    return (STAGE["on"] and not args.no_explore and ENGINE["kind"] != "loom" and not CODEX_PAUSE["until"]
+            and ((i - 1) % args.explore_every == 0 or EXPLORE_RETRY["due"]))
+
+
+# ------------------------------------------------------------------ engine target
+# The loop improves the Loom worker engine instead of the UI. The judge is the engine
+# bench (bench/engine/tasks, hidden tests): build the work copy, run every task with it.
+
+ENGINE_PROMPT = """You are improving the Loom worker ENGINE: the native coding agent in this Rust crate
+(src/core/worker.rs, src/core/tools.rs, src/core/model/*). Iteration {i} of {n}.
+
+## Bench results of the current engine
+{state}
+
+## What to do
+{task}
+
+## Rules
+- The judge is scripts/loom-enginebench (tasks with hidden tests, outside this crate). A change
+  is kept only if more tasks pass, or the same tasks pass with at least 5% fewer input tokens.
+- Do not special-case bench tasks or their names. Improve general behavior.
+- COST_CEILING and the paid-model block must stay exactly as they are.
+- Smallest change that addresses the cause; add or adjust unit tests for behavior you change.
+- Before finishing run: cargo build && cargo test -- --test-threads=1
+- Stay inside this crate. Do not commit.
+- End with a 3-line summary: cause you found, change, expected effect on the bench.
+"""
+
+ENGINE_TASK = """Study the failing tasks above (their trace tails show what the worker did and what
+the tools returned) and the token cost of the passing ones. Find ONE general cause that makes
+the worker fail or waste tokens, and fix it. Typical levers: the system prompt and tool
+descriptions, the shape and size of tool outputs (outline/read/find/check), edit matching and
+error messages, how the loop reacts when the model stops calling tools, the step budget.
+The bench model is a small local model: prefer changes that make the tools easier to use
+correctly over changes that assume a strong model."""
+
+
+def phase(text: str):
+    """What the loop is doing now: run.log (dashboard) and the stage status line."""
+    print(f"[phase] {time.strftime('%H:%M')} {text}", flush=True)
+    stage("say", text)
+
+
+def inspect_engine(crate: Path, env, _pty: bool) -> dict:
+    state = {"build": None, "tests": None, "self_check": None, "pty": None, "bench": None}
+    phase("점검: cargo build")
+    rc, out, err, _ = run(["cargo", "build"], crate, env)
+    state["build"] = {"ok": rc == 0, "log": "" if rc == 0 else tail(err, 60)}
+    if rc != 0:
+        return state
+    phase("점검: cargo test")
+    rc, out, err, _ = run(["cargo", "test", "--", "--test-threads=1"], crate, env)
+    failed = re.findall(r"^test (\S+) \.\.\. FAILED", out, re.M)
+    state["tests"] = {"ok": rc == 0, "failed": failed, "log": "" if rc == 0 else tail(out + err, 60)}
+    if rc != 0:
+        return state
+    report = Path(env.get("LOOM_BENCH_OUT", "/tmp/loom-bench.json"))
+    binary = Path(env["CARGO_TARGET_DIR"]) / "debug" / "loom-tui"
+    live = report.parent / "bench-live"
+    shutil.rmtree(live, ignore_errors=True)
+    live.mkdir(parents=True)
+    phase(f"점검: 엔진 벤치 (과제 {sum(1 for t in (ROOT / 'bench' / 'engine' / 'tasks').iterdir() if t.is_dir())}개, 숨은 테스트로 채점)")
+    stage("bench-view", str(live), "--title", "엔진 벤치 · 이 빌드의 worker가 과제를 푸는 중")
+    run([sys.executable, str(ROOT / "scripts" / "loom-enginebench"), "--engine", str(binary), "--json", str(report),
+         "--max-cost", ENGINE["max_cost"], "--progress", str(live)], ROOT, env, timeout=4 * 3600)
+    try:
+        state["bench"] = json.loads(report.read_text())
+    except (FileNotFoundError, json.JSONDecodeError):
+        state["bench"] = {"summary": {"passed": 0, "total": 0, "input_tokens": 0}, "results": [], "error": "bench did not run"}
+    return state
+
+
+def problems_engine(state) -> list[str]:
+    if not state["build"]["ok"]:
+        return [f"BUILD FAILS:\n{state['build']['log']}"]
+    if not state["tests"]["ok"]:
+        return [f"cargo test fails ({', '.join(state['tests']['failed']) or 'see log'}):\n{state['tests']['log']}"]
+    return []
+
+
+def describe_engine(state) -> str:
+    lines = [f"build: {'ok' if state['build']['ok'] else 'FAIL'}",
+             f"cargo test: {'ok' if (state['tests'] or {}).get('ok') else 'FAIL'}"]
+    bench = state.get("bench")
+    if bench:
+        s = bench["summary"]
+        lines.append(f"bench: {s['passed']}/{s['total']} passed · input {s['input_tokens']} tokens · {s.get('seconds', 0)}s")
+        lines.append("")
+        for r in bench["results"]:
+            lines.append(f"{'PASS' if r['passed'] else 'FAIL'} {r['task']}: {r['steps']} steps, input {r['input_tokens']}, stop: {r['stop']}")
+            if not r["passed"]:
+                if r.get("diff"):
+                    lines.append(f"  changed: {r['diff'].splitlines()[-1] if r['diff'] else 'nothing'}")
+                for t in r.get("trace_tail", []):
+                    lines.append(f"  · {t[:300]}")
+                if r.get("test_tail"):
+                    lines.append("  hidden tests:\n    " + r["test_tail"].replace("\n", "\n    "))
+    else:
+        lines.append("bench: not run")
+    probs = problems_engine(state)
+    if probs:
+        lines.append("\n## Problems")
+        lines += probs
+    return "\n".join(lines)
+
+
+def score_engine(state) -> tuple:
+    s = (state.get("bench") or {}).get("summary", {})
+    return (bool(state["build"]["ok"]), bool((state.get("tests") or {}).get("ok")), True, s.get("passed", -1))
+
+
+def regressed_engine(before, after) -> str | None:
+    names = ["build", "cargo test"]
+    b, a = score_engine(before), score_engine(after)
+    for k in range(2):
+        if b[k] and not a[k]:
+            return f"{names[k]} broke"
+    if not (b[0] and b[1]):
+        return None if a[0] and a[1] else "still broken"
+    bs, as_ = before["bench"]["summary"], after["bench"]["summary"]
+    if as_["passed"] < bs["passed"]:
+        return f"bench passed {bs['passed']} → {as_['passed']}"
+    if as_["passed"] == bs["passed"] and as_["input_tokens"] > bs["input_tokens"] * 0.95:
+        return f"no gain: {as_['passed']}/{as_['total']} passed, input {bs['input_tokens']} → {as_['input_tokens']}"
+    return None
+
+
+def use_engine_target():
+    g = globals()
+    g.update(inspect=inspect_engine, problems=problems_engine, describe=describe_engine,
+             score=score_engine, regressed=regressed_engine, PROMPT=ENGINE_PROMPT)
+
+
+# ------------------------------------------------------------------ core target
+# Feature development from a roadmap (bench/engine/roadmap.json, outside the crate).
+# Kept only when it builds, all tests pass, the number of tests grew, and the engine
+# bench did not get worse.
+
+ROADMAP = ROOT / "bench" / "engine" / "roadmap.json"
+
+CORE_TASK = """Implement this Core feature from the roadmap:
+
+  {title}
+
+Specification:
+{spec}
+
+Acceptance (write these tests first, see them fail, then implement):
+{acceptance}
+
+Background: {docs}
+
+Keep the change scoped to this feature, in the style of the surrounding code. If the
+specification conflicts with the code as it is, adapt sensibly and say so. If it cannot be
+done safely in one step, implement the smallest useful part and say what remains."""
+
+ROADMAP_REVIEW = """You are planning the next Core features of Loom (a coding-agent runtime; Rust crate in the
+current directory). Read docs/loom-experiment-findings.md, docs/loom-core-tools.md and
+docs/loom-core-models.md in the parent repository (../../docs or the paths you find), and the
+current code under src/core/. Existing roadmap (do not repeat):
+{roadmap}
+
+Propose up to 4 NEXT features that move Loom toward its goal (same quality as a single agent,
+much lower cost), each implementable in one iteration with unit tests. Return one JSON object
+in a ```json block and nothing else:
+{{"items": [{{"title": "...(Korean)", "spec": "...", "acceptance": "...", "docs": "..."}}]}}"""
+
+
+def load_roadmap() -> list[dict]:
+    try:
+        return json.loads(ROADMAP.read_text())["items"]
+    except (FileNotFoundError, json.JSONDecodeError, KeyError):
+        return []
+
+
+def save_roadmap(items: list[dict]):
+    ROADMAP.write_text(json.dumps({"items": items}, ensure_ascii=False, indent=2))
+
+
+def count_tests(text: str) -> int:
+    return sum(int(n) for n in re.findall(r"test result: \w+\. (\d+) passed", text))
+
+
+def inspect_core(crate: Path, env, pty: bool) -> dict:
+    state = inspect_engine(crate, env, pty)
+    if state["tests"] and state["tests"]["ok"]:
+        rc, out, err, _ = run(["cargo", "test", "--", "--test-threads=1"], crate, env)
+        state["tests"]["count"] = count_tests(out + err)
+    return state
+
+
+def describe_core(state) -> str:
+    text = describe_engine(state)
+    n = (state.get("tests") or {}).get("count")
+    return text.replace("cargo test: ok", f"cargo test: ok ({n} tests)") if n is not None else text
+
+
+def regressed_core(before, after) -> str | None:
+    b, a = score_engine(before), score_engine(after)
+    if b[0] and not a[0]:
+        return "build broke"
+    if b[1] and not a[1]:
+        return "cargo test broke"
+    if not (a[0] and a[1]):
+        return "still broken"
+    nb, na = (before.get("tests") or {}).get("count", 0), (after.get("tests") or {}).get("count", 0)
+    if na <= nb:
+        return f"no new tests ({nb} → {na})"
+    bs, as_ = (before.get("bench") or {}).get("summary"), (after.get("bench") or {}).get("summary")
+    if bs and as_:
+        if as_["passed"] < bs["passed"]:
+            return f"bench passed {bs['passed']} → {as_['passed']}"
+        if bs["input_tokens"] and as_["input_tokens"] > bs["input_tokens"] * 1.15:
+            return f"bench input tokens {bs['input_tokens']} → {as_['input_tokens']} (+15% limit)"
+    return None
+
+
+def plan_roadmap(state, crate, run_dir, i, model, timeout) -> int:
+    items = load_roadmap()
+    known = "\n".join(f"- [{x.get('status', 'open')}] {x['title']}" for x in items) or "(empty)"
+    prompt = ROADMAP_REVIEW.format(roadmap=known)
+    result = agent(prompt, crate, run_dir / f"roadmap-{i}.jsonl", model, timeout, sandbox="read-only")
+    data = parse_items(result["summary"])
+    if not data:
+        return 0
+    seen = {x["title"] for x in items}
+    added = 0
+    for idea in data["items"]:
+        if idea.get("title") and idea["title"] not in seen:
+            items.append({**idea, "id": f"core-{len(items) + 1}", "status": "open", "proposed": run_dir.name})
+            added += 1
+    save_roadmap(items)
+    return added
+
+
+def use_core_target():
+    use_engine_target()
+    g = globals()
+    g.update(inspect=inspect_core, describe=describe_core, regressed=regressed_core)
+
+
+def stage_tour(state, run_dir: Path, tag) -> None:
+    """Walk the interfaces of this build on the stage; the recording joins the state.
+    At the start and every third iteration the tour also makes one real request with the
+    real backend (demo fixtures cannot show real streaming, tools, diffs or latency)."""
+    if not STAGE["on"] or not state["build"]["ok"]:
+        return
+    if STAGE["name"] != "ui":
+        state["tour"] = None  # core/engine are judged by tests and the bench; their stage shows the worker
+        return
+    out = run_dir / f"tour-{tag}.json"
+    live = ["--live"] if (tag == 0 or (isinstance(tag, int) and tag % 3 == 0)) else []
+    subprocess.run([sys.executable, str(STAGE_SCRIPT), "tour", "--binary", str(TARGET / "debug" / "loom-tui"),
+                    "--json", str(out), *live], capture_output=True, text=True, timeout=1800,
+                   env={**os.environ, "LOOM_STAGE_NAME": STAGE["name"]})
+    try:
+        state["tour"] = json.loads(out.read_text())
+    except (FileNotFoundError, json.JSONDecodeError):
+        state["tour"] = None
+
+
+def facts(state) -> dict:
+    sc = state.get("self_check") or {}
+    tour = state.get("tour") or {}
+    bench = ((state.get("bench") or {}).get("summary")) or {}
+    times = [st["response_seconds"] for st in tour.get("steps", []) if st.get("response_seconds") is not None]
+    return {
+        "tests": (state.get("tests") or {}).get("count"),
+        "self_check": f"{sc['total'] - len(sc['failed'])}/{sc['total']}" if sc else None,
+        "tour": f"{tour['passed']}/{tour['total']}" if tour else None,
+        "response": round(sum(times) / len(times), 2) if times else None,
+        "startup": tour.get("startup_seconds"),
+        "bench": f"{bench['passed']}/{bench['total']}" if bench else None,
+        "bench_tokens": bench.get("input_tokens"),
+    }
+
+
+def pad(label: str, width: int = 11) -> str:
+    import unicodedata
+    used = sum(2 if unicodedata.east_asian_width(c) in "WF" else 1 for c in label)
+    return label + " " * max(1, width - used)
+
+
+def scoreboard(i, kind, axis, target, outcome, before, after, shortstat, elapsed, kept, reverted) -> str:
+    b, a = facts(before), facts(after)
+
+    def row(label, key, fmt=lambda v: str(v)):
+        if b.get(key) is None and a.get(key) is None:
+            return None
+        if b.get(key) == a.get(key):
+            return f"  {pad(label)}{fmt(a.get(key))}"
+        return f"  {pad(label)}{fmt(b.get(key))} → {fmt(a.get(key))}"
+
+    rows = [
+        f"━━ 반복 {i} 성과 · {outcome} ━━",
+        f"  {pad('작업')}{kind}{f'({axis})' if axis else ''}: {target[:90]}",
+        f"  {pad('변경')}{shortstat or '없음'}",
+        row("테스트", "tests"),
+        row("self-check", "self_check"),
+        row("투어", "tour"),
+        row("평균 반응", "response", lambda v: f"{v}s" if v is not None else "?"),
+        row("시작 시간", "startup", lambda v: f"{v}s" if v is not None else "?"),
+        row("벤치", "bench"),
+        row("벤치 token", "bench_tokens"),
+        f"  {pad('누적')}유지 {kept} · 되돌림 {reverted} · 경과 {elapsed}",
+    ]
+    return "\n".join(r for r in rows if r)
+
+
+# ------------------------------------------------------------------ self-extending judge
+# Agents may add judge items when they find a problem the judge misses. Items are only
+# added (never changed or removed) and only after validation.
+
+PROPOSALS = ROOT / "bench" / "proposals"
+TOUR_EXTRA = ROOT / "bench" / "tour-extra.json"
+BENCH_TASKS = ROOT / "bench" / "engine" / "tasks"
+
+JUDGE_NOTE = """
+## Extend the judge when it misses something
+If you notice a real problem the checks do not catch (a UI path the stage tour never exercises,
+a failure mode, a coding task the engine would get wrong), add a judge item. Items are validated
+by the loop and then kept forever, so make them precise and deterministic.
+- Stage tour step: write {tour}/<short-name>.json:
+  {{"title": "한국어 제목", "why": "what failure this catches",
+    "actions": [["send", "text or /command"], ["click", "visible label"], ["key", "Escape"], ["resize", "60x20"]],
+    "expects": ["text that must appear on screen"]}}
+  Runs in demo mode after the approval is handled and the chat view is open. It is accepted if
+  two runs on the current build agree; a step that FAILS on the current build is welcome: it
+  becomes a problem to fix.
+- Engine bench task (harder coding tasks are welcome): create {bench}/<name>/ with task.md,
+  repo/ (Cargo.toml with package name bench_task and [workspace], src/...), hidden/hidden.rs
+  (integration tests using bench_task::...), solution.patch (unified diff, paths relative to
+  repo/, e.g. a/src/lib.rs) and why.md. Accepted only if the hidden tests fail on repo/ and pass
+  after solution.patch.
+"""
+
+
+def _move(src: Path, dest_dir: Path) -> Path:
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    dest = dest_dir / src.name
+    if dest.exists():
+        dest = dest_dir / f"{src.stem}-{int(time.time())}{src.suffix}"
+    shutil.move(str(src), str(dest))
+    return dest
+
+
+def validate_tour_proposals(run_dir: Path, i: int) -> list[str]:
+    accepted = []
+    for proposal in sorted((PROPOSALS / "tour").glob("*.json")):
+        try:
+            item = json.loads(proposal.read_text())
+            assert item["title"] and item["actions"] and item["expects"]
+        except Exception as e:
+            _move(proposal, PROPOSALS / "tour" / "rejected")
+            report_line(run_dir, f"- [{i}] judge proposal rejected (malformed): {proposal.name}: {e}")
+            continue
+        if not STAGE["on"]:
+            continue  # needs the stage; stays pending
+        results = []
+        for n in range(2):
+            out = run_dir / f"proposal-{proposal.stem}-{n}.json"
+            subprocess.run([sys.executable, str(STAGE_SCRIPT), "tour", "--binary", str(TARGET / "debug" / "loom-tui"),
+                            "--steps-file", str(proposal), "--json", str(out)], capture_output=True, text=True,
+                           timeout=600, env={**os.environ, "LOOM_STAGE_NAME": STAGE["name"]})
+            try:
+                results.append([st["ok"] for st in json.loads(out.read_text())["steps"]])
+            except Exception:
+                results.append(None)
+        if results[0] is None or results[0] != results[1]:
+            _move(proposal, PROPOSALS / "tour" / "rejected")
+            report_line(run_dir, f"- [{i}] judge proposal rejected (not deterministic: {results}): {item['title']}")
+            continue
+        extras = json.loads(TOUR_EXTRA.read_text()) if TOUR_EXTRA.exists() else []
+        extras.append({**item, "proposed": run_dir.name, "fails_when_added": not all(results[0])})
+        TOUR_EXTRA.write_text(json.dumps(extras, ensure_ascii=False, indent=2))
+        _move(proposal, PROPOSALS / "tour" / "accepted")
+        accepted.append(f"투어: {item['title']}{' (현재 실패)' if not all(results[0]) else ''}")
+    return accepted
+
+
+def validate_bench_proposals(run_dir: Path, i: int) -> list[str]:
+    import tempfile
+    accepted = []
+    for task in sorted(p for p in (PROPOSALS / "bench").iterdir() if p.is_dir() and p.name not in ("accepted", "rejected")):
+        needed = [task / "task.md", task / "repo" / "Cargo.toml", task / "hidden" / "hidden.rs", task / "solution.patch"]
+        reason = next((f"missing {n.relative_to(task)}" for n in needed if not n.exists()), None)
+        if reason is None and (BENCH_TASKS / task.name).exists():
+            reason = "a task with this name exists"
+        if reason is None:
+            def hidden_passes(apply_solution: bool) -> bool:
+                variant = "solution" if apply_solution else "original"
+                env = {**os.environ, "CARGO_TARGET_DIR": str(ROOT / "bench" / "engine" / ".target" / f"proposal-{task.name}-{variant}")}
+                with tempfile.TemporaryDirectory() as tmp:
+                    repo = Path(tmp) / "repo"
+                    # fresh mtimes, so cargo never reuses a build of the other variant
+                    shutil.copytree(task / "repo", repo, copy_function=shutil.copy)
+                    if apply_solution:
+                        p = subprocess.run(["git", "apply", "--unsafe-paths", "-p1", str(task / "solution.patch")],
+                                           cwd=repo, capture_output=True, text=True)
+                        if p.returncode != 0:
+                            p = subprocess.run(["patch", "-p1", "-i", str(task / "solution.patch")], cwd=repo,
+                                               capture_output=True, text=True)
+                            if p.returncode != 0:
+                                return False
+                    (repo / "tests").mkdir(exist_ok=True)
+                    shutil.copy(task / "hidden" / "hidden.rs", repo / "tests" / "hidden.rs")
+                    rc, *_ = run(["cargo", "test", "-q"], repo, env, timeout=600)
+                    return rc == 0
+
+            if hidden_passes(False):
+                reason = "hidden tests already pass on the original repo"
+            elif not hidden_passes(True):
+                reason = "hidden tests do not pass with solution.patch"
+        if reason:
+            _move(task, PROPOSALS / "bench" / "rejected")
+            report_line(run_dir, f"- [{i}] bench proposal rejected ({reason}): {task.name}")
+            continue
+        dest = BENCH_TASKS / task.name
+        shutil.copytree(task, dest, ignore=shutil.ignore_patterns("solution.patch"))
+        (dest / "proposed-by").write_text(run_dir.name)
+        _move(task, PROPOSALS / "bench" / "accepted")
+        accepted.append(f"벤치: {task.name}")
+    return accepted
+
+
+def copy_crate(dst: Path):
+    shutil.copytree(CRATE, dst, ignore=shutil.ignore_patterns("target", "target-*", "__pycache__", ".custom-tui"))
+
+
+GIT = ["git", "-c", "user.name=loom-selfimprove", "-c", "user.email=loom@localhost"]
+
+
+def git(crate: Path, *args) -> str:
+    return subprocess.run([*GIT, "-C", str(crate), *args], capture_output=True, text=True).stdout.strip()
+
+
+def score(state) -> tuple:
+    """Higher is better; compared field by field to detect regressions."""
+    sc = state.get("self_check") or {}
+    return (
+        bool(state["build"]["ok"]),
+        bool((state.get("tests") or {}).get("ok")),
+        state["pty"] is None or bool(state["pty"]["ok"]),
+        -len(sc.get("failed", [])) if sc else -999,
+    )
+
+
+def regressed(before, after) -> str | None:
+    names = ["build", "cargo test", "PTY suite"]
+    b, a = score(before), score(after)
+    for k in range(3):
+        if b[k] and not a[k]:
+            return f"{names[k]} broke"
+    if a[3] < b[3]:
+        return f"self-check failures {-b[3]} → {-a[3]}"
+    # Scripted (demo) steps only, step by step: live steps depend on the real backend and run
+    # only every third tour, so comparing totals would count their absence as a regression.
+    tb, ta = before.get("tour"), after.get("tour")
+    if tb and ta:
+        was_ok = {st["title"] for st in tb.get("steps", []) if st["ok"] and not st.get("live")}
+        broke = [st["title"] for st in ta.get("steps", []) if not st["ok"] and not st.get("live") and st["title"] in was_ok]
+        if broke:
+            return f"stage tour step broke: {', '.join(broke)[:120]}"
+    return None
+
+
+TRANSIENT = re.compile(r"stream disconnected|Reconnecting|preflight|timed out|connection (reset|refused)|502|503|no usable model|no model:|temporarily unavailable|upstream", re.I)
+CAPACITY = re.compile(r"at capacity|try a different model|overloaded|server is busy", re.I)
+QUOTA = re.compile(r"usage limit|rate limit|quota|429|limit reached|too many requests", re.I)
+
+
+def classify_failure(result, log: Path) -> str | None:
+    """'quota' / 'transient' when the agent never got to work; None otherwise."""
+    if result["rc"] == 0:
+        return None
+    text = log.read_text(errors="replace")[-20000:] if log.exists() else ""
+    if CAPACITY.search(text):
+        return "capacity"
+    if QUOTA.search(text):
+        return "quota"
+    if TRANSIENT.search(text) or result["rc"] == -9:
+        return "transient"
+    if result.get("seconds", 999) < 90:
+        return "transient"  # failed before doing any work: an infrastructure problem, not an attempt
+    return None
+
+
+def report_line(run_dir: Path, text: str):
+    with open(run_dir / "REPORT.md", "a") as f:
+        f.write(text + "\n")
+
+
+def detach(args_list: list[str], run_dir: Path):
+    log = run_dir / "run.log"
+    cmd = [sys.executable, str(Path(__file__).resolve()), *args_list, "--run-dir", str(run_dir)]
+    if shutil.which("caffeinate"):
+        cmd = ["caffeinate", "-i", *cmd]  # keep the Mac awake while the loop runs
+    with open(log, "a") as out:
+        p = subprocess.Popen(cmd, stdout=out, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+                             start_new_session=True, cwd=ROOT)
+    print(f"running in background: pid {p.pid}\n  progress: tail -f {log}\n  report:   {run_dir / 'REPORT.md'}\n  stop:     kill {p.pid}")
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--target", choices=["ui", "engine", "core"], default="ui",
+                    help="ui: TUI checks and UX backlog; engine: make the worker better on the engine bench; "
+                         "core: implement Core features from bench/engine/roadmap.json")
+    ap.add_argument("--hours", type=float, default=None, help="time budget; stops starting new iterations after it")
+    ap.add_argument("--iterations", type=int, default=None, help="iteration cap (default 3, or unlimited with --hours)")
+    ap.add_argument("--no-improve", action="store_true", help="only fix failures; skip UX review and backlog work")
+    ap.add_argument("--no-pty", action="store_true", help="skip the real-terminal PTY suite")
+    ap.add_argument("--in-place", action="store_true", help="edit loom-tui directly (no isolation, no automatic revert)")
+    ap.add_argument("--detach", action="store_true", help="run in the background and return immediately")
+    ap.add_argument("--model", default=MODEL, help="codex engine: model slug")
+    ap.add_argument("--fallback-models", nargs="*", default=["chatgpt-web/high", "chatgpt-web/medium", "loom"],
+                    help="codex engine: models to switch to when the current one is at capacity; "
+                         "`loom` = Loom's own worker on free remote models (OmniRoute)")
+    ap.add_argument("--engine", choices=["codex", "loom"], default="loom",
+                    help="who edits: Codex or Loom's own worker; engine target with Loom uses evidence-driven replay")
+    ap.add_argument("--max-cost", choices=["local", "free", "subscription"], default="free",
+                    help="loom engine: highest cost class; paid models are always blocked")
+    ap.add_argument("--agent-timeout", type=int, default=2400)
+    ap.add_argument("--stage", action="store_true",
+                    help="run the current build in a live Loom window the agent drives and you watch")
+    ap.add_argument("--no-open", action="store_true", help="with --stage: do not open a viewer window")
+    ap.add_argument("--explore-every", type=int, default=3,
+                    help="with --stage: every Nth iteration (starting with the first) a tester agent uses the "
+                         "real product on the stage and adds what it finds to the backlog/roadmap")
+    ap.add_argument("--explore-minutes", type=int, default=20)
+    ap.add_argument("--no-explore", action="store_true")
+    ap.add_argument("--run-dir", help=argparse.SUPPRESS)
+    args = ap.parse_args()
+    if args.target == "engine" and args.engine == "loom":
+        # Native self-improvement has a separate regression oracle and must keep
+        # the engine being evaluated distinct from the agent doing the editing.
+        native_run = Path(args.run_dir) if args.run_dir else ROOT / ".custom-tui" / "evolve" / time.strftime("%Y%m%d-%H%M%S")
+        if args.detach:
+            native_run.mkdir(parents=True, exist_ok=True)
+            detach([a for a in sys.argv[1:] if a != "--detach"], native_run)
+            return
+        explicit_cost = any(a == "--max-cost" or a.startswith("--max-cost=") for a in sys.argv[1:])
+        command = [sys.executable, str(ROOT / "scripts/loom-evolve"), "--execute",
+                   "--model", args.model if args.model != MODEL else "omniroute/agy/claude-opus-4-6-thinking",
+                   "--max-cost", args.max_cost if explicit_cost else "subscription",
+                   "--agent-timeout", str(args.agent_timeout),
+                   "--iterations", str(args.iterations or (10_000 if args.hours else 1)),
+                   "--run-dir", str(native_run)]
+        if args.hours is not None:
+            command.extend(["--hours", str(args.hours)])
+        raise SystemExit(subprocess.call(command, cwd=ROOT))
+    if args.in_place and args.detach:
+        sys.exit("--detach needs isolation for automatic revert; drop --in-place")
+    import signal
+
+    def _early_stop(*_):
+        raise KeyboardInterrupt
+
+    signal.signal(signal.SIGTERM, _early_stop)
+    signal.signal(signal.SIGHUP, _early_stop)
+    global TARGET
+    # Each loop builds into its own target dir; concurrent loops must not overwrite each other.
+    TARGET = CRATE / f"target-selfimprove-{args.target}"
+    models = [args.model] + [m for m in args.fallback_models if m != args.model]
+    model_at = 0
+    attempts: dict[str, int] = {}
+    stuck: set[str] = set()
+    iterations = args.iterations or (10_000 if args.hours else 3)
+    if args.target in ("engine", "core"):
+        if args.engine == "loom":
+            sys.exit(f"--target {args.target} is improved by Codex; the Loom worker is what is being judged")
+        use_core_target() if args.target == "core" else use_engine_target()
+        ENGINE["max_cost"] = args.max_cost
+    deadline = time.time() + args.hours * 3600 if args.hours else None
+
+    run_dir = Path(args.run_dir) if args.run_dir else ROOT / ".custom-tui" / "selfimprove" / time.strftime("%Y%m%d-%H%M%S")
+    if args.detach:
+        run_dir.mkdir(parents=True, exist_ok=True)
+        detach([a for a in sys.argv[1:] if a != "--detach"], run_dir)
+        return
+    run_dir.mkdir(parents=True, exist_ok=True)
+    if args.in_place:
+        crate = CRATE
+        if args.engine == "loom":
+            ENGINE.update(kind="loom", bin=build_engine(CRATE), max_cost=args.max_cost)
+    else:
+        copy_crate(run_dir / "base" / "loom-tui")
+        copy_crate(run_dir / "work" / "loom-tui")
+        crate = run_dir / "work" / "loom-tui"
+        (crate / ".gitignore").write_text("target/\ntarget-*/\n__pycache__/\n.loom/\n.custom-tui/\n")
+        if args.engine == "loom":
+            ENGINE.update(kind="loom", bin=build_engine(run_dir / "base" / "loom-tui"), max_cost=args.max_cost)
+        git(crate, "init", "-q")
+        git(crate, "add", "-A")
+        git(crate, "commit", "-q", "-m", "base snapshot")
+    env = {**os.environ, "CARGO_TARGET_DIR": str(TARGET), "CARGO_TERM_COLOR": "never"}
+    env.pop("NO_COLOR", None)
+    env["LOOM_BENCH_OUT"] = str(run_dir / "bench-latest.json")
+    log = run_dir / "log.jsonl"
+    print(f"run: {run_dir}\ncrate: {crate}\nbudget: {args.hours or '-'} h, {iterations if iterations < 10_000 else 'unlimited'} iterations", flush=True)
+    engine = f"loom worker (≤ {args.max_cost})" if args.engine == "loom" else f"codex {args.model}"
+    report_line(run_dir, f"# Loom self-improve {run_dir.name}\n\nengine {engine} · budget {args.hours or '-'} h\n")
+
+    if args.stage:
+        # Each loop target gets its own stage, window and lock.
+        global STAGE_DIR
+        STAGE["name"] = args.target
+        STAGE_DIR = ROOT / ".custom-tui" / "stage" / args.target
+        # Open the window right away; it shows the current build until the loop's own builds load.
+        lock = STAGE_DIR / "loop.pid"
+        STAGE_DIR.mkdir(parents=True, exist_ok=True)
+        if lock.exists():
+            try:
+                os.kill(int(lock.read_text()), 0)
+                sys.exit(f"another --target {args.target} --stage loop (pid {lock.read_text().strip()}) is running; stop it first")
+            except (ProcessLookupError, ValueError):
+                pass
+        lock.write_text(str(os.getpid()))
+        STAGE["on"] = True
+        relay = subprocess.Popen([sys.executable, str(STAGE_SCRIPT), "serve"], stdout=subprocess.DEVNULL,
+                                 stderr=subprocess.DEVNULL, start_new_session=True,
+                                 env={**os.environ, "LOOM_STAGE_NAME": STAGE["name"]})
+        import atexit
+        atexit.register(relay.terminate)
+        atexit.register(lambda: lock.unlink(missing_ok=True))
+        atexit.register(lambda: (stage("close"), stage("stop")))
+        current = CRATE / "target" / "debug" / "loom-tui"
+        if current.exists():
+            stage("start", "--binary", str(current))
+        stage("say", "자기개선 루프 시작 · 첫 점검 중 (빌드·테스트·PTY, 몇 분)")
+        if not args.no_open:
+            stage("open")
+    state = inspect(crate, env, not args.no_pty)
+    start_score = score(state)
+    if args.stage:
+        stage("say", "첫 점검 완료 · 인터페이스 투어 시작")
+        stage_tour(state, run_dir, 0)
+        stage("say", f"첫 점검 완료 · {describe(state).splitlines()[2] if len(describe(state).splitlines()) > 2 else ''}")
+    report_line(run_dir, f"start: {describe(state).splitlines()[:4]}\n")
+    kept = reverted = 0
+    backoff = 0
+    started_at = time.time()
+    i = 0
+    # SIGTERM / SIGHUP (the watching terminal closed) end the loop like Ctrl+C: the
+    # current agent is stopped with the process group, kept work is still reported.
+    import signal
+    def _stop(*_):
+        raise KeyboardInterrupt
+    signal.signal(signal.SIGTERM, _stop)
+    signal.signal(signal.SIGHUP, _stop)
+    try:
+        while i < iterations:
+            if deadline and time.time() > deadline:
+                print("time budget reached", flush=True)
+                break
+            i += 1
+            probs = [p for p in problems(state) if p.splitlines()[0][:160] not in stuck]
+            print(f"\n[{i}] {time.strftime('%H:%M')} {describe(state).splitlines()[0:4]}  problems: {len(probs)}", flush=True)
+            item = None
+            if probs:
+                kind, target, task = "fix", probs[0].splitlines()[0][:160], FIX_TASK
+            elif args.no_improve:
+                print("everything passes; stopping", flush=True)
+                break
+            elif args.target == "core":
+                if explore_due(i, args):
+                    added = explore("core", run_dir, i, args.model, args.explore_minutes * 60 + 1800, args.explore_minutes)
+                    print(f"[{i}] exploration added {added} roadmap items", flush=True)
+                pending = [x for x in load_roadmap() if x.get("status", "open") == "open"]
+                pending.sort(key=lambda x: (x.get("source") != "explore", x.get("kind") != "bug"))
+                if not pending:
+                    added = plan_roadmap(state, crate, run_dir, i, args.model, args.agent_timeout)
+                    print(f"[{i}] roadmap review added {added} features", flush=True)
+                    pending = [x for x in load_roadmap() if x.get("status", "open") == "open"]
+                if not pending:
+                    print("roadmap is empty; stopping", flush=True)
+                    break
+                item = {**pending[0], "_roadmap": True}
+                kind, target = "feature", item["title"]
+                task = CORE_TASK.format(title=item["title"], spec=item.get("spec", ""),
+                                        acceptance=item.get("acceptance", ""), docs=item.get("docs", ""))
+            elif args.target == "engine":
+                bench = state["bench"]["summary"]
+                kind, target, task = "improve", f"engine bench {bench['passed']}/{bench['total']}, input {bench['input_tokens']}", ENGINE_TASK
+            else:
+                if explore_due(i, args):
+                    added = explore("ui", run_dir, i, args.model, args.explore_minutes * 60 + 1800, args.explore_minutes)
+                    print(f"[{i}] exploration added {added} findings to {BACKLOG}", flush=True)
+                if len(open_items(load_backlog())) < 3 or (i % 3 == 0 and not explore_due(i, args)):
+                    added = review(state, crate, run_dir, i, args.model, args.agent_timeout)
+                    print(f"[{i}] UX review added {added} ideas to {BACKLOG}", flush=True)
+                pending = open_items(load_backlog())
+                if not pending:
+                    print("everything passes and the backlog is empty; stopping", flush=True)
+                    break
+                item = pending[0]
+                kind, target = "improve", item["title"]
+                task = IMPROVE_TASK.format(title=item["title"], benefit=item.get("benefit", ""),
+                                           screen=item.get("screen", ""), verify=item.get("verify", ""))
+            if models[model_at] == "loom" and time.time() >= CODEX_PAUSE["until"] and CODEX_PAUSE["until"]:
+                model_at, CODEX_PAUSE["until"] = 0, 0  # time to see whether Codex has capacity again
+            print(f"[{i}] {kind}: {target}", flush=True)
+            phase(f"반복 {i}: 에이전트 작업 중 · {kind}: {target[:60]}")
+            stage("say", f"반복 {i} 시작 · {kind}: {target[:70]}")
+            prompt = PROMPT.format(i=i, n=iterations if iterations < 10_000 else "∞", state=describe(state), task=task)
+            (run_dir / f"prompt-{i}.md").write_text(prompt)
+            agent_log = run_dir / f"agent-{i}.jsonl"
+            if models[model_at] == "loom" and ENGINE["kind"] != "loom":
+                # every Codex model is at capacity: let Loom's own worker (built from the base
+                # snapshot, free remote models first) take this iteration
+                if not ENGINE.get("fallback_bin"):
+                    source = run_dir / "base" / "loom-tui" if not args.in_place else CRATE
+                    ENGINE["fallback_bin"] = build_engine(source)
+                saved = dict(ENGINE)
+                ENGINE.update(kind="loom", bin=ENGINE["fallback_bin"], max_cost="free")
+                os.environ["LOOM_PREFER_REMOTE"] = "1"
+                try:
+                    result = agent(prompt, crate, agent_log, "loom", args.agent_timeout)
+                finally:
+                    ENGINE.clear()
+                    ENGINE.update(saved)
+                # every Codex model was at capacity: keep using the Loom worker and probe Codex
+                # again in 30 minutes instead of spending minutes on capacity errors each iteration
+                CODEX_PAUSE["until"] = time.time() + 1800
+            else:
+                result = agent(prompt, crate, agent_log, models[model_at], args.agent_timeout)
+            failure = classify_failure(result, agent_log)
+            changed = bool(git(crate, "status", "--porcelain")) if not args.in_place else True
+            if failure == "capacity" and not changed:
+                model_at = (model_at + 1) % len(models)
+                wait = 30 if model_at else [120, 300, 600, 900][min(backoff, 3)]
+                backoff += 0 if model_at else 1
+                print(f"[{i}] {models[model_at - 1]} at capacity; switching to {models[model_at]}", flush=True)
+                report_line(run_dir, f"- [{i}] {time.strftime('%H:%M')} model at capacity → {models[model_at]}")
+                i -= 1
+                time.sleep(wait)
+                continue
+            if failure and not changed:
+                wait = [300, 900, 1800, 3600][min(backoff, 3)] if failure == "quota" else 60
+                backoff += 1
+                print(f"[{i}] agent {failure} failure; retrying in {wait // 60} min", flush=True)
+                report_line(run_dir, f"- [{i}] {time.strftime('%H:%M')} {kind}: {target} → AGENT {failure.upper()}, retry in {wait // 60} min")
+                i -= 1
+                time.sleep(wait)
+                continue
+            backoff = 0
+
+            after = inspect(crate, env, not args.no_pty)
+            judge_added = validate_bench_proposals(run_dir, i)
+            if after["build"]["ok"]:
+                judge_added += validate_tour_proposals(run_dir, i)
+            for added in judge_added:
+                print(f"[{i}] judge extended: {added}", flush=True)
+                report_line(run_dir, f"- [{i}] **judge extended**: {added}")
+            if STAGE["on"]:
+                stage("say", f"반복 {i}: 새 빌드로 인터페이스 투어")
+                stage_tour(after, run_dir, i)
+            why = regressed(state, after)
+            if not args.in_place:
+                git(crate, "add", "-A", "-N")
+                shortstat = git(crate, "diff", "--shortstat", "HEAD").replace(" changed", "").replace("insertions(+)", "+").replace("deletions(-)", "−")
+            else:
+                shortstat = ""
+            before_state = state
+            if args.in_place:
+                outcome, commit = ("REGRESSED (kept, in-place)" if why else "KEPT"), "-"
+                state = after
+            elif not changed:
+                outcome, commit = "NO CHANGE", "-"
+            elif why:
+                git(crate, "reset", "-q", "--hard", "HEAD")
+                git(crate, "clean", "-qfd")
+                outcome, commit = f"REVERTED ({why})", "-"
+                reverted += 1
+            else:
+                git(crate, "add", "-A")
+                git(crate, "commit", "-q", "-m", f"{kind}: {target}\n\n{result['summary'][:1500]}")
+                commit = git(crate, "rev-parse", "--short", "HEAD")
+                outcome = "KEPT"
+                kept += 1
+                state = after
+            if STAGE["on"]:
+                # Show the build the loop will continue from (the kept change, or the reverted state).
+                if outcome.startswith("REVERTED"):
+                    run(["cargo", "build"], crate, env)
+                if STAGE["name"] == "ui":
+                    stage("restart", "--binary", str(TARGET / "debug" / "loom-tui"))
+                stage("say", f"반복 {i}: {outcome} · {target[:60]}")
+            if kind == "fix" and outcome != "KEPT":
+                attempts[target] = attempts.get(target, 0) + 1
+                if attempts[target] >= 3:
+                    stuck.add(target)
+                    print(f"[{i}] STUCK after 3 attempts, skipping: {target}", flush=True)
+                    report_line(run_dir, f"- [{i}] **STUCK** (3 attempts, needs a person): {target}")
+                    stage("say", f"막힘: 3번 시도해도 해결 못함 · {target[:50]}")
+            elapsed_min = int((time.time() - started_at) / 60)
+            board = scoreboard(i, kind, (item or {}).get("axis"), target, outcome, before_state, after, shortstat,
+                               f"{elapsed_min // 60}h{elapsed_min % 60:02d}m", kept, reverted)
+            if judge_added:
+                board += "\n  " + pad("판정 추가") + " · ".join(judge_added)
+            print(board, flush=True)
+            report_line(run_dir, "\n```\n" + board + "\n```")
+            if STAGE["on"]:
+                first = board.splitlines()[1].split(":", 1)[-1].strip()[:40]
+                stage("say", f"반복 {i} {outcome.split(' ')[0]} · {first} · " + " · ".join(
+                    l.strip().replace("  ", " ") for l in board.splitlines()[3:6]))
+            print(f"[{i}] {outcome} · agent {result['seconds']}s {result['input_tokens']} input tokens\n{result['summary']}", flush=True)
+            report_line(run_dir, f"- [{i}] {time.strftime('%H:%M')} {kind}: {target} → **{outcome}** commit {commit} · "
+                                 f"checks {describe(after).splitlines()[2]}\n  {result['summary'][:300].replace(chr(10), ' / ')}")
+            with open(log, "a") as f:
+                f.write(json.dumps({"iteration": i, "kind": kind, "target": target, "outcome": outcome,
+                                    "commit": commit, **result}, ensure_ascii=False) + "\n")
+            if item and item.get("_roadmap"):
+                items = load_roadmap()
+                for x in items:
+                    if x.get("id") == item["id"]:
+                        if outcome == "KEPT":
+                            x["status"] = "done"
+                        else:
+                            x["attempts"] = x.get("attempts", 0) + 1
+                            if x["attempts"] >= 2:
+                                x["status"] = "failed"
+                        x["run"], x["note"] = run_dir.name, result["summary"][:500]
+                save_roadmap(items)
+            elif item:
+                items = load_backlog()
+                for x in items:
+                    if x.get("id") == item["id"]:
+                        if result["summary"].lstrip().startswith("REJECT"):
+                            x["status"] = "rejected"
+                        elif outcome == "KEPT":
+                            x["status"] = "done"
+                        else:
+                            x["attempts"] = x.get("attempts", 0) + 1
+                            if x["attempts"] >= 2:
+                                x["status"] = "failed"
+                        x["run"], x["note"] = run_dir.name, result["summary"][:500]
+                save_backlog(items)
+    except KeyboardInterrupt:
+        if not args.in_place:
+            # discard the half-done iteration; kept commits stay
+            git(crate, "reset", "-q", "--hard", "HEAD")
+            git(crate, "clean", "-qfd")
+        print("\nstopped; reporting what was kept", flush=True)
+        report_line(run_dir, f"- stopped at {time.strftime('%H:%M')} (interrupted)")
+
+    if STAGE["on"]:
+        stage("say", f"루프 종료 · 유지 {kept} · 되돌림 {reverted}")
+        time.sleep(3)
+        stage("close")
+        stage("stop")
+    final = describe(state).split("\n## Rendered")[0]
+    print("\nfinal:\n" + final, flush=True)
+    report_line(run_dir, f"\n## Result\n\nkept {kept} · reverted {reverted} · score {start_score} → {score(state)}\n\n```\n{final}\n```")
+    if not args.in_place:
+        patch = run_dir / "changes.patch"
+        diff = subprocess.run(["diff", "-ruN", "-x", ".git", "-x", ".gitignore", "-x", "target", "-x", "target-*", "base/loom-tui", "work/loom-tui"],
+                              cwd=run_dir, capture_output=True, text=True).stdout
+        patch.write_text(diff)
+        files = sorted(set(re.findall(r"^\+\+\+ work/loom-tui/(\S+)", diff, re.M)))
+        history = git(crate, "log", "--oneline")
+        msg = (f"\npatch: {patch} ({len(files)} files)\ncommits:\n{history}\n"
+               f"review, then apply from the repo root:\n  patch -p1 -d {ROOT} --dry-run < {patch}\n  patch -p1 -d {ROOT} < {patch}")
+        print(msg)
+        report_line(run_dir, msg)
+
+
+if __name__ == "__main__":
+    main()

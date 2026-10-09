@@ -1,0 +1,62 @@
+{
+  "summary": {
+    "passed": 0,
+    "total": 1,
+    "input_tokens": 17451,
+    "output_tokens": 732,
+    "seconds": 83,
+    "mean_steps": 12.0,
+    "orient_bytes": 1604,
+    "validate_bytes": 0,
+    "remote_input_tokens": 17451,
+    "remote_calls": 11,
+    "contract_recall": 1.0,
+    "scope_events": 0,
+    "slice_rereads": 0,
+    "slice_bytes": 0,
+    "validated": 0,
+    "false_finish": 0,
+    "escalated": 0
+  },
+  "results": [
+    {
+      "task": "average-empty",
+      "passed": false,
+      "finished": false,
+      "stop": "Unresolved",
+      "steps": 12,
+      "seconds": 83,
+      "input_tokens": 17451,
+      "remote_input_tokens": 17451,
+      "remote_calls": 11,
+      "output_tokens": 732,
+      "phase_bytes": {
+        "message": 0,
+        "orient": 1604
+      },
+      "contract_recall": 1.0,
+      "scope_events": 0,
+      "slice_bytes": 0,
+      "slice_rereads": 0,
+      "validated": false,
+      "tiers": [
+        "Local"
+      ],
+      "models": {
+        "omniroute/openai/gpt-oss-120b": 11
+      },
+      "diff": "",
+      "test_tail": " --> tests/hidden.rs:3:46\n  |\n3 | #[test] fn none() { assert_eq!(average(&[]), None); }\n  |                                              ^^^^ expected `f64`, found `Option<_>`\n  |\n  = note: expected type `f64`\n             found enum `Option<_>`\n\nFor more information about this error, try `rustc --explain E0308`.\nerror: could not compile `bench_task` (test \"hidden\") due to 2 previous errors\n\nworker made no source changes",
+      "trace_tail": [
+        "find: src/report.rs:1 [<imports>] use crate::average;\nsrc/report.rs:5 [report] format!(\"{} values, mean {:.2}\", values.len(), average(values))\nsrc/lib.rs:4 [average] pub fn average(values: &[f64]) -> f64 {\n",
+        "find: Same find call as before, so the result is unchanged (see the earlier result). Original evidence: read_artifact(path=\"8c6ac820a0d30e497cd286c1a01df707c6f26eed8c7efae4bf69d31542556a18\", start=1, end=1)",
+        "repo_browser.find ERROR: unknown tool `repo_browser.find`",
+        "repo_browser.find ERROR: unknown tool `repo_browser.find`",
+        "find: no matches for `average(`",
+        "find: Same find call as before, so the result is unchanged (see the earlier result). Original evidence: read_artifact(path=\"b1e47ded706bb43c6a5a08b2a4b61ba7c47856803a9e63463c8eba8d85e0981d\", start=1, end=1)",
+        "repo_browser.find ERROR: unknown tool `repo_browser.find`",
+        "repo_browser.find ERROR: unknown tool `repo_browser.find`"
+      ]
+    }
+  ]
+}

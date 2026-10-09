@@ -1,0 +1,64 @@
+[package]
+name = "loom-core"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "Revision-pinned resources and control for Loom workers, independent of the UI"
+
+[workspace]
+
+[features]
+default = []
+cuda = ["llama-cpp-2/cuda"]
+
+[dependencies]
+anyhow = "1"
+base64 = "0.22"
+clap = { version = "4.6", features = ["derive"] }
+encoding_rs = "0.8"
+flate2 = "1"
+fs2 = "0.4"
+libc = "0.2"
+getrandom = "0.2"
+jsonwebtoken = "9"
+llama-cpp-2 = { version = "0.1.158", default-features = false, features = ["common"] }
+llama-cpp-sys-2 = { version = "0.1.158", default-features = false }
+# GGUF-embedded chat templates (HF Jinja) for models other than Spark
+minijinja = { version = "2.24", features = ["json"] }
+minijinja-contrib = { version = "2.24", features = ["pycompat"] }
+proc-macro2 = { version = "1", features = ["span-locations"] }
+quote = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+syn = { version = "2", features = ["full"] }
+tempfile = "3"
+tar = "0.4"
+toml = "0.9"
+# Multi-language symbols (wrapped by world::lang; replaceable by Loom extractors)
+ast-grep-core = "0.45.3"
+ast-grep-language = { version = "0.45.3", default-features = false, features = ["tree-sitter-rust", "tree-sitter-python", "tree-sitter-javascript", "tree-sitter-typescript", "tree-sitter-go", "tree-sitter-java"] }
+tree-sitter = "0.27"
+tree-sitter-tags = "0.27"
+tree-sitter-python = "0.25"
+tree-sitter-javascript = "0.25"
+tree-sitter-typescript = "0.23"
+tree-sitter-go = "0.25"
+tree-sitter-java = "0.23"
+url = "2"
+ureq = { version = "2", features = ["json"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+tokio = { version = "1", features = ["rt", "time", "macros"] }
+zip = { version = "2", default-features = false, features = ["deflate"] }
+
+# Hugging Face tokenizer.json: MLX checkpoints and native LMX v2 files (all platforms)
+tokenizers = { version = "0.22", default-features = false, features = ["fancy-regex"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+llama-cpp-2 = { version = "0.1.158", default-features = false, features = ["common", "metal"] }
+
+[build-dependencies]
+cc = "1"
+
+[dev-dependencies]
+ctor = "0.2"

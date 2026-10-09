@@ -1,0 +1,82 @@
+{
+  "date": "2026-10-04",
+  "scope": "Native worker execution, evidence reuse, routing and bounded recovery. No upstream Codex source changes.",
+  "verification": {
+    "core": {
+      "passed": 222,
+      "failed": 0
+    },
+    "client": {
+      "passed": 211,
+      "failed": 0
+    },
+    "new_worker_regressions": 16,
+    "worker_tests_total": 48,
+    "clippy_all_targets": "passed (-D warnings)",
+    "selfcheck": {
+      "passed": 433,
+      "failed": 0
+    },
+    "core_release": "built",
+    "client_debug_and_release": "built",
+    "new_core_regressions": 17,
+    "pty": {
+      "full_suite": "passed before final router correction",
+      "final_release_focused_checks": [
+        "Native edit/validation/approval/apply",
+        "distinct batched tools and local provider-failure report at 80/40 columns",
+        "shutdown cancels validation children",
+        "Escape interrupts active turn and menu without losing draft"
+      ],
+      "status": "passed"
+    }
+  },
+  "byte_measurement": {
+    "fixture": "editing_one_file_does_not_resend_an_unchanged_other_file",
+    "first_read_bytes": 10120,
+    "unchanged_read_after_other_file_edit_bytes": 237,
+    "claim": "Tool-result bytes only; no measured model-token reduction claim."
+  },
+  "regressions": [
+    "Model wait and tool/check commands share the original deadline",
+    "No new validation command starts after deadline",
+    "Retry backoff respects deadline",
+    "Parent cancellation interrupts child wait",
+    "Nonzero terminal exit is_error=true with exit code and output",
+    "Large terminal output is bounded valid JSON with full raw artifact",
+    "Unchanged other-file evidence survives single-file edit",
+    "Symlink and hardlink aliases are invalidated",
+    "Arbitrary commands invalidate source evidence",
+    "Running terminals disable evidence reuse",
+    "Invalid search regex is an error with literal-search guidance",
+    "Unknown tools do not invalidate source or count as edits",
+    "Repeated unknown calls warn once and stop",
+    "One recovery guidance can lead to actual edit without increasing limits",
+    "Only explicit tool_use_failed generation errors recover once; other BadRequest and repeated failures stop",
+    "Generated tool rejection neither switches to another model nor disables tool support; worker receives the error for correction"
+  ],
+  "live_conditions": {
+    "task": "average-empty",
+    "model": "omniroute/groq/openai/gpt-oss-120b",
+    "actual_served_model": "omniroute/openai/gpt-oss-120b",
+    "jobs": 1,
+    "max_steps": 16,
+    "task_seconds": 90,
+    "worker_seconds": 81,
+    "temperature": 0
+  },
+  "live_results": {
+    "baseline": "worker-loop-groq-2026-10-03.json",
+    "first_candidate": "worker-loop-groq-after-2026-10-04.json",
+    "generation_recovery_candidate": "worker-loop-groq-recovery-2026-10-04.json",
+    "preserved_diagnostic_trace": "worker-loop-trace-2026-10-04.jsonl",
+    "native_completion": "failed, no original patch applied; last model request timed out",
+    "isolated_generated_edits": "two successful edits reconstructed from trace passed three independent hidden tests",
+    "isolated_grade": "worker-loop-isolated-grade-2026-10-04.json",
+    "claim": "No Native completion-rate, speed, or model-token efficiency improvement proved. Auxiliary patch grading is not a Native benchmark pass.",
+    "final_router_candidate": "worker-loop-groq-router-2026-10-04.json",
+    "final_router_candidate_completion": "failed, 14 model turns, final provider timeout; no original patch applied",
+    "final_router_trace": "worker-loop-router-trace-2026-10-04.jsonl"
+  },
+  "remaining": "Native still needs reliable completion/verification after a correct partial patch. Preserve unresolved status and report instead of treating a buildable patch as proof of the full user request."
+}

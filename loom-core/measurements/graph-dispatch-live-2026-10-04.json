@@ -1,0 +1,67 @@
+{
+  "date": "2026-10-04",
+  "kind": "live-model graph dispatch, before stronger scoped system contract",
+  "fixture": {
+    "left.py": "def clamp_score(value): return value",
+    "right.py": "def slugify(text): return text.strip().lower()"
+  },
+  "requested_model": "omniroute/groq/openai/gpt-oss-120b",
+  "expected_hidden_cases": 9,
+  "original_files_unchanged": true,
+  "result": {
+    "cached_input_tokens": 768,
+    "contract_recall": 1.0,
+    "decision": {
+      "estimated_work": 4,
+      "groups": [
+        {
+          "anchors": [
+            "left.py::clamp_score"
+          ],
+          "read_files": [],
+          "write_files": [
+            "left.py"
+          ]
+        },
+        {
+          "anchors": [
+            "right.py::slugify"
+          ],
+          "read_files": [],
+          "write_files": [
+            "right.py"
+          ]
+        }
+      ],
+      "mode": "Split",
+      "observed_fixed_ms": null,
+      "reason": "AST 그래프에서 쓰기·의존 범위가 분리된 2개 작업을 병렬 배분합니다. 병합 후 Core가 검증합니다."
+    },
+    "finished": false,
+    "id": "task-18db125405e0f998-26960",
+    "input_tokens": 15160,
+    "models": {
+      "omniroute/openai/gpt-oss-120b": 11
+    },
+    "output_tokens": 1505,
+    "phase_bytes": {
+      "edit": 55,
+      "message": 0,
+      "orient": 753
+    },
+    "remote_calls": 11,
+    "remote_input_tokens": 15160,
+    "scope_events": [],
+    "slice_bytes": 0,
+    "slice_rereads": 1,
+    "status": "Unresolved",
+    "steps": 12,
+    "stop_reason": "Unresolved",
+    "summary": "작업을 완료하지 못했습니다.\n\nCore 실행 보고\n그래프 분배: 2개 · 모델 요청 12회\n작업 1: RateLimited: HTTP 429: {\"error\":{\"message\":\"[groq/openai/gpt-oss-120b] [429]: Rate limit reached for model `openai/gpt-oss-120b` in organization `org_01hwf7wpe1emqtrtag0dycx3t6` service tier `on_demand` on tokens per minute (TPM): Limit 8000, Used 7873, Requested 1516. Please try again in 10.4175s. Need more tokens? Upgrade to Dev Tier today at https://console.groq.com/settings/billing (reset after 9s)\",\"retry_after\":9,\"reset_at\":\"2026-10-03T16:37:54.941Z\"}}\n진행 결과:\n- read · left.py:1..400 · 결과: 2줄 읽음\n- find · def slugify ·  · 결과: right.py:1 [slugify] def slugify(text):\n- find · slugify ·  · 결과: right.py:1 [slugify] def slugify(text):\n격리 사본 수정 제안: 없음\n이번 시도: 모델 요청 4/8회 · 토큰 3990/500000 · 경과 37초/107초 · 모델 대기 36초\n마지막 모델 오류: RateLimited: HTTP 429: {\"error\":{\"message\":\"[groq/openai/gpt-oss-120b] [429]: Rate limit reached for model `openai/gpt-oss-120b` in organization `org_01hwf7wpe1emqtrtag0dycx3t6` service tier `on_demand` on tokens per minute (TPM): Limit 8000, Used 7873, Requested 1516. Please try again in 10.4175s. \n작업 2: budget exhausted\n진행 결과:\n- edit · right.py · 결과: 수정 완료\n- repo_browser.find ·  · 실패: unknown tool `repo_browser.find`\n- find · def clamp_score ·  · 결과: left.py:1 [clamp_score] def clamp_score(value):\n- edit · left.py · 실패: WRITE_SCOPE_CONFLICT: `left.py` is outside declared write_files\n격리 사본 수정 제안: right.py\n이번 시도: 모델 요청 8/8회 · 토큰 12675/500000 · 경과 62초/107초 · 모델 대기 62초\n누적 실행: 시도 1회 · 모델 요청 12회 · 토큰 16665 · 모델 대기 99초\n최근 모델 실패: RateLimited: HTTP 429: {\"error\":{\"message\":\"[groq/openai/gpt-oss-120b] [429]: Rate limit reached for model `openai/gpt-oss-120b` in organization `org_01hwf7wpe1emqtrtag0dycx3t6` service tier `on_deman\nCore 검증: 아직 수행하지 않음\n원본 반영: 없음 · 미수락 제안은 적용되지 않았습니다.\n남은 작업: Fix clamp_score to clamp numbers to the inclusive range 0 through 10, and fix slugify to lowercase, trim, and join whitespace-separated words with one hyphen. Keep the public function names and files.\n중단 사유: one or more graph workers could not complete their scoped proposal\n실행 근거: .loom/artifacts/0ed985ffddf1cc2f5f6024dbe78c8b41c93a228ef1b06cc3020edc5b40310325",
+    "tiers": [
+      "Local"
+    ],
+    "validated": false
+  },
+  "outcome": "FAILED: one child hit Groq TPM 429; another searched and tried modifying sibling-owned code and exhausted its 8 calls. Scope enforcement denied that edit. No merge/validation/application. This is not evidence of improved quality or token efficiency."
+}

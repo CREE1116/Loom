@@ -1,0 +1,13 @@
+engine bench: 12/12 passed · input 226135 tokens · 334s · mean 6.1 steps · orient 17851B · validate 3576B
+  ✓ average-empty            5 steps   23s input   13585 · finished
+  ✓ clamp-range              6 steps   26s input   14777 · finished
+  ✓ config-merge             5 steps   24s input   13884 · finished
+  ✓ expr-precedence         11 steps   59s input   60344 · finished
+  ✓ fix-build                6 steps   23s input   15725 · finished
+  ✓ last-n                   4 steps   15s input    8863 · finished
+  ✓ lru-cache                9 steps   37s input   26961 · finished
+  ✓ median-even              6 steps   21s input   13915 · finished
+  ✓ parse-duration           5 steps   21s input   13426 · finished
+  ✓ shape-perimeter          4 steps   17s input   10829 · finished
+  ✓ token-bucket             8 steps   43s input   24087 · finished
+  ✓ word-freq-normalize      4 steps   25s input    9739 · finished

@@ -1,0 +1,1 @@
+`merge` in src/merge.rs layers configuration but gets three rules wrong. Required behavior: maps merge recursively (nested keys from both sides survive), lists in the overlay replace lists in the base (no concatenation), and a Null in the overlay deletes that key from the result. Scalars in the overlay replace the base.

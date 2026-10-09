@@ -1,0 +1,49 @@
+#!/usr/bin/env python3
+"""Compare MLX buffer budgets and QKV fusion in separate, sequential processes."""
+import argparse
+import json
+import os
+from pathlib import Path
+import statistics
+import subprocess
+
+root = Path(__file__).resolve().parents[1]
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument("--engine", type=Path, default=root / "loom-tui/target/release/loom")
+parser.add_argument("--model", default="mlx/mlx-community/Qwen3-4B-4bit")
+parser.add_argument("--prompt", type=int, default=512)
+parser.add_argument("--gen", type=int, default=64)
+parser.add_argument("--prefill", type=int, default=512)
+parser.add_argument("--repeats", type=int, default=3)
+parser.add_argument("--output", type=Path, required=True)
+args = parser.parse_args()
+if min(args.repeats, args.prompt, args.gen, args.prefill) < 1:
+    parser.error("prompt, gen, prefill and repeats must be positive")
+
+variants = [("previous-budget", "256", "0"), ("memory-first", "64", "0"), ("qkv-fused", "64", "1")]
+rows = []
+args.output.parent.mkdir(parents=True, exist_ok=True)
+for repeat in range(args.repeats):
+    # Rotate the order so a single variant does not always get the coldest system.
+    order = variants[repeat % len(variants):] + variants[:repeat % len(variants)]
+    for name, cache_mb, fusion in order:
+        env = {**os.environ, "LOOM_MLX_CACHE_MB": cache_mb, "LOOM_MLX_FUSE_QKV": fusion,
+               "LOOM_MLX_PREFILL": str(args.prefill)}
+        run = subprocess.run([
+            str(args.engine.resolve()), "model", "bench", args.model,
+            "--kv", "f16", "--prompt", str(args.prompt), "--gen", str(args.gen), "--json",
+        ], env=env, check=True, text=True, capture_output=True, timeout=300)
+        report = json.loads(run.stdout)
+        rows.append({"variant": name, "repeat": repeat, "cache_mb": int(cache_mb),
+                     "fuse_qkv": fusion == "1", "prefill_chunk": args.prefill, "report": report})
+        args.output.write_text(json.dumps(rows, indent=2) + "\n")
+        print(f"{name}: {report['generated'] * 1000 / max(1, report['decode_ms']):.1f} tok/s, "
+              f"physical peak {report['peak_footprint'] / 1e9:.3f} GB", flush=True)
+
+reference = rows[0]["report"]["tokens"]
+for name, _, _ in variants:
+    group = [row["report"] for row in rows if row["variant"] == name]
+    print(json.dumps({"variant": name,
+        "median_decode_tps": statistics.median(r['generated'] * 1000 / max(1, r['decode_ms']) for r in group),
+        "median_peak_footprint": statistics.median(r['peak_footprint'] for r in group),
+        "same_greedy_tokens": all(r["tokens"] == reference for r in group)}), flush=True)

@@ -1,0 +1,133 @@
+#!/usr/bin/env python3
+"""Compare V4/V5 on identical fixtures and hidden tests through one model port.
+
+Each task has independent repositories per engine. Run order rotates per task.
+Reports retain actual served models, observed usage, approval and hidden-test
+results; a prose completion or unapproved change cannot pass. Build before use.
+"""
+from __future__ import annotations
+import argparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import hashlib
+import json
+import os
+from pathlib import Path
+import shutil
+import signal
+import subprocess
+import tempfile
+import threading
+import time
+
+ROOT=Path(__file__).resolve().parents[1]
+TASKS=ROOT/'bench/engine/tasks'
+
+
+def process(command, cwd, directory, label, timeout):
+    output=directory/f'{label}.stdout'; error=directory/f'{label}.stderr'
+    started=time.monotonic()
+    with output.open('w') as stdout, error.open('w') as stderr:
+        child=subprocess.Popen(command,cwd=cwd,stdout=stdout,stderr=stderr,start_new_session=True)
+        try: code=child.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            os.killpg(child.pid,signal.SIGKILL);child.wait();code=-9
+    return code,round(time.monotonic()-started,3),output
+
+
+def source_bytes(repo):
+    return {str(p.relative_to(repo)):p.read_bytes() for p in repo.rglob('*')
+            if p.is_file() and not any(part in {'.git','.loom','.loom-v3','.custom-tui','target'} for part in p.relative_to(repo).parts)}
+
+
+def trial(task,version,iteration,binary,args,base):
+    engine=version
+    metadata=json.loads((task/'bench.json').read_text()) if (task/'bench.json').exists() else {}
+    if 'split' in version and metadata.get('decomposable') is False:
+        return {'task':task.name,'version':version,'iteration':iteration,'requested_model':args.model,'eligible':False,'passed':None,'exclusion':'coupled/single fixture: forced split is outside this experiment'}
+    directory=base/f'{iteration:02}-{task.name}-{version}';directory.mkdir()
+    repo=directory/'repo';shutil.copytree(task/'repo',repo)
+    (repo/'.gitignore').write_text('target/\n.loom/\n.loom-v3/\n.custom-tui/\n')
+    subprocess.run(['git','init','-q',str(repo)],check=True)
+    # Resolve the same offline lockfile for all engines before timing; no hidden
+    # tests are present. This makes dependency state a controlled fixture input.
+    lock=subprocess.run(['cargo','generate-lockfile','--offline'],cwd=repo,capture_output=True,text=True)
+    if lock.returncode: return {'task':task.name,'version':version,'iteration':iteration,'requested_model':args.model,'eligible':False,'passed':None,'failure':'fixture lock failed','detail':lock.stderr}
+    before=source_bytes(repo)
+    common=[str(binary),'--bench-core',engine,'--cwd',str(repo),'--core-state-dir',str(directory/'state'),
+            '--core-run-reference',f'{base.name}/{iteration}/{task.name}',
+            '--model',args.model,'--max-steps',str(args.max_calls),'--max-seconds',str(args.timeout-10),
+            '--core-attempts',str(args.attempts),'--core-call-seconds',str(args.call_seconds),'--core-check','cargo test --offline -q']
+    if args.effort:common+=['--core-effort',args.effort]
+    code,seconds,output=process(common+['--run',(task/'task.md').read_text(),'--no-approve'],repo,directory,'run',args.timeout)
+    result={'task':task.name,'version':version,'iteration':iteration,'requested_model':args.model,
+            'difficulty':metadata.get('difficulty','legacy-small'),'decomposable':metadata.get('decomposable'),
+            'directory':str(directory),'worker_code':code,'worker_seconds':seconds,'passed':False,'hidden_passed':False}
+    try: report=json.loads(output.read_text())
+    except ValueError:
+        result['failure']='no structured report; see run.stderr';return result
+    result['report']=report
+    result['served_models']=sorted({call['served'] for call in report['model_calls'] if call.get('served')})
+    result['original_unchanged_before_approval']=source_bytes(repo)==before
+    if report['status']!='AwaitingApproval' or not result['original_unchanged_before_approval']:
+        return result
+    code,seconds,approval_output=process(common+['--core-approve',report['id']],repo,directory,'approval',args.timeout)
+    result['approval_code']=code;result['approval_seconds']=seconds
+    try:result['approval_report']=json.loads(approval_output.read_text())
+    except ValueError:pass
+    result['verified_seconds']=round(result['worker_seconds']+seconds,3)
+    if code: return result
+    after=source_bytes(repo)
+    changed=any(before.get(p)!=data for p,data in after.items() if p.startswith('src/') or p in {'Cargo.toml','build.rs'})
+    result['production_changed']=changed
+    (repo/'tests').mkdir(exist_ok=True);shutil.copyfile(task/'hidden/hidden.rs',repo/'tests/hidden.rs')
+    code,hidden_seconds,_=process(['cargo','test','--offline','-q'],repo,directory,'hidden',args.timeout)
+    result['hidden_seconds']=hidden_seconds
+    result['hidden_passed']=code==0;result['passed']=code==0 and changed
+    return result
+
+
+def main():
+    parser=argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--model',required=True)
+    parser.add_argument('--binary',type=Path,default=ROOT/'loom-tui/target/debug/loom-tui')
+    parser.add_argument('--only',nargs='+')
+    parser.add_argument('--tasks',type=Path,default=TASKS)
+    parser.add_argument('--call-seconds',type=int,default=45)
+    parser.add_argument('--effort')
+    parser.add_argument('--versions',nargs='+',choices=['v4','v5'],default=['v4','v5'])
+    parser.add_argument('--repeat',type=int,default=1)
+    parser.add_argument('--jobs',type=int,default=2)
+    parser.add_argument('--timeout',type=int,default=120)
+    parser.add_argument('--max-calls',type=int,default=8)
+    parser.add_argument('--attempts',type=int,default=2)
+    parser.add_argument('--json',type=Path,required=True)
+    args=parser.parse_args()
+    if args.repeat<1 or args.jobs<1 or args.timeout<=10 or args.call_seconds<1:parser.error('positive repeat/jobs and timeout >10 required')
+    tasks=sorted(p for p in args.tasks.iterdir() if (p/'task.md').exists())
+    if args.only:
+        if set(args.only)-{p.name for p in tasks}:parser.error('unknown task')
+        tasks=[p for p in tasks if p.name in args.only]
+    base=Path(tempfile.mkdtemp(prefix='loom-corebench-'))
+    binary=base/'engine';shutil.copy2(args.binary,binary)
+    checksum=hashlib.sha256(binary.read_bytes()).hexdigest()
+    results=[];lock=threading.Lock()
+    document={'model':args.model,'binary_sha256':checksum,'run_directory':str(base),
+        'configuration':{'tasks':[p.name for p in tasks],'versions':args.versions,'repeat':args.repeat,'max_calls':args.max_calls,'timeout':args.timeout,'attempts':args.attempts,'jobs':args.jobs,'unique_request_reference':True,'task_root':str(args.tasks),'call_seconds':args.call_seconds,'effort':args.effort,'ollama_context':os.environ.get('LOOM_OLLAMA_CTX'),'include_approval_timing':True},'results':results}
+    args.json.parent.mkdir(parents=True,exist_ok=True)
+    def group(task,index,iteration):
+        versions=args.versions[index%len(args.versions):]+args.versions[:index%len(args.versions)]
+        for version in versions:
+            result=trial(task,version,iteration,binary,args,base)
+            with lock:
+                results.append(result);args.json.write_text(json.dumps(document,ensure_ascii=False,indent=2)+'\n')
+                r=result.get('report',{})
+                print(f"{task.name} {version} #{iteration}: {'SKIP' if result.get('eligible') is False else 'PASS' if result['passed'] else 'FAIL'} "
+                    f"calls={r.get('calls','?')} input={r.get('input','?')} seconds={result.get('worker_seconds','?')}",flush=True)
+    with ThreadPoolExecutor(max_workers=args.jobs) as pool:
+        futures=[pool.submit(group,task,index,iteration) for iteration in range(1,args.repeat+1) for index,task in enumerate(tasks)]
+        for future in as_completed(futures):future.result()
+    print(f'Report: {args.json}\nArtifacts: {base}',flush=True)
+    return 0  # Individual failures are benchmark observations, not harness failures.
+
+
+if __name__=='__main__':raise SystemExit(main())

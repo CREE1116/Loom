@@ -1,0 +1,499 @@
+{
+  "summary": {
+    "passed": 12,
+    "total": 12,
+    "input_tokens": 420778,
+    "output_tokens": 11949,
+    "seconds": 368,
+    "mean_steps": 6.3,
+    "orient_bytes": 23062,
+    "validate_bytes": 10518,
+    "remote_input_tokens": 420778,
+    "remote_calls": 76,
+    "contract_recall": 0.472,
+    "scope_events": 13,
+    "slice_rereads": 9,
+    "slice_bytes": 0,
+    "validated": 12,
+    "false_finish": 0,
+    "escalated": 0
+  },
+  "results": [
+    {
+      "task": "average-empty",
+      "passed": true,
+      "finished": true,
+      "stop": "Accepted",
+      "steps": 6,
+      "seconds": 32,
+      "input_tokens": 32698,
+      "remote_input_tokens": 32698,
+      "remote_calls": 6,
+      "output_tokens": 1038,
+      "phase_bytes": {
+        "edit": 124,
+        "message": 282,
+        "orient": 1518,
+        "validate": 846
+      },
+      "contract_recall": 0.6666666666666666,
+      "scope_events": 1,
+      "slice_bytes": 0,
+      "slice_rereads": 2,
+      "validated": true,
+      "tiers": [
+        "Local"
+      ],
+      "models": {
+        "omniroute/claude-opus-4-6-thinking": 6
+      },
+      "diff": "src/lib.rs    | 10 +++++-----\n src/report.rs |  6 +++++-\n 2 files changed, 10 insertions(+), 6 deletions(-)",
+      "test_tail": "",
+      "trace_tail": [
+        "read: src/report.rs lines 1-6 of 6\n    1| use crate::average;\n    2| \n    3| /// One-line summary like \"3 values, mean 2.00\".\n    4| pub fn report(values: &[f64]) -> String {\n    5|     format!(\"{} values, ",
+        "find: src/report.rs:5 [report] format!(\"{} values, mean {:.2}\", values.len(), average(values))\nsrc/lib.rs:4 [average] pub fn average(values: &[f64]) -> f64 {\n",
+        "edit: Edited src/lib.rs\n{\"matched\":\"exactly\",\"path\":\"src/lib.rs\"}",
+        "edit: Edited src/report.rs\n{\"matched\":\"exactly\",\"path\":\"src/report.rs\"}",
+        "check: {\"commands\":[{\"artifact\":{\"bytes\":22,\"id\":\"83aa059287b57176a5ac99c90ef40d6cdb7ecf29ae0d2d70c8032324157686b5\"},\"artifact_path\":\"83aa059287b57176a5ac99c90ef40d6cdb7ecf29ae0d2d70c8032324157686b5\",\"failed",
+        "read: src/lib.rs lines 1-10 of 10\n    1| pub mod report;\n    2| \n    3| /// Arithmetic mean. Returns `None` for an empty slice.\n    4| pub fn average(values: &[f64]) -> Option<f64> {\n    5|     if values.is",
+        "read: src/report.rs lines 1-10 of 10\n    1| use crate::average;\n    2| \n    3| /// One-line summary like \"3 values, mean 2.00\".\n    4| /// Prints \"n/a\" for the mean when there are no values.\n    5| pub fn r",
+        "finish: ok"
+      ]
+    },
+    {
+      "task": "clamp-range",
+      "passed": true,
+      "finished": true,
+      "stop": "Accepted",
+      "steps": 6,
+      "seconds": 30,
+      "input_tokens": 31060,
+      "remote_input_tokens": 31060,
+      "remote_calls": 6,
+      "output_tokens": 872,
+      "phase_bytes": {
+        "edit": 59,
+        "message": 430,
+        "orient": 742,
+        "validate": 846
+      },
+      "contract_recall": 0.5,
+      "scope_events": 1,
+      "slice_bytes": 0,
+      "slice_rereads": 1,
+      "validated": true,
+      "tiers": [
+        "Local"
+      ],
+      "models": {
+        "omniroute/claude-opus-4-6-thinking": 6
+      },
+      "diff": "src/lib.rs | 5 +++--\n 1 file changed, 3 insertions(+), 2 deletions(-)",
+      "test_tail": "",
+      "trace_tail": [
+        "read: src/lib.rs lines 1-10 of 10\n    1| /// Clamp `value` into [lo, hi].\n    2| pub fn clamp_to(value: i64, lo: i64, hi: i64) -> i64 {\n    3|     if value < lo {\n    4|         hi\n    5|     } else if valu",
+        "outline: src/\n  lib.rs",
+        "find: src/lib.rs:2 [clamp_to] pub fn clamp_to(value: i64, lo: i64, hi: i64) -> i64 {\n",
+        "edit: Edited src/lib.rs\n{\"matched\":\"exactly\",\"path\":\"src/lib.rs\"}",
+        "check: {\"commands\":[{\"artifact\":{\"bytes\":22,\"id\":\"83aa059287b57176a5ac99c90ef40d6cdb7ecf29ae0d2d70c8032324157686b5\"},\"artifact_path\":\"83aa059287b57176a5ac99c90ef40d6cdb7ecf29ae0d2d70c8032324157686b5\",\"failed",
+        "read: src/lib.rs lines 1-11 of 11\n    1| /// Clamp `value` into [lo, hi].\n    2| pub fn clamp_to(value: i64, lo: i64, hi: i64) -> i64 {\n    3|     let (lo, hi) = if lo <= hi { (lo, hi) } else { (hi, lo) };\n",
+        "finish: ok"
+      ]
+    },
+    {
+      "task": "config-merge",
+      "passed": true,
+      "finished": true,
+      "stop": "Accepted",
+      "steps": 5,
+      "seconds": 30,
+      "input_tokens": 27089,
+      "remote_input_tokens": 27089,
+      "remote_calls": 5,
+      "output_tokens": 843,
+      "phase_bytes": {
+        "edit": 19,
+        "message": 595,
+        "orient": 1685,
+        "validate": 846
+      },
+      "contract_recall": 0.5,
+      "scope_events": 1,
+      "slice_bytes": 0,
+      "slice_rereads": 1,
+      "validated": true,
+      "tiers": [
+        "Local"
+      ],
+      "models": {
+        "omniroute/claude-opus-4-6-thinking": 5
+      },
+      "diff": "src/merge.rs | 13 ++++++++-----\n 1 file changed, 8 insertions(+), 5 deletions(-)",
+      "test_tail": "",
+      "trace_tail": [
+        "read: src/merge.rs lines 1-18 of 18\n    1| use crate::val::Val;\n    2| \n    3| /// Merge `overlay` onto `base` (configuration layering).\n    4| pub fn merge(base: Val, overlay: Val) -> Val {\n    5|     matc",
+        "read: src/val.rs lines 1-10 of 10\n    1| use std::collections::BTreeMap;\n    2| \n    3| #[derive(Debug, Clone, PartialEq)]\n    4| pub enum Val {\n    5|     Null,\n    6|     Num(i64),\n    7|     Str(String),",
+        "replace_symbol: Edited src/merge.rs",
+        "check: {\"commands\":[{\"artifact\":{\"bytes\":22,\"id\":\"83aa059287b57176a5ac99c90ef40d6cdb7ecf29ae0d2d70c8032324157686b5\"},\"artifact_path\":\"83aa059287b57176a5ac99c90ef40d6cdb7ecf29ae0d2d70c8032324157686b5\",\"failed",
+        "read: src/merge.rs lines 1-21 of 21\n    1| use crate::val::Val;\n    2| \n    3| /// Merge `overlay` onto `base` (configuration layering).\n    4| pub fn merge(base: Val, overlay: Val) -> Val {\n    5|     matc",
+        "finish: ok"
+      ]
+    },
+    {
+      "task": "expr-precedence",
+      "passed": true,
+      "finished": true,
+      "stop": "Accepted",
+      "steps": 8,
+      "seconds": 49,
+      "input_tokens": 54340,
+      "remote_input_tokens": 54340,
+      "remote_calls": 8,
+      "output_tokens": 2195,
+      "phase_bytes": {
+        "edit": 65,
+        "message": 834,
+        "orient": 6208,
+        "validate": 846
+      },
+      "contract_recall": 0.5,
+      "scope_events": 1,
+      "slice_bytes": 0,
+      "slice_rereads": 1,
+      "validated": true,
+      "tiers": [
+        "Local"
+      ],
+      "models": {
+        "omniroute/claude-opus-4-6-thinking": 8
+      },
+      "diff": "src/parser.rs | 61 +++++++++++++++++++++++++++++++++++++++++++++--------------\n 1 file changed, 47 insertions(+), 14 deletions(-)",
+      "test_tail": "",
+      "trace_tail": [
+        "read: src/lib.rs lines 1-3 of 3\n    1| pub mod lexer;\n    2| pub mod parser;\n    3| pub use parser::eval;\n",
+        "find: no matches for `test`",
+        "outline ERROR: overlay path must be relative, without traversal",
+        "find: no matches for `#\\[test\\]`",
+        "edit: Edited src/parser.rs\n{\"matched\":\"exactly\",\"path\":\"src/parser.rs\"}",
+        "check: {\"commands\":[{\"artifact\":{\"bytes\":22,\"id\":\"83aa059287b57176a5ac99c90ef40d6cdb7ecf29ae0d2d70c8032324157686b5\"},\"artifact_path\":\"83aa059287b57176a5ac99c90ef40d6cdb7ecf29ae0d2d70c8032324157686b5\",\"failed",
+        "read: src/parser.rs lines 1-84 of 84\n    1| use crate::lexer::{tokenize, Token};\n    2| \n    3| /// Evaluate an arithmetic expression with + - * / and parentheses.\n    4| pub fn eval(src: &str) -> Result<f6",
+        "finish: ok"
+      ]
+    },
+    {
+      "task": "fix-build",
+      "passed": true,
+      "finished": true,
+      "stop": "Accepted",
+      "steps": 6,
+      "seconds": 26,
+      "input_tokens": 32651,
+      "remote_input_tokens": 32651,
+      "remote_calls": 6,
+      "output_tokens": 685,
+      "phase_bytes": {
+        "edit": 59,
+        "message": 240,
+        "orient": 1801,
+        "validate": 1210
+      },
+      "contract_recall": 0.0,
+      "scope_events": 2,
+      "slice_bytes": 0,
+      "slice_rereads": 0,
+      "validated": true,
+      "tiers": [
+        "Local"
+      ],
+      "models": {
+        "omniroute/claude-opus-4-6-thinking": 6
+      },
+      "diff": "src/lib.rs | 2 +-\n 1 file changed, 1 insertion(+), 1 deletion(-)",
+      "test_tail": "",
+      "trace_tail": [
+        "check ERROR: {\"commands\":[{\"artifact\":{\"bytes\":970,\"id\":\"ddb898a950805c826250ad08443b62fd1b3945247240b88e40f1b57e53ee4565\"},\"artifact_path\":\"ddb898a950805c826250ad08443b62fd1b3945247240b88e40f1b57e53ee4565\",\"faile",
+        "outline ERROR: /workspace is outside the workspace",
+        "read_artifact:     1| $ cargo build --quiet\n    2| error[E0308]: mismatched types\n    3|  --> src/lib.rs:9:5\n    4|   |\n    5| 4 | pub fn word_counts(text: &str) -> HashMap<String, usize> {\n    6|   |               ",
+        "outline: src/\n  lib.rs",
+        "read: src/lib.rs lines 1-16 of 16\n    1| use std::collections::HashMap;\n    2| \n    3| /// Count how often each word occurs.\n    4| pub fn word_counts(text: &str) -> HashMap<String, usize> {\n    5|     let ",
+        "edit: Edited src/lib.rs\n{\"matched\":\"exactly\",\"path\":\"src/lib.rs\"}",
+        "check: {\"commands\":[{\"artifact\":{\"bytes\":22,\"id\":\"83aa059287b57176a5ac99c90ef40d6cdb7ecf29ae0d2d70c8032324157686b5\"},\"artifact_path\":\"83aa059287b57176a5ac99c90ef40d6cdb7ecf29ae0d2d70c8032324157686b5\",\"failed",
+        "finish: ok"
+      ]
+    },
+    {
+      "task": "last-n",
+      "passed": true,
+      "finished": true,
+      "stop": "Accepted",
+      "steps": 4,
+      "seconds": 18,
+      "input_tokens": 19306,
+      "remote_input_tokens": 19306,
+      "remote_calls": 4,
+      "output_tokens": 502,
+      "phase_bytes": {
+        "edit": 59,
+        "message": 344,
+        "orient": 297,
+        "validate": 846
+      },
+      "contract_recall": 0.5,
+      "scope_events": 1,
+      "slice_bytes": 0,
+      "slice_rereads": 0,
+      "validated": true,
+      "tiers": [
+        "Local"
+      ],
+      "models": {
+        "omniroute/claude-opus-4-6-thinking": 4
+      },
+      "diff": "src/lib.rs | 2 +-\n 1 file changed, 1 insertion(+), 1 deletion(-)",
+      "test_tail": "",
+      "trace_tail": [
+        "read: src/lib.rs lines 1-5 of 5\n    1| /// The last `n` items of `items`, or all items if there are fewer than `n`.\n    2| pub fn last_n<T: Clone>(items: &[T], n: usize) -> Vec<T> {\n    3|     let start = i",
+        "edit: Edited src/lib.rs\n{\"matched\":\"exactly\",\"path\":\"src/lib.rs\"}",
+        "check: {\"commands\":[{\"artifact\":{\"bytes\":22,\"id\":\"83aa059287b57176a5ac99c90ef40d6cdb7ecf29ae0d2d70c8032324157686b5\"},\"artifact_path\":\"83aa059287b57176a5ac99c90ef40d6cdb7ecf29ae0d2d70c8032324157686b5\",\"failed",
+        "finish: ok"
+      ]
+    },
+    {
+      "task": "lru-cache",
+      "passed": true,
+      "finished": true,
+      "stop": "Accepted",
+      "steps": 7,
+      "seconds": 40,
+      "input_tokens": 40897,
+      "remote_input_tokens": 40897,
+      "remote_calls": 7,
+      "output_tokens": 1375,
+      "phase_bytes": {
+        "edit": 59,
+        "message": 711,
+        "orient": 2974,
+        "validate": 846
+      },
+      "contract_recall": 0.5,
+      "scope_events": 1,
+      "slice_bytes": 0,
+      "slice_rereads": 1,
+      "validated": true,
+      "tiers": [
+        "Local"
+      ],
+      "models": {
+        "omniroute/claude-opus-4-6-thinking": 7
+      },
+      "diff": "src/lru.rs | 27 +++++++++++++++++++++++----\n 1 file changed, 23 insertions(+), 4 deletions(-)",
+      "test_tail": "",
+      "trace_tail": [
+        "outline: src/\n  lib.rs\n  lru.rs",
+        "read: src/lib.rs lines 1-1 of 1\n    1| pub mod lru;\n",
+        "find: ",
+        "find: src/lru.rs:4 [LruCache] pub struct LruCache {\nsrc/lru.rs:10 [impl LruCache] impl LruCache {\n",
+        "edit: Edited src/lru.rs\n{\"matched\":\"exactly\",\"path\":\"src/lru.rs\"}",
+        "check: {\"commands\":[{\"artifact\":{\"bytes\":22,\"id\":\"83aa059287b57176a5ac99c90ef40d6cdb7ecf29ae0d2d70c8032324157686b5\"},\"artifact_path\":\"83aa059287b57176a5ac99c90ef40d6cdb7ecf29ae0d2d70c8032324157686b5\",\"failed",
+        "read: src/lru.rs lines 1-51 of 51\n    1| use std::collections::HashMap;\n    2| \n    3| /// Least-recently-used cache. `get` and `put` both count as a use.\n    4| pub struct LruCache {\n    5|     capacity: u",
+        "finish: ok"
+      ]
+    },
+    {
+      "task": "median-even",
+      "passed": true,
+      "finished": true,
+      "stop": "Accepted",
+      "steps": 4,
+      "seconds": 19,
+      "input_tokens": 19876,
+      "remote_input_tokens": 19876,
+      "remote_calls": 4,
+      "output_tokens": 535,
+      "phase_bytes": {
+        "edit": 59,
+        "message": 295,
+        "orient": 615,
+        "validate": 848
+      },
+      "contract_recall": 0.5,
+      "scope_events": 1,
+      "slice_bytes": 0,
+      "slice_rereads": 0,
+      "validated": true,
+      "tiers": [
+        "Local"
+      ],
+      "models": {
+        "omniroute/claude-opus-4-6-thinking": 4
+      },
+      "diff": "src/lib.rs | 7 ++++++-\n 1 file changed, 6 insertions(+), 1 deletion(-)",
+      "test_tail": "",
+      "trace_tail": [
+        "read: src/lib.rs lines 1-19 of 19\n    1| /// Median of a non-empty slice.\n    2| pub fn median(values: &[f64]) -> f64 {\n    3|     let mut sorted = values.to_vec();\n    4|     sorted.sort_by(|a, b| a.partia",
+        "edit: Edited src/lib.rs\n{\"matched\":\"exactly\",\"path\":\"src/lib.rs\"}",
+        "check: {\"commands\":[{\"artifact\":{\"bytes\":22,\"id\":\"83aa059287b57176a5ac99c90ef40d6cdb7ecf29ae0d2d70c8032324157686b5\"},\"artifact_path\":\"83aa059287b57176a5ac99c90ef40d6cdb7ecf29ae0d2d70c8032324157686b5\",\"failed",
+        "finish: ok"
+      ]
+    },
+    {
+      "task": "parse-duration",
+      "passed": true,
+      "finished": true,
+      "stop": "Accepted",
+      "steps": 5,
+      "seconds": 22,
+      "input_tokens": 26140,
+      "remote_input_tokens": 26140,
+      "remote_calls": 5,
+      "output_tokens": 759,
+      "phase_bytes": {
+        "edit": 59,
+        "message": 344,
+        "orient": 1611,
+        "validate": 846
+      },
+      "contract_recall": 0.5,
+      "scope_events": 1,
+      "slice_bytes": 0,
+      "slice_rereads": 1,
+      "validated": true,
+      "tiers": [
+        "Local"
+      ],
+      "models": {
+        "omniroute/claude-opus-4-6-thinking": 5
+      },
+      "diff": "src/lib.rs | 6 ++++++\n 1 file changed, 6 insertions(+)",
+      "test_tail": "",
+      "trace_tail": [
+        "read: src/lib.rs lines 1-19 of 19\n    1| /// Parse \"1h30m\", \"45m\", \"2h\", \"90s\" into seconds.\n    2| pub fn parse_duration(text: &str) -> Option<u64> {\n    3|     let mut total = 0;\n    4|     let mut number",
+        "edit: Edited src/lib.rs\n{\"matched\":\"exactly\",\"path\":\"src/lib.rs\"}",
+        "check: {\"commands\":[{\"artifact\":{\"bytes\":22,\"id\":\"83aa059287b57176a5ac99c90ef40d6cdb7ecf29ae0d2d70c8032324157686b5\"},\"artifact_path\":\"83aa059287b57176a5ac99c90ef40d6cdb7ecf29ae0d2d70c8032324157686b5\",\"failed",
+        "read: src/lib.rs lines 1-25 of 25\n    1| /// Parse \"1h30m\", \"45m\", \"2h\", \"90s\" into seconds.\n    2| pub fn parse_duration(text: &str) -> Option<u64> {\n    3|     let mut total = 0;\n    4|     let mut number",
+        "finish: ok"
+      ]
+    },
+    {
+      "task": "shape-perimeter",
+      "passed": true,
+      "finished": true,
+      "stop": "Accepted",
+      "steps": 6,
+      "seconds": 23,
+      "input_tokens": 31058,
+      "remote_input_tokens": 31058,
+      "remote_calls": 6,
+      "output_tokens": 844,
+      "phase_bytes": {
+        "edit": 195,
+        "message": 180,
+        "orient": 529,
+        "validate": 846
+      },
+      "contract_recall": 0.5,
+      "scope_events": 1,
+      "slice_bytes": 0,
+      "slice_rereads": 0,
+      "validated": true,
+      "tiers": [
+        "Local"
+      ],
+      "models": {
+        "omniroute/claude-opus-4-6-thinking": 6
+      },
+      "diff": "src/shapes.rs | 9 +++++++++\n 1 file changed, 9 insertions(+)",
+      "test_tail": "",
+      "trace_tail": [
+        "read: src/shapes.rs lines 1-24 of 24\n    1| pub trait Shape {\n    2|     fn area(&self) -> f64;\n    3| }\n    4| \n    5| pub struct Rect {\n    6|     pub w: f64,\n    7|     pub h: f64,\n    8| }\n    9| \n   10",
+        "edit: Edited src/shapes.rs\n{\"matched\":\"exactly\",\"path\":\"src/shapes.rs\"}",
+        "edit: Edited src/shapes.rs\n{\"matched\":\"exactly\",\"path\":\"src/shapes.rs\"}",
+        "edit: Edited src/shapes.rs\n{\"matched\":\"exactly\",\"path\":\"src/shapes.rs\"}",
+        "check: {\"commands\":[{\"artifact\":{\"bytes\":22,\"id\":\"83aa059287b57176a5ac99c90ef40d6cdb7ecf29ae0d2d70c8032324157686b5\"},\"artifact_path\":\"83aa059287b57176a5ac99c90ef40d6cdb7ecf29ae0d2d70c8032324157686b5\",\"failed",
+        "finish: ok"
+      ]
+    },
+    {
+      "task": "token-bucket",
+      "passed": true,
+      "finished": true,
+      "stop": "Accepted",
+      "steps": 7,
+      "seconds": 35,
+      "input_tokens": 39965,
+      "remote_input_tokens": 39965,
+      "remote_calls": 7,
+      "output_tokens": 1134,
+      "phase_bytes": {
+        "edit": 65,
+        "message": 722,
+        "orient": 2882,
+        "validate": 846
+      },
+      "contract_recall": 0.5,
+      "scope_events": 1,
+      "slice_bytes": 0,
+      "slice_rereads": 1,
+      "validated": true,
+      "tiers": [
+        "Local"
+      ],
+      "models": {
+        "omniroute/claude-opus-4-6-thinking": 7
+      },
+      "diff": "src/bucket.rs | 9 ++++++---\n 1 file changed, 6 insertions(+), 3 deletions(-)",
+      "test_tail": "",
+      "trace_tail": [
+        "outline: src/\n  bucket.rs\n  clock.rs\n  lib.rs",
+        "find: no matches for `bucket`",
+        "read: src/clock.rs lines 1-4 of 4\n    1| /// Time source in milliseconds, injectable for tests.\n    2| pub trait Clock {\n    3|     fn now_ms(&self) -> u64;\n    4| }\n",
+        "read: src/lib.rs lines 1-2 of 2\n    1| pub mod bucket;\n    2| pub mod clock;\n",
+        "edit: Edited src/bucket.rs\n{\"matched\":\"exactly\",\"path\":\"src/bucket.rs\"}",
+        "check: {\"commands\":[{\"artifact\":{\"bytes\":22,\"id\":\"83aa059287b57176a5ac99c90ef40d6cdb7ecf29ae0d2d70c8032324157686b5\"},\"artifact_path\":\"83aa059287b57176a5ac99c90ef40d6cdb7ecf29ae0d2d70c8032324157686b5\",\"failed",
+        "read: src/bucket.rs lines 1-38 of 38\n    1| use crate::clock::Clock;\n    2| \n    3| /// Token bucket: holds up to `capacity` tokens, refilled at `per_second` tokens/s.\n    4| pub struct Bucket<C: Clock> {\n ",
+        "finish: ok"
+      ]
+    },
+    {
+      "task": "word-freq-normalize",
+      "passed": true,
+      "finished": true,
+      "stop": "Accepted",
+      "steps": 12,
+      "seconds": 44,
+      "input_tokens": 65698,
+      "remote_input_tokens": 65698,
+      "remote_calls": 12,
+      "output_tokens": 1167,
+      "phase_bytes": {
+        "edit": 59,
+        "message": 413,
+        "orient": 2200,
+        "validate": 846
+      },
+      "contract_recall": 0.5,
+      "scope_events": 1,
+      "slice_bytes": 0,
+      "slice_rereads": 1,
+      "validated": true,
+      "tiers": [
+        "Local"
+      ],
+      "models": {
+        "omniroute/claude-opus-4-6-thinking": 12
+      },
+      "diff": "src/lib.rs | 6 +++++-\n 1 file changed, 5 insertions(+), 1 deletion(-)",
+      "test_tail": "",
+      "trace_tail": [
+        "exec_command: {\"session_id\":null,\"exit_code\":0,\"output\":\"find: /workspace: No such file or directory\\r\\n\",\"artifact\":{\"id\":\"7e3ddd52890d219d09e4596b6bc4cd2aa69fb1c602b046dafe11e07bc4debb01\",\"bytes\":45}}",
+        "exec_command: {\"session_id\":2,\"exit_code\":null,\"output\":\"\",\"artifact\":{\"id\":\"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\",\"bytes\":0}}",
+        "exec_command: {\"session_id\":null,\"exit_code\":0,\"output\":\"Cargo.toml\\r\\n\",\"artifact\":{\"id\":\"47518cb60a989f3674d9a7607e6f9ec7e7b9918c67de5bede9079ce1551a39bb\",\"bytes\":12}}",
+        "exec_command: {\"session_id\":null,\"exit_code\":0,\"output\":\"./src/lib.rs\\r\\n\",\"artifact\":{\"id\":\"f76747be81a5c95d847255220618fd2d29da289b89fb36c928a71918e9f70517\",\"bytes\":14}}",
+        "edit: Edited src/lib.rs\n{\"matched\":\"exactly\",\"path\":\"src/lib.rs\"}",
+        "check: {\"commands\":[{\"artifact\":{\"bytes\":22,\"id\":\"83aa059287b57176a5ac99c90ef40d6cdb7ecf29ae0d2d70c8032324157686b5\"},\"artifact_path\":\"83aa059287b57176a5ac99c90ef40d6cdb7ecf29ae0d2d70c8032324157686b5\",\"failed",
+        "read: src/lib.rs lines 1-17 of 17\n    1| use std::collections::HashMap;\n    2| \n    3| /// The `k` most frequent words, most frequent first; ties alphabetical.\n    4| pub fn top_words(text: &str, k: usize) ",
+        "finish: ok"
+      ]
+    }
+  ]
+}

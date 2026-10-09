@@ -1,0 +1,6 @@
+{"id": "find-exit-print", "base": "b734d56548b90279efb4f87d694514ae6e5bb615",
+ "goal": "custom-tui에서 Loom을 종료할 때 세션 id와 다시 열기 명령을 출력하는 코드가 어느 파일 몇 번째 줄에 있는지 찾아서 알려줘",
+ "origin": "2026-10-03: a local model named the wrong file; a weak remote one repeated map/find",
+ "grade": {"source_locations": [{"path": "custom-tui/src/main.rs", "needle": "세션을 닫았습니다: {id}"}],
+           "max_steps": 12,
+           "trace_constraints": {"max_repeated_call": 2, "model_switches": 0}}}

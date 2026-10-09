@@ -1,0 +1,7 @@
+{"id": "until-zero-test", "base": "9f4ddc7de1c9386512deb3ffba85dfbf9629631a",
+ "goal": "custom-tui/src/app/meter.rs 의 until 함수(상대 시간 포맷)에 0초일 때 '0m'을 반환하는지 확인하는 단위 테스트를 추가해줘",
+ "origin": "2026-10-03: checked 31 times without editing; validation hit sandbox socket denials",
+ "env": {"LOOM_SANDBOX_LOOPBACK": "1"},
+ "grade": {"files_regex": {"custom-tui/src/app/meter.rs": "until\\(\\s*0\\s*\\)"}, "must_change": true,
+           "commands": ["cd custom-tui && cargo test --quiet --lib until -- --test-threads=1"],
+           "max_steps": 25, "trace_constraints": {"check_without_change": 1}}}

@@ -1,0 +1,61 @@
+{
+  "date": "2026-10-04",
+  "kind": "live graph dispatch after preserving provider error codes, before accepting strict EndTurn finish payload",
+  "model": "omniroute/groq/openai/gpt-oss-120b",
+  "result": {
+    "cached_input_tokens": 0,
+    "contract_recall": 1.0,
+    "decision": {
+      "estimated_work": 4,
+      "groups": [
+        {
+          "anchors": [
+            "left.py::clamp_score"
+          ],
+          "read_files": [],
+          "write_files": [
+            "left.py"
+          ]
+        },
+        {
+          "anchors": [
+            "right.py::slugify"
+          ],
+          "read_files": [],
+          "write_files": [
+            "right.py"
+          ]
+        }
+      ],
+      "mode": "Split",
+      "observed_fixed_ms": null,
+      "reason": "AST 그래프에서 쓰기·의존 범위가 분리된 2개 작업을 병렬 배분합니다. 병합 후 Core가 검증합니다."
+    },
+    "finished": false,
+    "id": "task-18db1304e0a1bc88-18270",
+    "input_tokens": 11340,
+    "models": {
+      "omniroute/openai/gpt-oss-120b": 8
+    },
+    "output_tokens": 1394,
+    "phase_bytes": {
+      "edit": 108,
+      "message": 1408,
+      "orient": 167
+    },
+    "remote_calls": 8,
+    "remote_input_tokens": 11340,
+    "scope_events": [],
+    "slice_bytes": 0,
+    "slice_rereads": 0,
+    "status": "Unresolved",
+    "steps": 8,
+    "stop_reason": "Unresolved",
+    "summary": "작업을 완료하지 못했습니다.\n\nCore 실행 보고\n그래프 분배: 2개 · 모델 요청 8회\n작업 1: model stopped without a proposal\n진행 결과:\n- read · left.py:1..400 · 결과: 2줄 읽음\n- edit · left.py · 결과: 수정 완료\n격리 사본 수정 제안: left.py\n이번 시도: 모델 요청 4/8회 · 토큰 6662/500000 · 경과 12초/107초 · 모델 대기 12초\n작업 2: model stopped without a proposal\n진행 결과:\n- read · right.py:1..200 · 결과: 2줄 읽음\n- edit · right.py · 결과: 수정 완료\n격리 사본 수정 제안: right.py\n이번 시도: 모델 요청 4/8회 · 토큰 6072/500000 · 경과 39초/107초 · 모델 대기 39초\n누적 실행: 시도 1회 · 모델 요청 8회 · 토큰 12734 · 모델 대기 52초\nCore 검증: 아직 수행하지 않음\n원본 반영: 없음 · 미수락 제안은 적용되지 않았습니다.\n남은 작업: Fix clamp_score to clamp numbers to the inclusive range 0 through 10, and fix slugify to lowercase, trim, and join whitespace-separated words with one hyphen. Keep the public function names and files.\n중단 사유: one or more graph workers could not complete their scoped proposal\n실행 근거: .loom/artifacts/04da341559742cd4f1001a7d3f1b8fa1abb774fbfa01b3effee4479f182643e1",
+    "tiers": [
+      "Local"
+    ],
+    "validated": false
+  },
+  "diagnosis": "Both workers edited only their owned files then returned structured finish payloads as text twice. Worker insisted on the finish tool name, wasted the second text response, and returned unresolved. New regression accepts only EndTurn JSON with summary, unresolved boolean, optional answer boolean after mutation; it remains a proposal and must pass independent validation. Ordinary prose, truncated generation, and answers after edit still cannot bypass verification."
+}

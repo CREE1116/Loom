@@ -1,0 +1,63 @@
+{
+  "summary": {
+    "passed": 0,
+    "total": 1,
+    "input_tokens": 20339,
+    "output_tokens": 1010,
+    "seconds": 84,
+    "mean_steps": 14.0,
+    "orient_bytes": 2007,
+    "validate_bytes": 0,
+    "remote_input_tokens": 20339,
+    "remote_calls": 12,
+    "contract_recall": 1.0,
+    "scope_events": 0,
+    "slice_rereads": 2,
+    "slice_bytes": 0,
+    "validated": 0,
+    "false_finish": 0,
+    "escalated": 0
+  },
+  "results": [
+    {
+      "task": "average-empty",
+      "passed": false,
+      "finished": false,
+      "stop": "Unresolved",
+      "steps": 14,
+      "seconds": 84,
+      "input_tokens": 20339,
+      "remote_input_tokens": 20339,
+      "remote_calls": 12,
+      "output_tokens": 1010,
+      "phase_bytes": {
+        "edit": 59,
+        "message": 0,
+        "orient": 2007
+      },
+      "contract_recall": 1.0,
+      "scope_events": 0,
+      "slice_bytes": 0,
+      "slice_rereads": 2,
+      "validated": false,
+      "tiers": [
+        "Local"
+      ],
+      "models": {
+        "omniroute/openai/gpt-oss-120b": 12
+      },
+      "diff": "",
+      "test_tail": " --> tests/hidden.rs:3:46\n  |\n3 | #[test] fn none() { assert_eq!(average(&[]), None); }\n  |                                              ^^^^ expected `f64`, found `Option<_>`\n  |\n  = note: expected type `f64`\n             found enum `Option<_>`\n\nFor more information about this error, try `rustc --explain E0308`.\nerror: could not compile `bench_task` (test \"hidden\") due to 2 previous errors\n\nworker made no source changes",
+      "trace_tail": [
+        "repo_browser.find ERROR: unknown tool `repo_browser.find`",
+        "repo_browser.find ERROR: unknown tool `repo_browser.find`",
+        "find ERROR: ripgrep failed (exit 2):\nrg: regex parse error:\n    (?:average()\n    ^\nerror: unclosed group\n\nUse literal=true for an exact source fragment, or repair the regex/path.",
+        "edit: Edited src/lib.rs\n{\"matched\":\"exactly\",\"path\":\"src/lib.rs\"}",
+        "find ERROR: ripgrep failed (exit 2):\nrg: regex parse error:\n    (?:average()\n    ^\nerror: unclosed group\n\nUse literal=true for an exact source fragment, or repair the regex/path.",
+        "find: src/report.rs:5 [report] format!(\"{} values, mean {:.2}\", values.len(), average(values))\nsrc/lib.rs:4 [average] pub fn average(values: &[f64]) -> Option<f64> {\n",
+        "read: Same read call as before, so the result is unchanged (see the earlier result). Original evidence: read_artifact(path=\"fa7e8109c3a2ded79cfec5a3b86c8792d13ad51940380b3e9110c4333c400ae9\", start=1, end=1)",
+        "read: src/report.rs lines 1-6 of 6\n    1| use crate::average;\n    2| \n    3| /// One-line summary like \"3 values, mean 2.00\".\n    4| pub fn report(values: &[f64]) -> String {\n    5|     format!(\"{} values, "
+      ]
+    }
+  ]
+}

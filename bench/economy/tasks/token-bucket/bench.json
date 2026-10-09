@@ -1,0 +1,5 @@
+{
+  "difficulty": "coupled-medium",
+  "decomposable": false,
+  "source": "bench/engine/tasks/token-bucket"
+}

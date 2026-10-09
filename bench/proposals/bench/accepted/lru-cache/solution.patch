@@ -1,0 +1,37 @@
+diff -ruN a/src/lru.rs b/src/lru.rs
+--- a/src/lru.rs	2026-10-02 14:18:23
++++ b/src/lru.rs	2026-10-02 14:18:23
+@@ -12,18 +12,27 @@
+         Self { capacity, map: HashMap::new(), order: Vec::new() }
+     }
+ 
++    fn touch(&mut self, key: &str) {
++        self.order.retain(|k| k != key);
++        self.order.push(key.to_string());
++    }
++
+     pub fn get(&mut self, key: &str) -> Option<i64> {
+-        self.map.get(key).copied()
++        let value = self.map.get(key).copied()?;
++        self.touch(key);
++        Some(value)
+     }
+ 
+     pub fn put(&mut self, key: &str, value: i64) {
+-        if self.map.len() >= self.capacity {
+-            if let Some(newest) = self.order.pop() {
+-                self.map.remove(&newest);
+-            }
++        if self.capacity == 0 {
++            return;
+         }
++        if !self.map.contains_key(key) && self.map.len() >= self.capacity {
++            let oldest = self.order.remove(0);
++            self.map.remove(&oldest);
++        }
+         self.map.insert(key.to_string(), value);
+-        self.order.push(key.to_string());
++        self.touch(key);
+     }
+ 
+     pub fn len(&self) -> usize {

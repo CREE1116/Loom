@@ -1,0 +1,53 @@
+diff -ruN a/src/parser.rs b/src/parser.rs
+--- a/src/parser.rs	2026-10-02 14:18:23
++++ b/src/parser.rs	2026-10-02 14:18:23
+@@ -11,24 +11,35 @@
+     Ok(value)
+ }
+ 
+-// BUG: all binary operators share one precedence level, evaluated left to right.
+ fn expr(t: &[Token], pos: &mut usize) -> Result<f64, String> {
+-    let mut acc = atom(t, pos)?;
+-    while *pos < t.len() {
+-        let op = t[*pos].clone();
+-        if !matches!(op, Token::Plus | Token::Minus | Token::Star | Token::Slash) {
+-            break;
+-        }
++    let mut acc = term(t, pos)?;
++    while let Some(op @ (Token::Plus | Token::Minus)) = t.get(*pos).cloned() {
+         *pos += 1;
+-        let rhs = atom(t, pos)?;
+-        acc = match op {
+-            Token::Plus => acc + rhs,
+-            Token::Minus => acc - rhs,
+-            Token::Star => acc * rhs,
+-            _ => acc / rhs,
+-        };
++        let rhs = term(t, pos)?;
++        acc = if op == Token::Plus { acc + rhs } else { acc - rhs };
+     }
+     Ok(acc)
++}
++
++fn term(t: &[Token], pos: &mut usize) -> Result<f64, String> {
++    let mut acc = unary(t, pos)?;
++    while let Some(op @ (Token::Star | Token::Slash)) = t.get(*pos).cloned() {
++        *pos += 1;
++        let rhs = unary(t, pos)?;
++        if op == Token::Slash && rhs == 0.0 {
++            return Err("division by zero".into());
++        }
++        acc = if op == Token::Star { acc * rhs } else { acc / rhs };
++    }
++    Ok(acc)
++}
++
++fn unary(t: &[Token], pos: &mut usize) -> Result<f64, String> {
++    if t.get(*pos) == Some(&Token::Minus) {
++        *pos += 1;
++        return Ok(-unary(t, pos)?);
++    }
++    atom(t, pos)
+ }
+ 
+ fn atom(t: &[Token], pos: &mut usize) -> Result<f64, String> {

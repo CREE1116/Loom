@@ -1,0 +1,67 @@
+#!/usr/bin/env python3
+"""Prepare one independent practice workspace and open Loom V3 there."""
+import argparse
+import os
+from pathlib import Path
+import shlex
+import shutil
+import subprocess
+import tempfile
+
+ROOT = Path(__file__).resolve().parents[1]
+TASKS = ROOT / 'bench/practice/tasks'
+CHOICES = {'1': 'ttl-boundary', '2': 'job-report', '3': 'retry-context'}
+
+
+def prepare_workspace(task, workspace, launcher):
+    """Copy starter code only; an existing destination is never replaced."""
+    prompt = (task / 'task.md').read_text()
+    workspace.mkdir(parents=True, exist_ok=False)
+    repo = workspace / 'repo'
+    shutil.copytree(task / 'repo', repo)
+    (repo / 'TASK.md').write_text(prompt)
+    ignore = repo / '.gitignore'
+    existing = ignore.read_text() if ignore.exists() else ''
+    ignore.write_text(existing + ('\n' if existing and not existing.endswith('\n') else '')
+                      + 'target/\n.loom/\n.loom-v3/\n.custom-tui/\n')
+    run = repo / 'run-loom'
+    run.write_text('#!/bin/sh\nset -eu\n'
+                   'practice_repo=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)\n'
+                   f'exec {shlex.quote(str(launcher.resolve()))} --cwd "$practice_repo" "$@"\n')
+    run.chmod(0o755)
+    subprocess.run(['git', 'init', '-q', str(repo)], check=True)
+    return repo
+
+
+def main():
+    parser = argparse.ArgumentParser(description='예제 복사 → 문제 준비 → Loom V3 실행')
+    parser.add_argument('task', nargs='?', default='1', choices=[*CHOICES, *CHOICES.values()],
+                        help='1 캐시 버그 / 2 작업 요약 / 3 실패 복구 (기본: 1)')
+    parser.add_argument('--directory', type=Path, help='새 작업 폴더. 이미 존재하면 중단')
+    parser.add_argument('--prepare-only', action='store_true', help='준비만 하고 실행하지 않음')
+    args = parser.parse_args()
+    name = CHOICES.get(args.task, args.task)
+    launcher = ROOT / 'scripts/loom-v3'
+    if not shutil.which('git'):
+        parser.error('git을 찾을 수 없습니다.')
+    if not launcher.is_file() or not os.access(launcher, os.X_OK):
+        parser.error(f'Loom 실행 스크립트를 찾을 수 없습니다: {launcher}')
+    if args.directory:
+        workspace = args.directory.expanduser().resolve()
+    else:
+        # Keep the workspace after Loom exits so proposals and sessions can resume.
+        base = Path(tempfile.mkdtemp(prefix=f'loom-practice-{name}-'))
+        workspace = base / 'work'
+    try:
+        repo = prepare_workspace(TASKS / name, workspace, launcher)
+    except FileExistsError:
+        parser.error(f'이미 존재하는 폴더입니다. 새 경로를 지정하세요: {workspace}')
+    print(f'문제: {name}\n작업 폴더: {repo}\n'
+          '채팅에 입력: TASK.md의 요구사항대로 수정하고 테스트로 검증해줘.\n'
+          f'이어서 실행: {shlex.quote(str(repo / "run-loom"))}', flush=True)
+    if not args.prepare_only:
+        os.execv(str(repo / 'run-loom'), [str(repo / 'run-loom'), '--new'])
+
+
+if __name__ == '__main__':
+    main()

@@ -1,0 +1,274 @@
+{
+  "scenario": "two tool calls then call limit, actual Release Native CLI",
+  "fixture_file": {
+    "file.txt": "old\n"
+  },
+  "fixture_model_responses": [
+    {
+      "parts": [
+        {
+          "ToolCall": {
+            "id": "read",
+            "name": "read",
+            "arguments": {
+              "path": "file.txt"
+            }
+          }
+        }
+      ],
+      "usage": {
+        "input": 10,
+        "output": 2,
+        "cached_input": 0
+      },
+      "stop": "ToolUse",
+      "model": "scripted",
+      "latency": {
+        "secs": 0,
+        "nanos": 0
+      },
+      "route": null
+    },
+    {
+      "parts": [
+        {
+          "ToolCall": {
+            "id": "edit",
+            "name": "edit",
+            "arguments": {
+              "path": "file.txt",
+              "old": "old",
+              "new": "new"
+            }
+          }
+        }
+      ],
+      "usage": {
+        "input": 10,
+        "output": 2,
+        "cached_input": 0
+      },
+      "stop": "ToolUse",
+      "model": "scripted",
+      "latency": {
+        "secs": 0,
+        "nanos": 0
+      },
+      "route": null
+    }
+  ],
+  "human_progress": "요청을 검토하고 필요한 작업을 선택합니다.\n실행 중: read · file.txt\nread · file.txt · 결과: file.txt lines 1-1 of 1\n도구 실행 결과:\nread · file.txt · 결과: file.txt lines 1-1 of 1\n실행 중: edit · file.txt\nedit · file.txt · 결과: Edited file.txt\n도구 실행 결과:\nedit · file.txt · 결과: Edited file.txt\n",
+  "human_final": "작업을 완료하지 못했습니다.\n\nCore 실행 보고\n진행 결과:\n- read · file.txt · 결과: file.txt lines 1-1 of 1\n- edit · file.txt · 결과: Edited file.txt\n격리 사본 수정 제안: file.txt\n이번 시도: 모델 요청 2/2회 · 토큰 24/1000000 · 경과 0초/270초 · 모델 대기 0초\n누적 실행: 시도 1회 · 모델 요청 2회 · 토큰 24 · 모델 대기 0초\nCore 검증: 아직 수행하지 않음\n원본 반영: 없음 · 미수락 제안은 적용되지 않았습니다.\n남은 작업: change file\n중단 사유: budget exhausted\n실행 근거: .loom/artifacts/bef7e155988e5c5468d8fbd25f14e4958809c56fa1ac43d89fe6b07b8d4d1684\ntask-18db0b1f149b4178-35413 · Unresolved\n",
+  "trace_events": [
+    {
+      "model_started": {
+        "remaining_seconds": 270,
+        "step": 1
+      }
+    },
+    {
+      "progress": {
+        "id": "18db0b1f1976a610-start",
+        "message": "요청을 검토하고 필요한 작업을 선택합니다.",
+        "phase": "thinking"
+      }
+    },
+    {
+      "gateway_overhead_ms": null,
+      "gateway_upstream_ms": null,
+      "model_wait_ms": 0,
+      "step": 1
+    },
+    {
+      "calls": [
+        {
+          "args": {
+            "path": "file.txt"
+          },
+          "tool": "read"
+        }
+      ],
+      "endpoint": "scripted",
+      "model": "scripted",
+      "requested_model": "",
+      "requested_tier": "Local",
+      "route": null,
+      "step": 1,
+      "streamed": false,
+      "text": "",
+      "usage": {
+        "cached_input": 0,
+        "input": 10,
+        "output": 2
+      }
+    },
+    {
+      "tool_started": {
+        "description": "read · file.txt",
+        "operation_id": "18db0b1f1976a610-1-0",
+        "step": 1,
+        "tool": "read"
+      }
+    },
+    {
+      "args": {
+        "path": "file.txt"
+      },
+      "artifact": {
+        "bytes": 35,
+        "id": "cd57e0ae2209a84dfe608c0962f7ac285dc3625cc93eb35094384e2242fa30b0"
+      },
+      "cached": false,
+      "description": "read · file.txt",
+      "error": false,
+      "operation_id": "18db0b1f1976a610-1-0",
+      "result": "file.txt lines 1-1 of 1\n    1| old\n",
+      "result_summary": "결과: file.txt lines 1-1 of 1",
+      "step": 1,
+      "tool": "read",
+      "tool_ms": 15
+    },
+    {
+      "progress": {
+        "id": "18db0b1f1976a610-progress-1",
+        "message": "도구 실행 결과:\nread · file.txt · 결과: file.txt lines 1-1 of 1",
+        "phase": "Orient"
+      }
+    },
+    {
+      "model_started": {
+        "remaining_seconds": 270,
+        "step": 2
+      }
+    },
+    {
+      "gateway_overhead_ms": null,
+      "gateway_upstream_ms": null,
+      "model_wait_ms": 0,
+      "step": 2
+    },
+    {
+      "calls": [
+        {
+          "args": {
+            "new": "new",
+            "old": "old",
+            "path": "file.txt"
+          },
+          "tool": "edit"
+        }
+      ],
+      "endpoint": "scripted",
+      "model": "scripted",
+      "requested_model": "",
+      "requested_tier": "Local",
+      "route": null,
+      "step": 2,
+      "streamed": false,
+      "text": "",
+      "usage": {
+        "cached_input": 0,
+        "input": 10,
+        "output": 2
+      }
+    },
+    {
+      "tool_started": {
+        "description": "edit · file.txt",
+        "operation_id": "18db0b1f1976a610-2-0",
+        "step": 2,
+        "tool": "edit"
+      }
+    },
+    {
+      "args": {
+        "new": "new",
+        "old": "old",
+        "path": "file.txt"
+      },
+      "artifact": {
+        "bytes": 55,
+        "id": "1de5ccc57ac66974b0e4f44866cd373351fb010b529af36415d85a6b26f61553"
+      },
+      "cached": false,
+      "description": "edit · file.txt",
+      "error": false,
+      "operation_id": "18db0b1f1976a610-2-0",
+      "result": "Edited file.txt\n{\"matched\":\"exactly\",\"path\":\"file.txt\"}",
+      "result_summary": "결과: Edited file.txt",
+      "step": 2,
+      "tool": "edit",
+      "tool_ms": 15
+    },
+    {
+      "progress": {
+        "id": "18db0b1f1976a610-progress-2",
+        "message": "도구 실행 결과:\nedit · file.txt · 결과: Edited file.txt",
+        "phase": "Edit"
+      }
+    }
+  ],
+  "structured_outcome": {
+    "cached_input_tokens": 0,
+    "contract_recall": 0.0,
+    "decision": {
+      "estimated_work": 0,
+      "mode": "Single",
+      "observed_fixed_ms": null,
+      "reason": "Single: split benefit has not been established by measured gates"
+    },
+    "finished": false,
+    "id": "task-18db0b1f25f29e08-35963",
+    "input_tokens": 20,
+    "models": {
+      "scripted/scripted": 2
+    },
+    "output_tokens": 4,
+    "phase_bytes": {
+      "edit": 55,
+      "message": 0,
+      "orient": 35
+    },
+    "remote_calls": 0,
+    "remote_input_tokens": 0,
+    "scope_events": [
+      "observed write beyond derived contract: file.txt"
+    ],
+    "slice_bytes": 0,
+    "slice_rereads": 0,
+    "status": "Unresolved",
+    "steps": 2,
+    "stop_reason": "Unresolved",
+    "summary": "작업을 완료하지 못했습니다.\n\nCore 실행 보고\n진행 결과:\n- read · file.txt · 결과: file.txt lines 1-1 of 1\n- edit · file.txt · 결과: Edited file.txt\n격리 사본 수정 제안: file.txt\n이번 시도: 모델 요청 2/2회 · 토큰 24/1000000 · 경과 0초/270초 · 모델 대기 0초\n누적 실행: 시도 1회 · 모델 요청 2회 · 토큰 24 · 모델 대기 0초\nCore 검증: 아직 수행하지 않음\n원본 반영: 없음 · 미수락 제안은 적용되지 않았습니다.\n남은 작업: change file\n중단 사유: budget exhausted\n실행 근거: .loom/artifacts/a99460d6b5eca7fc3b4b4d53c4e0978e65e7eea229f26b0649d0ed7a675b0b33",
+    "tiers": [
+      "Local"
+    ],
+    "validated": false
+  },
+  "original_preserved": true,
+  "reporting_model_calls": 0,
+  "verification": {
+    "core-full": {
+      "passed": 205,
+      "ignored": 1
+    },
+    "tui-tests": {
+      "passed": 211,
+      "ignored": 3
+    },
+    "native-final": {
+      "passed": 15,
+      "ignored": 0
+    },
+    "selfcheck": {
+      "passed": 433,
+      "failed": 0
+    },
+    "core_clippy": "passed with -D warnings",
+    "full_pty": "passed",
+    "release_native_stop_report_pty": "passed",
+    "core_release_build": "passed",
+    "client_release_build": "passed"
+  },
+  "live_model_limit": "Gemini 3.8 Flash average-empty did not finish due provider timeout/cooldown; no quality improvement established. Live run preceded the aggregate reporting and reserve guard fixes, which were subsequently regression-tested."
+}

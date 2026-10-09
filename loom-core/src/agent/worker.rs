@@ -1,0 +1,843 @@
+//! One model/tool loop for both direct and scoped workers. No session/apply ownership.
+use crate::agent::{
+    Options,
+    events::{Event, Observer, Stage},
+    orchestration,
+    tools::{self, Host},
+    world::WorldHub,
+};
+use anyhow::{Result, ensure};
+use crate::{
+    effects::{Overlay, Patch, SandboxMode},
+    instructions::Instructions,
+    models::{cost_ceiling, Message, ModelPort, Need, Part, Request, Role, Stop, Usage},
+};
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
+use std::{
+    collections::BTreeSet,
+    fs::File,
+    io::Write,
+    path::PathBuf,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
+    time::{Duration, Instant},
+};
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct Metrics {
+    pub calls: usize,
+    pub usage: Usage,
+}
+#[derive(Clone, Debug)]
+pub struct Proposal {
+    pub patch: Patch,
+    pub reads: BTreeSet<PathBuf>,
+    pub summary: String,
+    pub complete: bool,
+    pub delegated: bool,
+}
+pub struct Shared<'a> {
+    pub run_id: String,
+    pub root: &'a std::path::Path,
+    pub model: &'a dyn ModelPort,
+    pub options: &'a Options,
+    pub hub: WorldHub,
+    pub cancel: Arc<AtomicBool>,
+    pub observe: &'a Observer<'a>,
+    pub started: Instant,
+    calls: AtomicUsize,
+    metrics: Mutex<Metrics>,
+    log: Mutex<File>,
+    log_error: Mutex<Option<String>>,
+}
+impl<'a> Shared<'a> {
+    pub fn new(
+        root: &'a std::path::Path,
+        model: &'a dyn ModelPort,
+        options: &'a Options,
+        hub: WorldHub,
+        cancel: Arc<AtomicBool>,
+        observe: &'a Observer<'a>,
+        log: File,
+    ) -> Self {
+        Self {
+            run_id: format!(
+                "{:x}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos()
+            ),
+            root,
+            model,
+            options,
+            hub,
+            cancel,
+            observe,
+            started: Instant::now(),
+            calls: AtomicUsize::new(0),
+            metrics: Mutex::new(Metrics {
+                calls: 0,
+                usage: Usage {
+                    input: Some(0),
+                    cached_input: Some(0),
+                    output: Some(0),
+                },
+            }),
+            log: Mutex::new(log),
+            log_error: Mutex::new(None),
+        }
+    }
+    pub fn remaining(&self) -> Duration {
+        Duration::from_secs(self.options.seconds).saturating_sub(self.started.elapsed())
+    }
+    pub fn worker_time(&self) -> Duration {
+        self.remaining().saturating_sub(Duration::from_secs(
+            self.options
+                .validation_reserve
+                .min(self.options.seconds / 4),
+        ))
+    }
+    pub fn stopped(&self) -> bool {
+        self.cancel.load(Ordering::Acquire) || self.worker_time().is_zero()
+    }
+    /// Deliver a transient event to the surface without recording it.
+    pub fn show(&self, event: Event) {
+        (self.observe)(event);
+    }
+    pub fn emit(&self, event: Event) {
+        // Append under the lock, render only after releasing it.
+        let result = (|| -> Result<()> {
+            let mut file = self
+                .log
+                .lock()
+                .map_err(|_| anyhow::anyhow!("event log lock poisoned"))?;
+            serde_json::to_writer(&mut *file, &event)?;
+            file.write_all(b"\n")?;
+            Ok(())
+        })();
+        if let Err(error) = result {
+            *self.log_error.lock().unwrap() = Some(error.to_string());
+        }
+        if !self.options.inquiry {
+            self.options.control.observe(&event);
+        }
+        (self.observe)(event);
+    }
+    pub fn flush(&self) -> Result<()> {
+        if let Some(error) = self.log_error.lock().unwrap().as_ref() {
+            anyhow::bail!("event log failed: {error}");
+        }
+        self.log.lock().unwrap().sync_all()?;
+        Ok(())
+    }
+    pub fn metrics(&self) -> Metrics {
+        self.metrics.lock().unwrap().clone()
+    }
+    pub fn complete(&self, id: &str, request: &Request) -> Result<crate::models::Response> {
+        use crate::models::ErrorKind;
+        let attempts = self.options.model_attempts.clamp(1, 5);
+        let mut attempt = 0;
+        let served = loop {
+            ensure!(!self.stopped(), "cancelled or deadline reached");
+            let m = self.metrics();
+            ensure!(
+                m.usage
+                    .input
+                    .unwrap_or(0)
+                    .saturating_add(m.usage.output.unwrap_or(0))
+                    < self.options.tokens,
+                "observed token budget exhausted"
+            );
+            self.calls
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+                    (n < self.options.steps).then_some(n + 1)
+                })
+                .map_err(|_| anyhow::anyhow!("shared model-call budget exhausted"))?;
+            attempt += 1;
+            let mut request = request.clone();
+            request.timeout = Some(
+                request
+                    .timeout
+                    .unwrap_or(self.worker_time())
+                    .min(self.worker_time()),
+            );
+            self.metrics.lock().unwrap().calls = self.calls.load(Ordering::SeqCst);
+            self.emit(Event::new(
+                id,
+                Stage::Run,
+                "model",
+                json!({
+                    "request":request.messages, "model":request.model, "attempt":attempt,
+                    "max_attempts":attempts, "timeout_seconds":request.timeout.unwrap().as_secs(),
+                    "reasoning_effort":request.reasoning_effort, "tools":request.tools.len()
+                }),
+            ));
+            let mut partial = false;
+            let result = self.model.complete_stream(Need {
+                tools: !request.tools.is_empty(), max_cost: cost_ceiling(), ..Default::default()
+            }, &request, &mut |event| {
+                if let crate::models::StreamEvent::Speed { tokens, seconds } = &event
+                    && *seconds > 0.0
+                {
+                    self.show(Event::new(id, Stage::Answer, "speed", json!({"tokens_per_second": *tokens as f64 / seconds})));
+                }
+                if let crate::models::StreamEvent::TextDelta(text) = &event
+                    && !text.is_empty()
+                {
+                    partial = true;
+                    // Shown live; the event log keeps only the final reply.
+                    self.show(Event::new(id, Stage::Answer, "stream", json!({"text": text})));
+                }
+            });
+            match result {
+                Ok(served) => break served,
+                Err(error) => {
+                    let wait = error
+                        .retry_after
+                        .unwrap_or(Duration::from_millis(500 * attempt as u64));
+                    let can_retry =
+                        matches!(error.kind, ErrorKind::Transient | ErrorKind::TimedOut | ErrorKind::RateLimited)
+                            && !partial
+                            && attempt < attempts
+                            && !self.stopped()
+                            && self.calls.load(Ordering::SeqCst) < self.options.steps
+                            && self.worker_time() > wait + Duration::from_secs(1);
+                    if !can_retry {
+                        let mut event = Event::new(
+                            id,
+                            Stage::Error,
+                            "model_error",
+                            json!({
+                                "reason":error.to_string(), "attempt":attempt, "max_attempts":attempts
+                            }),
+                        );
+                        event.failed = true;
+                        self.emit(event);
+                        return Err(error.into());
+                    }
+                    self.emit(Event::new(id, Stage::Run, "model_retry", json!({
+                        "reason":error.to_string(), "attempt":attempt, "next_attempt":attempt + 1,
+                        "max_attempts":attempts, "wait_seconds":wait.as_secs_f64()
+                    })));
+                    let until = Instant::now() + wait;
+                    while Instant::now() < until {
+                        ensure!(!self.stopped(), "cancelled during model retry wait");
+                        std::thread::sleep(
+                            Duration::from_millis(20)
+                                .min(until.saturating_duration_since(Instant::now())),
+                        );
+                    }
+                }
+            }
+        };
+        ensure!(
+            served.candidate.cost <= cost_ceiling(),
+            "model exceeded cost ceiling"
+        );
+        let mut m = self.metrics.lock().unwrap();
+        m.usage.input = m
+            .usage
+            .input
+            .zip(served.response.usage.input)
+            .map(|(a, b)| a.saturating_add(b));
+        m.usage.cached_input = m
+            .usage
+            .cached_input
+            .zip(served.response.usage.cached_input)
+            .map(|(a, b)| a.saturating_add(b));
+        m.usage.output = m
+            .usage
+            .output
+            .zip(served.response.usage.output)
+            .map(|(a, b)| a.saturating_add(b));
+        drop(m);
+        self.emit(Event::new(
+            id,
+            Stage::Run,
+            "model_result",
+            serde_json::to_value(&served.response)?,
+        ));
+        Ok(served.response)
+    }
+}
+
+fn guidance(shared: &Shared<'_>, id: &str, goal: &str, instructions: &mut Instructions) -> Result<String> {
+    let mut guidance = instructions.root_guidance()?;
+    // Skills: the main worker sees them; delegated children get their goal only.
+    if id == "main" {
+        guidance.push_str(&crate::instructions::skill_guidance(shared.root, goal, &shared.options.skills, "load one with use_skill before following it")?);
+    }
+    for path in instructions.loaded_paths() {
+        shared.emit(Event::new(
+            id,
+            Stage::Source,
+            path.display().to_string(),
+            json!({"kind":"instructions", "completed":true}),
+        ));
+    }
+    Ok(guidance)
+}
+
+/// Every caller supplies a freshly created overlay (main, DAG branch, or stale retry).
+/// Subsequent mutations refresh through Host::refresh, which captures live content.
+pub fn run(
+    shared: &Shared<'_>,
+    id: &str,
+    goal: &str,
+    overlay: &mut Overlay,
+    scope: Option<BTreeSet<PathBuf>>,
+    plan_mode: bool,
+) -> Result<Proposal> {
+    if shared.stopped() {
+        overlay.defer_cleanup();
+        anyhow::bail!("cancelled or deadline reached");
+    }
+    let readonly = shared.options.read_only
+        || shared.options.policy.sandbox == SandboxMode::ReadOnly
+        || scope.as_ref().is_some_and(|s| s.is_empty());
+    let child = scope.is_some();
+    let mut instructions = Instructions::open(shared.root)?;
+    let guidance = guidance(shared, id, goal, &mut instructions)?;
+    shared.emit(Event::new(
+        id,
+        Stage::Direct,
+        "preparation",
+        json!({"phase":"index", "started":true}),
+    ));
+    if shared.stopped() {
+        overlay.defer_cleanup();
+        anyhow::bail!("cancelled or deadline reached");
+    }
+    let mut host = Host {
+        view: shared.hub.initial_view(overlay, &shared.cancel)?,
+        sets: Default::default(),
+        hub: shared.hub.clone(),
+        overlay,
+        scope,
+        readonly,
+        // /plan starts like a normal worker: it plans first, then delegates only when
+        // independent parts benefit from agents, otherwise it does the work itself.
+        orchestrating: false,
+        checks: shared.options.checks.clone(),
+        policy: shared.options.policy,
+        instructions,
+        extensions: None,
+    };
+    // Extensions are configured per workspace; without a config there is nothing to start.
+    if shared.root.join(".loom/config.toml").is_file() {
+        host.extensions = crate::extensions::Extensions::open_for_workspace(shared.root, host.overlay.dir(), shared.options.policy).ok();
+    }
+    if id == "main" && !shared.options.inquiry {
+        shared.options.control.publish(
+            host.view.world.snapshot.revision.clone(),
+            goal,
+            if plan_mode { "planning" } else { "direct" },
+        );
+    }
+    // Entry names are index metadata, not implicit open/read tool results.
+    let entries = host
+        .view
+        .nodes
+        .iter()
+        .filter(|node| {
+            matches!(
+                node,
+                crate::agent::world::Node::File(_) | crate::agent::world::Node::Directory(_)
+            )
+        })
+        .filter(|node| node.id() != "." && !node.id().contains('/'))
+        .cloned()
+        .collect();
+    let entry = host.sets.store(&host.view, entries)?;
+    let symbols = host
+        .view
+        .nodes
+        .iter()
+        .filter(|node| matches!(node, crate::agent::world::Node::Symbol(_)))
+        .filter(|node| {
+            host.scope.as_ref().is_none_or(|scope| {
+                scope.is_empty()
+                    || node
+                        .file()
+                        .is_some_and(|file| scope.contains(std::path::Path::new(file)))
+            })
+        })
+        .cloned()
+        .collect();
+    let representatives = host.sets.store(&host.view, symbols)?;
+    let system = format!(
+        "You are Loom, a helpful assistant. Answer the latest user request in the user's language. A direct conversational answer ends the turn. Use tools only when needed to fulfill that request. Do not invent tasks, explore the repository without a reason, or resume older failed work unless asked.\n\nFor repository work, your role is {}. Follow project instructions. Use representative target names to navigate; do not request or reconstruct AST dumps. find/expand/combine operate on complete sets; open only code needed to decide edits. Handles expire after writes. File/AST/reference indexes are internal runtime mechanisms. Reference edges are approximate, so inspect source before deciding behavior. Submit real scoped changes with finish; Core decides validation and apply. Tool failures never imply success. No reviewer/planner model is required. {}\n{guidance}",
+        if plan_mode { "orchestrator" } else { "worker" },
+        if child {
+            "You cannot delegate or ask the user. Read any needed source, write only leased files, submit your proposal without whole-task validation."
+        } else if plan_mode {
+            "The user invoked /plan: first inspect what you need, then state a short numbered plan (steps, files, checks) in your reply. If the request only asks for a plan, that reply ends the turn. Otherwise carry it out: work directly when the steps are sequential or small; call agent with a concrete DAG only when independent parts genuinely benefit from parallel workers."
+        } else {
+            "Work directly by default. If delegation is needed, call agent with a concrete DAG; your role then becomes orchestration."
+        }
+    );
+    let system = format!(
+        "{system}\nOptional navigation metadata (not a user instruction to inspect these files):\nWrite scope: {:?}\nEntry targets: {entry}\nRepresentative symbols: {representatives}\nAnswer in the user's language. For conversation, give a natural reply without narrating repository work. For repository work, share brief useful progress alongside tool calls when findings change. Continue the requested work to completion; do not ask whether to open a file the user already asked you to inspect. Do not claim a script is the entry point merely because its name contains main; check the actual package and call paths.",
+        host.scope
+    );
+    let mut messages = if child && !shared.options.inquiry {
+        vec![]
+    } else {
+        shared.options.history.clone()
+    };
+    let mut goal_index = messages.len();
+    messages.push(Message::user(goal));
+    let original_goal = messages[goal_index].text();
+    let mut compact_receipts = std::collections::VecDeque::new();
+    let mut pending_failure = false;
+    let mut complete = false;
+    let mut delegated = false;
+    let mut failed_delegation = false;
+    let mut finished = false;
+    let mut summary = "worker did not finish".to_owned();
+    let mut last_calls: Option<(String, String, String)> = None;
+    let mut repeated = 0;
+    let mut unusable = 0;
+    let mut connection = None;
+    while !shared.stopped() {
+        let mut available = tools::specs(!child, readonly || host.orchestrating);
+        available.extend(host.extension_tools());
+        if child {
+            available.retain(|t| t.name != "ask");
+        }
+        let request = Request {
+            model: shared.options.model.clone().unwrap_or_default(),
+            system: Some(format!(
+                "{system}\nCurrent role: {}",
+                if host.orchestrating {
+                    "orchestration; coordinate the DAG and its blockers"
+                } else if shared.options.inquiry {
+                    "read-only parallel inquiry; main task continues independently"
+                } else {
+                    "assistant; answer the current request, perform repository work only when needed"
+                }
+            )),
+            messages: messages.clone(),
+            tools: available,
+            max_output_tokens: Some(8192),
+            reasoning_effort: shared.options.reasoning_effort.clone(),
+            cancel: Some(shared.cancel.clone()),
+            timeout: Some(
+                shared
+                    .worker_time()
+                    .min(Duration::from_secs(shared.options.call_seconds)),
+            ),
+            gateway_connection: connection.clone(),
+            ..Default::default()
+        };
+        let response = match shared.complete(id, &request) {
+            Ok(r) => r,
+            Err(e) => {
+                summary = e.to_string();
+                break;
+            }
+        };
+        connection = response.gateway_connection.clone();
+        if shared.stopped() {
+            summary = "cancelled or deadline reached".into();
+            break;
+        }
+        let calls: Vec<_> = response
+            .tool_calls()
+            .map(|(cid, n, a)| (cid.to_owned(), n.to_owned(), a.clone()))
+            .collect();
+        if calls.is_empty() {
+            if response.stop == Stop::EndTurn
+                && !response.text().trim().is_empty()
+                && !failed_delegation
+                && !pending_failure
+            {
+                summary = crate::agent::conversation::without_receipts(&response.text());
+                complete = true;
+                break;
+            }
+            // Re-asking a model that keeps answering with nothing usable only spins
+            // under "waiting for the model"; stop and say what came back.
+            unusable += 1;
+            if unusable >= 2 {
+                summary = if response.parts.is_empty() {
+                    "the model returned empty replies twice; no text or tool call could be read".into()
+                } else {
+                    format!("the model replied twice without a usable tool call (stop: {:?})", response.stop)
+                };
+                break;
+            }
+            messages.push(Message {
+                role: Role::Assistant,
+                parts: response.parts,
+            });
+            messages.push(Message::user("Provide a usable tool call or finish. Truncated or empty output cannot finish."));
+            continue;
+        }
+        unusable = 0;
+        let commentary = response.text();
+        if !commentary.trim().is_empty() {
+            shared.emit(Event::new(id, Stage::Answer, "commentary", json!({"text":commentary})));
+        }
+        // A repeat is the same calls on the same revision returning the same results, so
+        // reading further ranges or pages of one target is progress, not repetition.
+        let revision = host.view.revision().to_owned();
+        let call_key = serde_json::to_string(&calls.iter().map(|(_, n, a)| (n, a)).collect::<Vec<_>>())?;
+        messages.push(Message {
+            role: Role::Assistant,
+            parts: response.parts,
+        });
+        let mut results = Vec::new();
+        let mut failed = false;
+        for (cid, name, args) in calls {
+            if shared.stopped() {
+                summary = "cancelled or deadline reached".into();
+                break;
+            }
+            let stage = match name.as_str() {
+                "find" | "expand" | "combine" | "project" => Stage::Navigation,
+                "open" | "use_skill" => Stage::Source,
+                "change" => Stage::Change,
+                "agent" => Stage::Orchestrating,
+                _ => Stage::Run,
+            };
+            let target = args["target"]
+                .as_str()
+                .or(args["query"].as_str())
+                .or(args["command"].as_str())
+                .unwrap_or(&name)
+                .to_owned();
+            shared.emit(Event::new(
+                id,
+                stage,
+                target.clone(),
+                json!({"tool":name,"args":args,"started":true}),
+            ));
+            let result: Result<Value> = if !request.tools.iter().any(|t| t.name == name) {
+                Err(anyhow::anyhow!("unavailable tool {name}"))
+            } else if name == "finish" {
+                if failed || pending_failure && !args["unresolved"].as_bool().unwrap_or(false) {
+                    Err(anyhow::anyhow!(
+                        "a tool failed in this batch; resolve the failure before finishing"
+                    ))
+                } else if failed_delegation && !args["unresolved"].as_bool().unwrap_or(false) {
+                    Err(anyhow::anyhow!(
+                        "DAG has unresolved work; repair delegation or finish unresolved"
+                    ))
+                } else {
+                    finished = true;
+                    summary = crate::agent::conversation::without_receipts(args["summary"].as_str().unwrap_or(""));
+                    complete = !args["unresolved"].as_bool().unwrap_or(false)
+                        && !summary.trim().is_empty();
+                    Ok(json!({"proposal":complete}))
+                }
+            } else if name == "agent" {
+                let plan = serde_json::from_value::<orchestration::Plan>(args.clone());
+                match plan {
+                    Ok(plan) => match plan.validate() {
+                        Ok(()) => {
+                            host.orchestrating = true;
+                            delegated = true;
+                            let outcome = orchestration::execute(shared, &plan, host.overlay);
+                            host.refresh(&shared.cancel)?;
+                            outcome
+                        }
+                        Err(e) => Err(e),
+                    },
+                    Err(e) => Err(e.into()),
+                }
+            } else if name == "ask" {
+                shared
+                    .options
+                    .control
+                    .ask(id, args["question"].as_str().unwrap_or(""), shared)
+            } else {
+                host.call(&name, &args, &shared.cancel, shared.worker_time())
+            };
+            if id == "main"
+                && !shared.options.inquiry
+                && matches!(name.as_str(), "change" | "run" | "agent")
+            {
+                shared.options.control.publish(
+                    host.view.world.snapshot.revision.clone(),
+                    goal,
+                    if host.orchestrating {
+                        "orchestrating"
+                    } else {
+                        "direct"
+                    },
+                );
+            }
+            let (value, error) = match result {
+                Ok(v) => {
+                    let command_failed = name == "run"
+                        && v.as_array()
+                            .is_some_and(|results| results.iter().any(|r| r["status"] != "Passed"));
+                    (v, command_failed)
+                }
+                Err(e) => (json!({"error":e.to_string()}), true),
+            };
+            if name == "agent" {
+                failed_delegation = error;
+            }
+            failed |= error;
+            if name != "finish" {
+                pending_failure = error;
+            }
+            compact_receipts.push_back(format!(
+                "{name} · {target} · {} · {}",
+                if error { "failed" } else { "observed" },
+                tools::clip(&value.to_string(), 1200)
+            ));
+            while compact_receipts.len() > 32 {
+                compact_receipts.pop_front();
+            }
+            let mut event = Event::new(
+                id,
+                stage,
+                target,
+                json!({"tool":name,"args":args,"result":value,"completed":true}),
+            );
+            event.failed = error;
+            shared.emit(event);
+            results.push(Part::ToolResult {
+                call_id: cid,
+                output: tools::clip(&value.to_string(), 20000),
+                is_error: error,
+            });
+            if name == "finish" && !error {
+                break;
+            }
+        }
+        let outputs: Vec<&str> = results
+            .iter()
+            .filter_map(|part| match part {
+                Part::ToolResult { output, .. } => Some(output.as_str()),
+                _ => None,
+            })
+            .collect();
+        let fingerprint = (revision, call_key, outputs.join("\u{0}"));
+        if last_calls.as_ref() == Some(&fingerprint) {
+            repeated += 1;
+        } else {
+            repeated = 0;
+            last_calls = Some(fingerprint);
+        }
+        if repeated > 0 {
+            // Tell the model inside the results: text beside tool results breaks the
+            // message order chat-completions servers require.
+            for part in &mut results {
+                if let Part::ToolResult { output, .. } = part {
+                    *output = format!(
+                        "[same call as your previous step on an unchanged repository; the result is identical. Use it, try a different query or range, or finish.]\n{output}"
+                    );
+                }
+            }
+        }
+        messages.push(Message {
+            role: Role::User,
+            parts: results,
+        });
+        if finished {
+            break;
+        }
+        if repeated >= 4 {
+            summary = "repeated identical operations on unchanged revision".into();
+            break;
+        }
+        let mut compacted = false;
+        // Keep the immutable goal and newest complete exchanges, preserving raw trace on disk.
+        while messages.len() > 5
+            && messages
+                .iter()
+                .map(|m| m.text().len() + serde_json::to_vec(&m.parts).map_or(0, |b| b.len()))
+                .sum::<usize>()
+                > shared.options.context_bytes
+        {
+            compacted = true;
+            if goal_index >= 2 {
+                messages.drain(0..2);
+                goal_index -= 2;
+            } else {
+                messages.drain(goal_index + 1..goal_index + 3);
+            }
+        }
+        if compacted {
+            let evidence = compact_receipts
+                .iter()
+                .rev()
+                .cloned()
+                .collect::<Vec<_>>()
+                .join("\n");
+            messages[goal_index] = Message::user(format!(
+                "{original_goal}\nCompacted observations for this objective (historical evidence; reopen current source as needed):\n{}",
+                tools::clip(&evidence, 8000)
+            ));
+        }
+    }
+    if shared.stopped() {
+        host.overlay.defer_cleanup();
+        anyhow::bail!("cancelled or deadline reached");
+    }
+    Ok(Proposal {
+        patch: host.overlay.patch()?,
+        reads: host
+            .overlay
+            .read_paths()
+            .into_iter()
+            .map(|p| {
+                p.strip_prefix(host.overlay.dir())
+                    .map(std::path::Path::to_owned)
+                    .unwrap_or(p)
+            })
+            .collect(),
+        summary,
+        complete,
+        delegated,
+    })
+}
+
+#[cfg(test)]
+mod startup_tests {
+    use super::*;
+    use crate::{base::Revision, models::{Response, ScriptedModel}};
+    use std::{fs, process::Command};
+
+    fn check_initial_host(stop_at: Option<&str>) {
+        let root = tempfile::tempdir().unwrap();
+        assert!(Command::new("git").args(["init", "-q"]).arg(root.path())
+            .status().unwrap().success());
+        fs::write(root.path().join("a.rs"), "pub fn initial() {}\n").unwrap();
+        let base = Revision::capture(root.path()).unwrap();
+        let mut overlay = Overlay::create(root.path(), &base).unwrap();
+        let cache = overlay.dir().join(".loom/revision-stat-cache.json");
+        if cache.exists() {
+            fs::remove_file(&cache).unwrap();
+        }
+        let model = ScriptedModel::new([Response {
+            parts: if stop_at == Some("change") {
+                vec![Part::ToolCall {
+                    id: "create".into(), name: "change".into(),
+                    arguments: json!({"op":"create", "target":"new.txt", "content":"isolated edit"}),
+                }]
+            } else { vec![Part::Text("hello".into())] },
+            usage: Usage::default(),
+            stop: Stop::EndTurn,
+            model: "scripted".into(),
+            latency: Duration::ZERO,
+            route: None,
+            gateway_connection: None,
+            gateway_upstream_ms: None,
+        }]);
+        let options = Options::default();
+        let cancel = Arc::new(AtomicBool::new(stop_at == Some("before")));
+        let observe = |event: Event| {
+            if stop_at.is_none() && event.target == "model" {
+                assert!(!cache.exists(), "initial Host indexing recaptured the overlay before the model");
+            }
+            if stop_at == Some("model_result") && event.target == "model_result"
+                || stop_at == Some("change") && event.stage == Stage::Change && event.detail["completed"] == true
+                || stop_at == Some("preparation") && event.target == "preparation" && event.detail["phase"] == "index"
+            {
+                if cache.exists() {
+                    fs::remove_file(&cache).unwrap();
+                }
+                cancel.store(true, Ordering::Release);
+            }
+        };
+        let shared = Shared::new(root.path(), &model, &options, WorldHub::default(),
+            cancel.clone(), &observe, tempfile::tempfile().unwrap());
+        let result = run(&shared, "main", "hello", &mut overlay, None, false);
+        if stop_at.is_some() {
+            let error = result.unwrap_err();
+            assert!(error.to_string().contains("cancelled"), "{error}");
+            assert!(!cache.exists());
+            if stop_at == Some("before") || stop_at == Some("preparation") {
+                assert_eq!(shared.hub.parses(), 0, "stopped workers must not index the Host");
+                assert!(model.requests().is_empty());
+            } else if stop_at == Some("change") {
+                assert_eq!(fs::read_to_string(overlay.dir().join("new.txt")).unwrap(), "isolated edit");
+                assert!(!root.path().join("new.txt").exists());
+            }
+        } else {
+            assert!(result.unwrap().complete);
+            assert_eq!(model.requests().len(), 1);
+        }
+    }
+
+    /// Small local models often repeat a lookup; they get told so and may recover, and
+    /// only a long unbroken run of the same call on an unchanged repository stops them.
+    fn repeat_run(repeats: usize) -> (Proposal, Vec<String>) {
+        let root = tempfile::tempdir().unwrap();
+        assert!(Command::new("git").args(["init", "-q"]).arg(root.path())
+            .status().unwrap().success());
+        fs::write(root.path().join("a.rs"), "pub fn initial() {}\n").unwrap();
+        let base = Revision::capture(root.path()).unwrap();
+        let mut overlay = Overlay::create(root.path(), &base).unwrap();
+        let reply = |name: &str, arguments: Value| Response {
+            parts: vec![Part::ToolCall { id: "c".into(), name: name.into(), arguments }],
+            usage: Usage::default(),
+            stop: Stop::ToolUse,
+            model: "scripted".into(),
+            latency: Duration::ZERO,
+            route: None,
+            gateway_connection: None,
+            gateway_upstream_ms: None,
+        };
+        let model = ScriptedModel::new(
+            (0..repeats)
+                .map(|_| reply("find", json!({"query":"initial","kind":"symbol"})))
+                .chain([reply("finish", json!({"summary":"found initial"}))]),
+        );
+        let options = Options::default();
+        let observe = |_: Event| {};
+        let shared = Shared::new(root.path(), &model, &options, WorldHub::default(),
+            Arc::new(AtomicBool::new(false)), &observe, tempfile::tempfile().unwrap());
+        let proposal = run(&shared, "main", "find initial", &mut overlay, None, false).unwrap();
+        let outputs = model.requests().last().unwrap().messages.iter()
+            .flat_map(|message| message.parts.iter())
+            .filter_map(|part| match part { Part::ToolResult { output, .. } => Some(output.clone()), _ => None })
+            .collect();
+        (proposal, outputs)
+    }
+
+    #[test]
+    fn repeated_lookups_are_flagged_before_the_worker_gives_up() {
+        let (proposal, outputs) = repeat_run(4);
+        assert!(proposal.complete, "{}", proposal.summary);
+        assert_eq!(proposal.summary, "found initial");
+        assert!(!outputs[0].contains("same call"));
+        assert!(outputs[1..].iter().all(|output| output.contains("same call")), "{outputs:?}");
+        let (stuck, _) = repeat_run(8);
+        assert_eq!(stuck.summary, "repeated identical operations on unchanged revision");
+    }
+
+    #[test]
+    fn initial_host_does_not_recapture_before_first_model_request() {
+        check_initial_host(None);
+    }
+
+    #[test]
+    fn initial_host_checks_stop_before_indexing() {
+        check_initial_host(Some("before"));
+    }
+
+    #[test]
+    fn initial_host_checks_stop_after_preparation_event_before_indexing() {
+        check_initial_host(Some("preparation"));
+    }
+
+    #[test]
+    fn initial_host_cancelled_idle_response_skips_final_capture() {
+        check_initial_host(Some("model_result"));
+    }
+
+    #[test]
+    fn initial_host_cancelled_after_change_keeps_isolated_edit_without_final_capture() {
+        check_initial_host(Some("change"));
+    }
+}

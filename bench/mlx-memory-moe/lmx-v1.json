@@ -1,0 +1,472 @@
+{
+  "date": "2026-10-09",
+  "device": "Apple M4 Pro, 24 GiB unified memory",
+  "format": "LMX v1",
+  "profile": "preserve",
+  "validation": "Same source payload/precision and greedy generation; not a general model-quality or speed claim",
+  "engines": {
+    "cpu": {
+      "source": "~/.loom/models/empero-ai/Qwen3.8-4B-Distill-GGUF/Qwen3.8-4B-Q6_K.gguf",
+      "prepared": {
+        "id": "lmx/5d06fb005b1ccfb8e841fd8358220d7f3269fa5515f00f9fdced698f0c587634",
+        "path": "/private/var/folders/df/513wctj901z3g7_73ndxnyw80000gn/T/loom-lmx-verify-24qnpags/models/lmx/5d06fb005b1ccfb8e841fd8358220d7f3269fa5515f00f9fdced698f0c587634.lmx",
+        "bytes": 3563068707,
+        "reused": false,
+        "engines": [
+          {
+            "engine": "cpu",
+            "payload_supported": true,
+            "compiled": true,
+            "reason": null
+          },
+          {
+            "engine": "mlx",
+            "payload_supported": false,
+            "compiled": true,
+            "reason": "this weight encoding has no executor for this engine yet"
+          },
+          {
+            "engine": "cuda",
+            "payload_supported": true,
+            "compiled": false,
+            "reason": "build with the cuda feature on a CUDA host"
+          }
+        ]
+      },
+      "inspect": {
+        "bytes": 3563068707,
+        "engines": [
+          {
+            "compiled": true,
+            "engine": "cpu",
+            "payload_supported": true,
+            "reason": null
+          },
+          {
+            "compiled": true,
+            "engine": "mlx",
+            "payload_supported": false,
+            "reason": "this weight encoding has no executor for this engine yet"
+          },
+          {
+            "compiled": false,
+            "engine": "cuda",
+            "payload_supported": true,
+            "reason": "build with the cuda feature on a CUDA host"
+          }
+        ],
+        "format": "lmx",
+        "id": "lmx/5d06fb005b1ccfb8e841fd8358220d7f3269fa5515f00f9fdced698f0c587634",
+        "path": "/private/var/folders/df/513wctj901z3g7_73ndxnyw80000gn/T/loom-lmx-verify-24qnpags/models/lmx/5d06fb005b1ccfb8e841fd8358220d7f3269fa5515f00f9fdced698f0c587634.lmx",
+        "payload_verified": true,
+        "profile": "preserve",
+        "version": 1
+      },
+      "original_bench": {
+        "model": "empero-ai/Qwen3.8-4B-Distill-GGUF/Qwen3.8-4B-Q6_K.gguf",
+        "backend": "cpu",
+        "kv": "f16",
+        "flash": null,
+        "weights_bytes": 3563027744,
+        "load_ms": 21936,
+        "weights_memory": 3545044128,
+        "context_tokens": 512,
+        "context_memory": 71516208,
+        "prompt_tokens": 128,
+        "prefill_ms": 9644,
+        "generated": 32,
+        "decode_ms": 9360,
+        "peak_footprint": 3675821864,
+        "tokens": [
+          4747,
+          37072,
+          3287,
+          4515,
+          198,
+          262,
+          2353,
+          1752,
+          5121,
+          7387,
+          46139,
+          313,
+          4188,
+          1148,
+          1916,
+          11,
+          2645,
+          578,
+          574,
+          6631,
+          24535,
+          11,
+          2645,
+          681,
+          2168,
+          574,
+          524,
+          20822,
+          5406,
+          8,
+          333,
+          198
+        ]
+      },
+      "lmx_bench": {
+        "model": "lmx/5d06fb005b1ccfb8e841fd8358220d7f3269fa5515f00f9fdced698f0c587634",
+        "backend": "cpu",
+        "kv": "f16",
+        "flash": null,
+        "weights_bytes": 3563068707,
+        "load_ms": 5392,
+        "weights_memory": 3549205688,
+        "context_tokens": 512,
+        "context_memory": 70877256,
+        "prompt_tokens": 128,
+        "prefill_ms": 4380,
+        "generated": 32,
+        "decode_ms": 7316,
+        "peak_footprint": 3673773840,
+        "tokens": [
+          4747,
+          37072,
+          3287,
+          4515,
+          198,
+          262,
+          2353,
+          1752,
+          5121,
+          7387,
+          46139,
+          313,
+          4188,
+          1148,
+          1916,
+          11,
+          2645,
+          578,
+          574,
+          6631,
+          24535,
+          11,
+          2645,
+          681,
+          2168,
+          574,
+          524,
+          20822,
+          5406,
+          8,
+          333,
+          198
+        ]
+      },
+      "continuation_tokens_identical": true,
+      "compared_generated_tokens": 32,
+      "import_maximum_rss_bytes": 34996224,
+      "import_peak_physical_footprint_bytes": 28770856
+    },
+    "mlx": {
+      "source": "~/.loom/models/mlx/mlx-community/Qwen3-4B-4bit",
+      "prepared": {
+        "id": "lmx/7029f64f4e7488e49ecdc041fb13b960379725c4b1538e926c6c65190ad86b6a",
+        "path": "/private/var/folders/df/513wctj901z3g7_73ndxnyw80000gn/T/loom-lmx-verify-24qnpags/models/lmx/7029f64f4e7488e49ecdc041fb13b960379725c4b1538e926c6c65190ad86b6a.lmx",
+        "bytes": 2274642656,
+        "reused": false,
+        "engines": [
+          {
+            "engine": "cpu",
+            "payload_supported": false,
+            "compiled": true,
+            "reason": "this weight encoding has no executor for this engine yet"
+          },
+          {
+            "engine": "mlx",
+            "payload_supported": true,
+            "compiled": true,
+            "reason": null
+          },
+          {
+            "engine": "cuda",
+            "payload_supported": false,
+            "compiled": false,
+            "reason": "this weight encoding has no executor for this engine yet"
+          }
+        ]
+      },
+      "inspect": {
+        "bytes": 2274642656,
+        "engines": [
+          {
+            "compiled": true,
+            "engine": "cpu",
+            "payload_supported": false,
+            "reason": "this weight encoding has no executor for this engine yet"
+          },
+          {
+            "compiled": true,
+            "engine": "mlx",
+            "payload_supported": true,
+            "reason": null
+          },
+          {
+            "compiled": false,
+            "engine": "cuda",
+            "payload_supported": false,
+            "reason": "this weight encoding has no executor for this engine yet"
+          }
+        ],
+        "format": "lmx",
+        "id": "lmx/7029f64f4e7488e49ecdc041fb13b960379725c4b1538e926c6c65190ad86b6a",
+        "path": "/private/var/folders/df/513wctj901z3g7_73ndxnyw80000gn/T/loom-lmx-verify-24qnpags/models/lmx/7029f64f4e7488e49ecdc041fb13b960379725c4b1538e926c6c65190ad86b6a.lmx",
+        "payload_verified": true,
+        "profile": "preserve",
+        "version": 1
+      },
+      "original_bench": {
+        "model": "mlx-community/Qwen3-4B-4bit",
+        "backend": "mlx",
+        "kv": "f16",
+        "flash": true,
+        "weights_bytes": 2263022529,
+        "load_ms": 931,
+        "weights_memory": 2477655864,
+        "context_tokens": 160,
+        "context_memory": 69566464,
+        "prompt_tokens": 128,
+        "prefill_ms": 376,
+        "generated": 32,
+        "decode_ms": 659,
+        "peak_footprint": 2827979224,
+        "mlx_memory": {
+          "active_bytes": 2302806020,
+          "peak_active_bytes": 2633451844,
+          "cache_bytes": 67098328
+        },
+        "local_resources": {
+          "budget_bytes": 19327352832,
+          "resident_bytes": 2728400109,
+          "reclaimable_resident_bytes": 104857600,
+          "inference_bytes": 0,
+          "tool_reserved_bytes": 0,
+          "peak_reserved_bytes": 2959086829,
+          "waiting_inference": 0,
+          "waiting_tools": 0,
+          "waits": 0,
+          "wait_ms": 0,
+          "estimate_overruns": 0,
+          "over_budget_observations": 0,
+          "reclaims": 0,
+          "reclaimed_bytes": 0
+        },
+        "tokens": [
+          1188,
+          1983,
+          11,
+          2732,
+          593,
+          589,
+          6845,
+          25340,
+          11,
+          2732,
+          701,
+          2240,
+          589,
+          537,
+          21480,
+          5581,
+          8,
+          456,
+          630,
+          14190,
+          11,
+          419,
+          374,
+          279,
+          1852,
+          2038,
+          2326,
+          3039,
+          13,
+          2938,
+          594,
+          537
+        ]
+      },
+      "lmx_bench": {
+        "model": "lmx/7029f64f4e7488e49ecdc041fb13b960379725c4b1538e926c6c65190ad86b6a",
+        "backend": "mlx",
+        "kv": "f16",
+        "flash": true,
+        "weights_bytes": 2263022529,
+        "load_ms": 629,
+        "weights_memory": 2466989880,
+        "context_tokens": 160,
+        "context_memory": 71237632,
+        "prompt_tokens": 128,
+        "prefill_ms": 262,
+        "generated": 32,
+        "decode_ms": 685,
+        "peak_footprint": 2833926592,
+        "mlx_memory": {
+          "active_bytes": 2302799876,
+          "peak_active_bytes": 2633445700,
+          "cache_bytes": 66570970
+        },
+        "local_resources": {
+          "budget_bytes": 19327352832,
+          "resident_bytes": 2728400109,
+          "reclaimable_resident_bytes": 104857600,
+          "inference_bytes": 0,
+          "tool_reserved_bytes": 0,
+          "peak_reserved_bytes": 2959086829,
+          "waiting_inference": 0,
+          "waiting_tools": 0,
+          "waits": 0,
+          "wait_ms": 0,
+          "estimate_overruns": 0,
+          "over_budget_observations": 0,
+          "reclaims": 0,
+          "reclaimed_bytes": 0
+        },
+        "tokens": [
+          1188,
+          1983,
+          11,
+          2732,
+          593,
+          589,
+          6845,
+          25340,
+          11,
+          2732,
+          701,
+          2240,
+          589,
+          537,
+          21480,
+          5581,
+          8,
+          456,
+          630,
+          14190,
+          11,
+          419,
+          374,
+          279,
+          1852,
+          2038,
+          2326,
+          3039,
+          13,
+          2938,
+          594,
+          537
+        ]
+      },
+      "continuation_tokens_identical": true,
+      "compared_generated_tokens": 32,
+      "import_maximum_rss_bytes": 164610048,
+      "import_peak_physical_footprint_bytes": 121160304
+    }
+  },
+  "cuda": {
+    "compiled": false,
+    "explicit_request_rejected": true,
+    "hardware_verified": false
+  },
+  "platforms": {
+    "macOS": "CPU and MLX verified",
+    "Windows": "not hardware-verified",
+    "Linux": "not hardware-verified"
+  },
+  "limitations": [
+    "Existing llama.cpp numerical backend for CPU/CUDA; own MLX numerical backend",
+    "GGUF encoding executes on CPU/CUDA only; MLX encoding on MLX only",
+    "No GGUF-to-MLX conversion or new quantization in v1",
+    "Background build/tests and other workloads overlapped; timings do not establish a speedup",
+    "RSS/footprint are per import process; exclude whole-system file cache",
+    "CPU/CUDA memory and VRAM are not yet admitted by the common resource governor"
+  ],
+  "weight_extraction": {
+    "weight_copies": 0,
+    "metadata_files": 3,
+    "metadata_bytes": 11433297
+  },
+  "core_regression": {
+    "passed": 194,
+    "failed": 0,
+    "ignored": 8
+  },
+  "product_regression": {
+    "passed": 329,
+    "failed": 0,
+    "ignored": 3
+  },
+  "native_regression": {
+    "normal": "PASS: 72 MoE cases, KV release/rollback, saved MoE checkpoint and bounded LMX slices (f16 and q4 KV)",
+    "compiled_activations_off": "PASS: 72 MoE cases, KV release/rollback, saved MoE checkpoint and bounded LMX slices (f16 and q4 KV)"
+  },
+  "without_mlx_build_check": {
+    "passed": true,
+    "scope": "macOS build with MLX runtime deliberately absent; not Windows/Linux validation"
+  },
+  "selfcheck": {
+    "passed": 785,
+    "failed": 0
+  },
+  "final_release_build": true,
+  "final_lmx_cli_regression": {
+    "passed": 1,
+    "failed": 0
+  },
+  "final_lmx_core_regression": {
+    "passed": 6,
+    "failed": 0
+  },
+  "mlx_worker_route": {
+    "exit_code": 0,
+    "outcome": {
+      "cached_input_tokens": 0,
+      "contract_recall": 1.0,
+      "decision": {
+        "estimated_work": 0,
+        "groups": [],
+        "mode": "Single",
+        "observed_fixed_ms": null,
+        "reason": "그래프에서 작업 대상을 아직 특정하지 못해 한 작업으로 시작합니다."
+      },
+      "finished": true,
+      "id": "task-18dc9bbe82797828-6801",
+      "input_tokens": 2582,
+      "models": {
+        "lmx/lmx/7029f64f4e7488e49ecdc041fb13b960379725c4b1538e926c6c65190ad86b6a": 1
+      },
+      "output_tokens": 2,
+      "phase_bytes": {
+        "message": 3
+      },
+      "remote_calls": 0,
+      "remote_input_tokens": 0,
+      "scope_events": [],
+      "slice_bytes": 0,
+      "slice_rereads": 0,
+      "status": "Accepted",
+      "steps": 1,
+      "stop_reason": "Accepted",
+      "summary": "OK.",
+      "tiers": [
+        "Local"
+      ],
+      "validated": false
+    },
+    "source": "ordinary Loom worker, pinned LMX model, read-only answer, no remote calls"
+  },
+  "verification_storage": {
+    "temporary_models_removed": true,
+    "original_models_modified": false,
+    "note": "Prepared paths in this report are historical temporary verification paths."
+  }
+}

@@ -1,0 +1,550 @@
+#!/usr/bin/env python3
+"""Evidence-driven Native Loom self-improvement. Original workspace stays untouched.
+
+Dry-run diagnosis: scripts/loom-evolve
+One supervised cycle: scripts/loom-evolve --execute --only greeting --iterations 1
+Full cycle: scripts/loom-evolve --execute --iterations 1
+
+Only curated replay tasks with an explicit oracle are used for promotion. Newly found
+patterns without an oracle are reported for fixture creation, never self-graded.
+"""
+
+from __future__ import annotations
+
+import argparse
+import importlib.machinery
+import importlib.util
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_MODEL = "omniroute/agy/claude-opus-4-6-thinking"
+RELATED = {
+    "greeting": {"unresolved_text_only"},
+    "find-exit-print": {"repeat_call", "model_switch", "budget_exhausted"},
+    "until-zero-test": {"check_without_change", "rerun_command", "validation_failed"},
+}
+ENVIRONMENTAL_PATTERNS = {"sandbox_denied", "transient", "gateway_delay"}
+SAFE_EDIT_ROOTS = {"loom-core", "loom-tui", "docs", "scripts"}
+
+
+def load_analyzer():
+    loader = importlib.machinery.SourceFileLoader("loom_failures", str(ROOT / "scripts/loom-failures"))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+def inspect_incidents(last: int) -> list[dict]:
+    analyzer = load_analyzer()
+    latest = list(analyzer.load_events(ROOT).values())[-last:]
+    found = [p for task in latest for p in analyzer.analyze_task(ROOT, task)]
+    grouped = {}
+    for item in found:
+        slot = grouped.setdefault(item["pattern"], {"pattern": item["pattern"], "tasks": set(), "examples": []})
+        slot["tasks"].add(item["task"])
+        if len(slot["examples"]) < 3:
+            slot["examples"].append(item)
+    ranked = sorted(grouped.values(), key=lambda p: (-len(p["tasks"]), p["pattern"]))
+    for pattern in ranked:
+        pattern["tasks"] = len(pattern["tasks"])
+    return ranked
+
+
+def fixtures(ids: list[str] | None) -> list[dict]:
+    tasks = [json.loads(path.read_text()) for path in sorted((ROOT / "bench/replay").glob("*.json"))]
+    if ids:
+        unknown = set(ids) - {task["id"] for task in tasks}
+        if unknown:
+            raise ValueError(f"unknown replay tasks: {sorted(unknown)}")
+        tasks = [task for task in tasks if task["id"] in ids]
+    if not tasks:
+        raise ValueError("no replay tasks with an explicit oracle")
+    return tasks
+
+
+def select_failure(issues: list[dict], cases: list[dict], baseline: dict,
+                   excluded: set[str] | None = None) -> dict | None:
+    # A provider outage or sealed sandbox alone is not a source-code repair task.
+    repairable = [issue for issue in issues if issue["pattern"] not in ENVIRONMENTAL_PATTERNS]
+    if issues and not repairable:
+        return None
+    failed = {result["task"] for result in baseline.get("results", []) if not result["passed"]}
+    frequencies = {issue["pattern"]: issue["tasks"] for issue in repairable}
+    candidates = [case for case in cases if case["id"] in failed and case["id"] not in (excluded or set())]
+    if not candidates:
+        return None
+    return sorted(candidates, key=lambda case: (-sum(frequencies.get(p, 0) for p in RELATED.get(case["id"], ())), case["id"]))[0]
+
+
+def compare_replays(before: dict, after: dict, target: str) -> tuple[bool, str]:
+    previous = {r["task"]: r for r in before.get("results", [])}
+    current = {r["task"]: r for r in after.get("results", [])}
+    if not previous or previous.keys() != current.keys():
+        return False, "different or missing replay cases"
+    if any((row.get("models") or current[case].get("models"))
+           and set((row.get("models") or {}).keys()) != set((current[case].get("models") or {}).keys())
+           for case, row in previous.items()):
+        return False, "served model changed between baseline and candidate replays"
+    if any(prev["passed"] and not current[case]["passed"] for case, prev in previous.items()):
+        return False, "a previously passing replay case regressed"
+    if not any(not prev["passed"] and current[case]["passed"] for case, prev in previous.items()):
+        return False, "no previously failing replay case improved"
+    if target not in current or not current[target]["passed"]:
+        return False, f"target {target} did not pass"
+    return True, "target fixed with no replay regressions"
+
+
+def trace_input_tokens(path: Path) -> int:
+    if not path.exists():
+        return 0
+    spent = 0
+    for line in path.read_text(errors="replace").splitlines():
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if "calls" in event:
+            spent += (event.get("usage") or {}).get("input") or 0
+    return spent
+
+
+def execute(command: list[str], *, cwd=ROOT, env=None, timeout=1200, log: Path | None = None,
+            trace: Path | None = None, input_ceiling: int | None = None) -> int:
+    """Persist output; propagate failures and reap timed-out child process groups."""
+    import signal
+    path = log or Path(tempfile.mkdtemp(prefix="loom-evolve-command-")) / "output.log"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w") as stream:
+        process = subprocess.Popen(command, cwd=cwd, env=env, start_new_session=True,
+                                   stdout=stream, stderr=subprocess.STDOUT)
+        try:
+            if trace is None or input_ceiling is None:
+                return process.wait(timeout=timeout)
+            deadline = time.monotonic() + timeout
+            while time.monotonic() < deadline:
+                spent = trace_input_tokens(trace)
+                exited = process.poll()
+                if exited is not None:
+                    return 125 if spent > input_ceiling else exited
+                if spent > input_ceiling:
+                    os.killpg(process.pid, signal.SIGKILL)
+                    process.wait()
+                    return 125  # repair worker exhausted its explicit input-token budget
+                try:
+                    return process.wait(timeout=1)
+                except subprocess.TimeoutExpired:
+                    pass
+            raise subprocess.TimeoutExpired(command, timeout)
+        except subprocess.TimeoutExpired:
+            os.killpg(process.pid, signal.SIGKILL)
+            process.wait()
+            return 124
+
+
+def snapshot(destination: Path):
+    """Create a self-contained checkout including currently untracked Loom source."""
+    destination.mkdir(parents=True)
+    ignore = shutil.ignore_patterns(".git", ".loom", ".custom-tui", "target", "target-*", ".target", "__pycache__", ".DS_Store")
+    for directory in ("loom-core", "loom-tui", "docs", "scripts", "bench"):
+        source = ROOT / directory
+        if source.is_dir():
+            shutil.copytree(source, destination / directory, ignore=ignore)
+    for file in ("AGENTS.md", ".gitignore"):
+        if (ROOT / file).is_file():
+            shutil.copy2(ROOT / file, destination / file)
+    with (destination / ".gitignore").open("a") as stream:
+        stream.write("\n.loom/\n.custom-tui/\n**/target/\n**/target-*/\n**/.target/\n**/__pycache__/\n")
+    subprocess.run(["git", "init", "-q", str(destination)], check=True)
+    subprocess.run(["git", "-C", str(destination), "add", "-A"], check=True)
+    subprocess.run(["git", "-C", str(destination), "-c", "user.name=loom-evolve", "-c", "user.email=evolve@localhost",
+                    "commit", "-qm", "isolated baseline"], check=True)
+
+
+def changed_files(workspace: Path) -> list[str]:
+    out = subprocess.check_output(["git", "-C", str(workspace), "status", "--porcelain", "--untracked-files=all"], text=True)
+    return [line[3:].split(" -> ")[-1] for line in out.splitlines() if line.strip()]
+
+
+def safe_changes(paths: list[str]) -> bool:
+    return bool(paths) and all(Path(name).parts and Path(name).parts[0] in SAFE_EDIT_ROOTS
+                               and not Path(name).is_absolute() and ".." not in Path(name).parts
+                               and not name.startswith(("scripts/loom-replay", "scripts/loom-evolve"))
+                               for name in paths)
+
+
+def focus_excerpt(source: Path, case: dict) -> str:
+    """Give the repair worker a bounded, curated code slice instead of a cold repo walk."""
+    excerpts = []
+    for hint in case.get("focus", [])[:5]:
+        relative = Path(hint["path"])
+        if relative.is_absolute() or ".." in relative.parts or relative.parts[0] not in SAFE_EDIT_ROOTS:
+            continue
+        file = source / relative
+        if not file.is_file():
+            continue
+        lines = file.read_text(errors="replace").splitlines()
+        matched = next((i for i, line in enumerate(lines) if hint["needle"] in line), None)
+        if matched is None:
+            excerpts.append(f"{relative}: search for {hint['needle']!r}")
+            continue
+        before, after = max(0, matched - 15), min(len(lines), matched + 22)
+        excerpt = "\n".join(f"{n + 1}| {lines[n]}" for n in range(before, after))
+        excerpts.append(f"{relative} (starting line {before + 1}):\n{excerpt[:4700]}")
+    return "\n\n".join(excerpts)
+
+
+INFRA_ERRORS = ("not available in the active live catalog", "authentication failed",
+                "no usable models", "rate limit", "quota exceeded", "http 429",
+                "gateway timeout", "service unavailable", "connection refused")
+
+
+def infrastructure_failure(row: dict) -> bool:
+    """Provider/transport outages cannot be used as evidence of Core quality."""
+    if row.get("passed"):
+        return False
+    summary = str(row.get("summary") or row.get("stop") or "").lower()
+    if any(marker in summary for marker in INFRA_ERRORS):
+        return True
+    # A task that never got even one model response cannot establish a baseline.
+    return not row.get("input_tokens") and not row.get("models")
+
+
+def run_replays(engine: Path, cases: list[dict], model: str, run_dir: Path, tag: str,
+                timeout: int, max_cost: str) -> dict | None:
+    output = run_dir / f"{tag}.json"
+    command = [sys.executable, str(ROOT / "scripts/loom-replay"), "--engine", str(engine), "--model", model,
+               "--max-cost", max_cost, "--jobs", "1", "--timeout", str(timeout), "--json", str(output),
+               "--only", *[case["id"] for case in cases]]
+    env = {**os.environ, "LOOM_REPLAY_TARGET_ROOT": str(run_dir / "replay-target" / tag)}
+    rc = execute(command, env=env, timeout=len(cases) * (timeout + 330), log=run_dir / f"{tag}.log")
+    if rc not in (0, 1) or not output.exists():
+        return None
+    report = json.loads(output.read_text())
+    expected = {case["id"] for case in cases}
+    if {item.get("task") for item in report.get("results", [])} != expected or len(report.get("results", [])) != len(expected):
+        return None
+    if any(infrastructure_failure(row) for row in report["results"]):
+        print(f"inconclusive {tag} replay: model/provider did not provide evaluable evidence; see {output}", flush=True)
+        return None
+    return report
+
+
+def run_enginebench(engine: Path, model: str | None, run_dir: Path, tag: str,
+                    timeout: int, max_cost: str, codex: bool = False) -> dict | None:
+    """Measure the same 12 hidden-test tasks; reject incomplete benchmark reports."""
+    output = run_dir / f"{tag}-enginebench.json"
+    command = [sys.executable, str(ROOT / "scripts/loom-enginebench"),
+               "--max-cost", max_cost, "--jobs", "1", "--timeout", str(timeout), "--json", str(output)]
+    if codex:
+        command += ["--codex", model or "gpt-5.6"]
+    else:
+        command += ["--engine", str(engine)]
+        if model:
+            command += ["--model", model]
+    expected = {p.name for p in (ROOT / "bench/engine/tasks").iterdir() if p.is_dir()}
+    env = {**os.environ, "LOOM_BENCH_TARGET_ROOT": str(run_dir / "bench-target" / tag)}
+    rc = execute(command, env=env, timeout=len(expected) * (timeout + 330), log=run_dir / f"{tag}-enginebench.log")
+    if rc not in (0, 1) or not output.exists():
+        return None
+    report = json.loads(output.read_text())
+    rows = report.get("results", [])
+    if len(rows) != len(expected) or {r.get("task") for r in rows} != expected:
+        return None
+    if not codex and any(infrastructure_failure(r) for r in rows):
+        print(f"inconclusive {tag} engine benchmark: no usable model result; see {output}", flush=True)
+        return None
+    return report
+
+
+def compare_enginebench(before: dict, after: dict) -> tuple[bool, str]:
+    original = {r["task"]: r for r in before["results"]}
+    current = {r["task"]: r for r in after["results"]}
+    if original.keys() != current.keys():
+        return False, "different or missing engine benchmark tasks"
+    if any((row.get("models") or current[name].get("models"))
+           and set((row.get("models") or {}).keys()) != set((current[name].get("models") or {}).keys())
+           for name, row in original.items()):
+        return False, "served model changed between benchmark measurements"
+    if any(r["passed"] and not current[name]["passed"] for name, r in original.items()):
+        return False, "previously passing engine benchmark task regressed"
+    return True, "12-task engine benchmark has no pass/fail regression"
+
+
+def clippy_diagnostics(log: Path) -> list[tuple[str, str]] | None:
+    """Extract reproducible lint messages and source locations; fail shut on unknown errors."""
+    lines = log.read_text(errors="replace").splitlines()
+    warnings = []
+    for i, line in enumerate(lines):
+        if not line.startswith("error:") or "could not compile" in line:
+            continue
+        following = []
+        for next_line in lines[i + 1:i + 14]:
+            if next_line.startswith("error:"):
+                break
+            following.append(next_line)
+        location = next((re.sub(r"^.*-->", "", next_line).strip()
+                         for next_line in following
+                         if re.search(r"^\s*-->.*:\d+:\d+", next_line)), None)
+        if location is None:
+            return None
+        warnings.append((line, location))
+    return sorted(warnings) if warnings else None
+
+
+def checks(workspace: Path, run_dir: Path, tag: str, timeout: int,
+           baseline_workspace: Path) -> bool:
+    isolated_home = run_dir / "test-home"
+    isolated_home.mkdir(exist_ok=True)
+    env = {**os.environ, "HOME": str(isolated_home), "LOOM_ALLOW_ROUTES": "",
+           "CARGO_HOME": str(Path.home() / ".cargo"),
+           "RUSTUP_HOME": str(Path.home() / ".rustup")}
+    env.pop("LOOM_SANDBOX_LOOPBACK", None)
+    target = workspace / "loom-core" / "target-evolve"
+    env["CARGO_TARGET_DIR"] = str(target)
+    commands = [
+        ["cargo", "test", "--manifest-path", "loom-core/Cargo.toml", "--", "--test-threads=1"],
+        ["cargo", "clippy", "--manifest-path", "loom-core/Cargo.toml", "--all-targets", "--", "-D", "warnings"],
+        ["cargo", "test", "--manifest-path", "loom-tui/Cargo.toml", "--", "--test-threads=1"],
+        ["cargo", "clippy", "--manifest-path", "loom-tui/Cargo.toml", "--all-targets", "--", "-D", "warnings"],
+        ["cargo", "run", "--manifest-path", "loom-tui/Cargo.toml", "-q", "--", "--self-check"],
+    ]
+    for number, command in enumerate(commands, 1):
+        # Core's network-denial tests must observe the default sealed sandbox.
+        # The TUI's localhost tests need the separately authorized loopback mode.
+        command_env = {**env, **({"LOOM_SANDBOX_LOOPBACK": "1"} if number >= 3 else {})}
+        log = run_dir / f"{tag}-check-{number}.log"
+        if not execute(command, cwd=workspace, env=command_env, timeout=timeout, log=log):
+            continue
+        if number != 4:
+            return False
+        # The preexisting TUI has Clippy debt. Reject new warnings while letting
+        # independently verified Core fixes proceed when inherited lints match.
+        candidate_lints = clippy_diagnostics(log)
+        baseline_log = run_dir / f"{tag}-baseline-tui-clippy.log"
+        baseline_env = {**command_env, "CARGO_TARGET_DIR": str(baseline_workspace / "loom-core/target-evolve")}
+        rc = execute(command, cwd=baseline_workspace, env=baseline_env,
+                     timeout=timeout, log=baseline_log)
+        original_lints = clippy_diagnostics(baseline_log) if rc else []
+        if candidate_lints is None or original_lints != candidate_lints:
+            return False
+        print(f"TUI inherited {len(candidate_lints)} identical Clippy diagnostics; no new warnings", flush=True)
+    return True
+
+
+def improve_one(source: Path, agent_engine: Path, cases: list[dict], baseline: dict,
+                issues: list[dict], args, run_dir: Path, iteration: int,
+                engine_baseline: dict | None, excluded: set[str]):
+    case = select_failure(issues, cases, baseline, excluded)
+    if case is None:
+        return False, "no unattempted failing replay task with an explicit oracle", baseline, source, None
+    work = run_dir / f"work-{iteration}"
+    shutil.copytree(source, work, ignore=shutil.ignore_patterns("target", "target-*", ".target", ".loom", ".custom-tui"))
+    # A copied repository has its own index; the immutable source copy is never edited.
+    related = RELATED.get(case["id"], set())
+    evidence = [item for group in issues if group["pattern"] in related for item in group["examples"]]
+    failing = next((r for r in baseline["results"] if r["task"] == case["id"]), {})
+    prompt = ("Improve Loom Native Core for this observed failure. Read the actual trace evidence, reproduce with a "
+              "deterministic regression test, demonstrate the test fails, implement the smallest correct Core fix, "
+              "then run the test. Never edit or weaken replay fixtures or benchmark grading. "
+              "Keep the original workspace untouched. Do not commit.\n\n"
+              f"Replay case: {case['id']}\nOriginal task: {case['goal']}\nFailure: {failing.get('reasons')}\n"
+              f"Observed result: {failing.get('summary')}\n"
+              f"Acceptance invariants: {case.get('invariants', 'Keep all existing contracts and tests.')}\n"
+              "Live baseline trace:\n" + json.dumps(failing.get("trace_evidence", []), ensure_ascii=False, indent=2)
+              + "\nHistorical evidence:\n" + json.dumps(evidence[:5], ensure_ascii=False, indent=2)
+              + "\nRelevant existing source (verify freshness before editing):\n"
+              + focus_excerpt(work, case))
+    (run_dir / f"attempt-{iteration}.prompt.txt").write_text(prompt)
+    trace = run_dir / f"attempt-{iteration}.trace.jsonl"
+    cmd = [str(agent_engine), "run", prompt, "--cwd", str(work), "--model", args.model,
+           "--max-cost", args.max_cost, "--max-steps", str(args.max_steps),
+           "--max-tokens", str(args.agent_input_budget),
+           "--max-seconds", str(args.agent_timeout - 30), "--max-attempts", "1", "--json", "--no-approve",
+           "--trace", str(trace)]
+    agent_env = {**os.environ, "LOOM_SANDBOX_LOOPBACK": "1", "LOOM_TEMPERATURE": "0",
+                 "CARGO_TARGET_DIR": str(work / "loom-core/target-evolve")}
+    agent_log = run_dir / f"attempt-{iteration}.stdout"
+    rc = execute(cmd, cwd=work, env=agent_env, timeout=args.agent_timeout, log=agent_log,
+                 trace=trace, input_ceiling=args.agent_input_budget)
+    lines = agent_log.read_text(errors="replace").strip().splitlines()
+    try:
+        proposal = json.loads(lines[-1]) if lines else {}
+    except json.JSONDecodeError:
+        proposal = {}
+    if rc not in (0, 2) or proposal.get("status") != "AwaitingApproval":
+        detail = (f"input budget {args.agent_input_budget} exceeded"
+                  if rc == 125 else f"rc={rc}, status={proposal.get('status')}")
+        return False, f"worker produced no validated proposal: {detail}", baseline, source, case["id"]
+    approval_log = run_dir / f"attempt-{iteration}.approval.json"
+    rc = execute([str(agent_engine), "approve", proposal["id"], "--cwd", str(work), "--json"],
+                 cwd=work, env=agent_env, timeout=args.agent_timeout, log=approval_log)
+    if rc:
+        return False, "approval failed in isolated copy", baseline, source, case["id"]
+    changed = changed_files(work)
+    if not safe_changes(changed):
+        return False, f"worker edited unexpected paths: {changed}", baseline, source, case["id"]
+    if not checks(work, run_dir, f"candidate-{iteration}", args.check_timeout, source):
+        return False, "tests, clippy or TUI self-check failed", baseline, source, case["id"]
+    candidate_bin = work / "loom-core/target-evolve/release/loom"
+    if execute(["cargo", "build", "--release", "--manifest-path", "loom-core/Cargo.toml", "--bin", "loom"],
+               cwd=work, env=agent_env, timeout=args.check_timeout, log=run_dir / f"candidate-{iteration}-build.log"):
+        return False, "candidate release build failed", baseline, source, case["id"]
+    after = run_replays(candidate_bin, cases, args.model, run_dir, f"candidate-{iteration}",
+                        args.replay_timeout, args.max_cost)
+    if after is None:
+        return False, "candidate replay could not produce a report", baseline, source, case["id"]
+    accepted, reason = compare_replays(baseline, after, case["id"])
+    if not accepted:
+        return False, reason, baseline, source, case["id"]
+    if engine_baseline is not None:
+        measured = run_enginebench(candidate_bin, args.model, run_dir, f"candidate-{iteration}",
+                                   args.enginebench_timeout, args.max_cost)
+        if measured is None:
+            return False, "candidate engine benchmark incomplete", baseline, source, case["id"]
+        valid, benchmark_reason = compare_enginebench(engine_baseline, measured)
+        if not valid:
+            return False, benchmark_reason, baseline, source, case["id"]
+    subprocess.run(["git", "-C", str(work), "add", "-A"], check=True)
+    with (run_dir / f"changes-{iteration}.patch").open("wb") as patch:
+        subprocess.run(["git", "-C", str(work), "diff", "--cached", "--binary"], stdout=patch, check=True)
+    subprocess.run(["git", "-C", str(work), "-c", "user.name=loom-evolve", "-c", "user.email=evolve@localhost",
+                    "commit", "-qm", f"accepted iteration {iteration}"], check=True)
+    return True, reason, after, work, case["id"]
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--execute", action="store_true", help="run the worker in an isolated copy; otherwise diagnose only")
+    ap.add_argument("--only", nargs="*", help="limit replay scope (full suite is recommended for promotion)")
+    ap.add_argument("--model", default=DEFAULT_MODEL)
+    ap.add_argument("--fallback-model", default="omniroute/agy/claude-sonnet-4-6",
+                    help="try this strong model only if the initial baseline is inconclusive")
+    ap.add_argument("--max-cost", choices=["local", "free", "subscription"], default="subscription")
+    ap.add_argument("--last", type=int, default=30)
+    ap.add_argument("--iterations", type=int, default=1)
+    ap.add_argument("--hours", type=float)
+    ap.add_argument("--agent-timeout", type=int, default=900)
+    ap.add_argument("--agent-input-budget", type=int, default=300_000,
+                    help="stop a repeatedly exploring worker before it consumes unbounded input tokens")
+    ap.add_argument("--check-timeout", type=int, default=900)
+    ap.add_argument("--replay-timeout", type=int, default=600)
+    ap.add_argument("--max-steps", type=int, default=35)
+    ap.add_argument("--run-dir")
+    ap.add_argument("--enginebench-timeout", type=int, default=900)
+    ap.add_argument("--codex-baseline", help="optionally measure official Codex with the given model")
+    args = ap.parse_args()
+    cases = fixtures(args.only)
+    issues = inspect_incidents(args.last)
+    coverage = {case["id"]: sorted(RELATED.get(case["id"], set())) for case in cases}
+    covered = set().union(*[set(v) for v in coverage.values()])
+    print(f"diagnosis: {sum(p['tasks'] for p in issues)} task-pattern hits; {len(cases)} replay oracles")
+    for issue in issues[:12]:
+        print(f"  {issue['pattern']}: {issue['tasks']} tasks · {'replay' if issue['pattern'] in covered else 'needs oracle'}")
+    if not args.execute:
+        return
+    run_dir = Path(args.run_dir).resolve() if args.run_dir else ROOT / ".custom-tui/evolve" / time.strftime("%Y%m%d-%H%M%S")
+    run_dir.mkdir(parents=True, exist_ok=True)
+    if any(child.name != "run.log" for child in run_dir.iterdir()):
+        raise ValueError(f"run directory already contains results: {run_dir}")
+    (run_dir / "incidents.json").write_text(json.dumps(issues, ensure_ascii=False, indent=2))
+    (run_dir / "coverage.json").write_text(json.dumps(coverage, ensure_ascii=False, indent=2))
+    print(f"evolve output: {run_dir}", flush=True)
+    begun = time.monotonic()  # include baseline build/measurement in the requested duration
+    source = run_dir / "base"
+    snapshot(source)
+    baseline_bin = (run_dir / "target-baseline/release/loom").resolve()
+    baseline_env = {**os.environ, "CARGO_TARGET_DIR": str(run_dir / "target-baseline")}
+    if execute(["cargo", "build", "--release", "--bin", "loom", "--manifest-path", "loom-core/Cargo.toml"],
+               cwd=source, env=baseline_env, timeout=args.check_timeout, log=run_dir / "original-build.log"):
+        raise RuntimeError("could not build the immutable baseline snapshot")
+    baseline = run_replays(baseline_bin, cases, args.model, run_dir, "baseline", args.replay_timeout, args.max_cost)
+    if baseline is None and args.fallback_model and args.fallback_model != args.model:
+        print(f"primary model inconclusive; retrying baseline with {args.fallback_model}", flush=True)
+        args.model = args.fallback_model
+        baseline = run_replays(baseline_bin, cases, args.model, run_dir, "fallback-baseline",
+                               args.replay_timeout, args.max_cost)
+    if baseline is None:
+        raise RuntimeError("baseline replay inconclusive; strong model routes or fixture execution unavailable")
+    original_baseline = baseline
+    # --only is a wiring/diagnostic run. Official promotion requires the complete
+    # replay suite AND the full 12-task hidden engine benchmark on both binaries.
+    diagnostic = args.only is not None
+    engine_baseline = None
+    original_engine_baseline = None
+    reference = None
+    if not diagnostic:
+        engine_baseline = run_enginebench(baseline_bin, args.model, run_dir, "baseline",
+                                          args.enginebench_timeout, args.max_cost)
+        if engine_baseline is None:
+            raise RuntimeError("baseline engine benchmark incomplete")
+        original_engine_baseline = engine_baseline
+        if args.codex_baseline:
+            reference = run_enginebench(baseline_bin, args.codex_baseline, run_dir, "codex",
+                                        args.enginebench_timeout, args.max_cost, codex=True)
+            if reference is None:
+                raise RuntimeError("Codex reference benchmark incomplete")
+    agent_engine = baseline_bin  # only advance to a candidate after full independent validation
+    outcomes = []
+    attempted_failures = set()
+    for iteration in range(1, args.iterations + 1):
+        if args.hours is not None and time.monotonic() - begun >= args.hours * 3600:
+            break
+        print(f"iteration {iteration}: selecting a failed replay", flush=True)
+        accepted, reason, after, work, task_id = improve_one(source, agent_engine, cases, baseline, issues,
+                                                              args, run_dir, iteration, engine_baseline,
+                                                              attempted_failures)
+        outcomes.append({"iteration": iteration, "task": task_id, "accepted": accepted and not diagnostic,
+                         "diagnostic_pass": accepted if diagnostic else None, "reason": reason})
+        print(f"iteration {iteration}: {'kept' if accepted else 'discarded'}: {reason}", flush=True)
+        if accepted:
+            source, baseline = work, after
+            attempted_failures.clear()
+            if engine_baseline is not None:
+                engine_baseline = json.loads((run_dir / f"candidate-{iteration}-enginebench.json").read_text())
+                # Recursive improvement: subsequent edits use the last proven
+                # engine. Rejected builds never become a worker.
+                agent_engine = (work / "loom-core/target-evolve/release/loom").resolve()
+        else:
+            if task_id is None or diagnostic:
+                break
+            attempted_failures.add(task_id)
+    (run_dir / "results.json").write_text(json.dumps({"baseline": original_baseline, "final": baseline,
+                                                     "enginebench_baseline": original_engine_baseline,
+                                                     "enginebench_final": engine_baseline,
+                                                     "codex_baseline": reference,
+                                                     "diagnostic_only": diagnostic, "iterations": outcomes}, ensure_ascii=False, indent=2))
+    if source != run_dir / "base" and not diagnostic:
+        first = subprocess.check_output(["git", "-C", str(source), "rev-list", "--max-parents=0", "HEAD"], text=True).strip().splitlines()[0]
+        with (run_dir / "changes.patch").open("wb") as patch:
+            subprocess.run(["git", "-C", str(source), "diff", "--binary", first, "HEAD"], stdout=patch, check=True)
+    report = ["# Loom self-improvement review", "", f"Model: {args.model}",
+              f"Replay coverage: {', '.join(case['id'] for case in cases)}",
+              f"Mode: {'diagnostic only, not promoted' if diagnostic else 'full replay and 12-task benchmark'}", "",
+              f"Replay: {original_baseline['summary']['passed']}/{original_baseline['summary']['total']}"
+              f" → {baseline['summary']['passed']}/{baseline['summary']['total']}",
+              *([f"Engine benchmark: {original_engine_baseline['summary']['passed']}/{original_engine_baseline['summary']['total']}"
+                 f" → {engine_baseline['summary']['passed']}/{engine_baseline['summary']['total']}"]
+                if engine_baseline is not None else []),
+              *([f"Codex reference: {reference['summary']['passed']}/{reference['summary']['total']}"]
+                if reference is not None else []), "",
+              "## Results", *[f"- Iteration {o['iteration']}: {'kept' if o['accepted'] else 'discarded'} — {o['reason']}" for o in outcomes],
+              "", ("Diagnostic only: inspect work-N and changes-N.patch; no promotion patch was emitted."
+                   if diagnostic else "Patch: changes.patch (when a candidate passed). Apply manually after review.")]
+    (run_dir / "REPORT.md").write_text("\n".join(report) + "\n")
+    if diagnostic:
+        print(f"diagnostic results: {run_dir} (no official promotion patch)")
+    else:
+        print(f"patches: {run_dir}/changes.patch (review before applying to the real repository)")
+
+
+if __name__ == "__main__":
+    main()

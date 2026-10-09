@@ -1,0 +1,23 @@
+#!/bin/sh
+# Fetch Apple's prebuilt MLX runtime (libmlx.dylib + Metal kernels + headers) for Loom's
+# MLX engine. Building MLX from source needs full Xcode; the official wheel does not.
+# Usage: scripts/fetch-mlx [version]   (installs into loom-core/vendor/mlx)
+set -eu
+version=${1:-0.32.3}
+root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+target="$root/loom-core/vendor/mlx"
+[ "$(uname -s)" = Darwin ] || { echo "MLX runs only on macOS (Apple silicon)" >&2; exit 1; }
+work=$(mktemp -d)
+trap 'rm -rf "$work"' EXIT
+python3 -m pip download "mlx-metal==$version" --no-deps --only-binary=:all: \
+    --platform macosx_15_0_arm64 --python-version 3.12 -d "$work" -q
+unzip -q "$work"/mlx_metal-*.whl -d "$work/wheel"
+rm -rf "$target"
+mkdir -p "$target"
+cp -R "$work/wheel/mlx/include" "$work/wheel/mlx/lib" "$target/"
+cp "$work"/wheel/mlx_metal-*.dist-info/licenses/LICENSE "$target/LICENSE"
+# Binaries linked during development find the library at its absolute location;
+# packaging rewrites this to a path relative to the executable.
+install_name_tool -id "$target/lib/libmlx.dylib" "$target/lib/libmlx.dylib"
+codesign --force --sign - "$target/lib/libmlx.dylib" 2>/dev/null || true
+echo "MLX $version installed in $target"

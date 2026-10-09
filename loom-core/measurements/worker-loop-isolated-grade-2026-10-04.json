@@ -1,0 +1,9 @@
+{
+  "description": "Independent diagnostic grading of successful edits recorded in trace. Not a Native completion or applied-patch benchmark pass.",
+  "task": "average-empty",
+  "trace": "/tmp/loom-worker-live-groq-recovery-20261004/average-empty.trace.jsonl",
+  "successful_edits_reconstructed": 2,
+  "hidden_tests_passed": true,
+  "output": "\nrunning 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n\nrunning 3 tests\n...\ntest result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n\nrunning 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n",
+  "workdir": "/var/folders/df/513wctj901z3g7_73ndxnyw80000gn/T/loom-isolated-patch-grade-pi6kq_p3/repo"
+}

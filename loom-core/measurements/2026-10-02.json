@@ -1,0 +1,106 @@
+{
+  "date": "2026-10-02",
+  "host": "macOS ARM64",
+  "profile": "debug",
+  "overlay": {
+    "revision": "6b0dca41fe9189416c273a9e13800cf4e05a469a",
+    "creation_ms": [
+      84,
+      78
+    ],
+    "build_ms": [
+      12908,
+      116
+    ],
+    "warm_ratio": 0.008986674930275797,
+    "gate_passed": true,
+    "conditions": "fresh .loom/target, two sequential lease slots, raw blob materialization"
+  },
+  "runtime_pilot": {
+    "conditions": {
+      "jobs": 3,
+      "task_timeout_seconds": 180,
+      "worker_budget_seconds": 150,
+      "max_steps": 30,
+      "model": "ollama/hf.co/HauhauCS/Gemma-4-E4B-Uncensored-HauhauCS-Aggressive:Q4_K_M"
+    },
+    "legacy": {
+      "passed": 2,
+      "total": 12,
+      "input_tokens": 29687,
+      "output_tokens": 10654,
+      "seconds": 1814,
+      "mean_steps": 3.1,
+      "orient_bytes": 6777,
+      "validate_bytes": 265
+    },
+    "native": {
+      "passed": 0,
+      "total": 12,
+      "input_tokens": 12534,
+      "output_tokens": 5831,
+      "seconds": 1833,
+      "mean_steps": 2.0,
+      "orient_bytes": 4810,
+      "validate_bytes": 0,
+      "contract_recall": 1.0,
+      "scope_events": 0,
+      "slice_rereads": 0,
+      "slice_bytes": 0,
+      "validated": 0,
+      "false_finish": 0,
+      "escalated": 0
+    },
+    "legacy_accepted": 0,
+    "native_accepted": 0,
+    "caveat": "A duplicate native bench overlapped briefly at startup and was terminated. Requests timed out. Not a controlled quality or performance gate."
+  },
+  "adoption": {
+    "context_default": false,
+    "execution_mode": "Single",
+    "L4_quality_gate": "unproven",
+    "L5_remote_token_gate": "unproven",
+    "L6_escalation_efficiency": "unproven",
+    "scheduler": "deferred until measured benefit"
+  },
+  "verification": {
+    "core_tests": {
+      "passed": 79,
+      "failed": 0,
+      "ignored": 1,
+      "ignored_reason": "external pinned ripgrep corpus; explicitly checked earlier"
+    },
+    "tui_tests": {
+      "passed": 189,
+      "failed": 0,
+      "ignored": 2,
+      "ignored_reason": "manual render profiling and desktop Terminal launch"
+    },
+    "self_check": {
+      "passed": 362,
+      "failed": 0,
+      "screens_reviewed": true
+    },
+    "pty_suite": {
+      "groups_passed": 29,
+      "failed": 0,
+      "live_models": false
+    },
+    "clippy": {
+      "all_targets": true,
+      "deny_warnings": true,
+      "passed": true
+    },
+    "regressions": [
+      "retry proposal and validation artifact handoff",
+      "worker check artifact handoff",
+      "duplicate task execution lease",
+      "read-only CLI and Native approval guard",
+      "current-base resume after scope conflict",
+      "terminal finish tool",
+      "private file permission preservation",
+      "raw snapshot piped stdin",
+      "durable checkpoint synchronization"
+    ]
+  }
+}

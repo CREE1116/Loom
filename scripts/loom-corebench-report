@@ -1,0 +1,16 @@
+#!/usr/bin/env python3
+"""Report quality, latency, total tokens and failed spend from recorded Core trials."""
+import argparse
+import importlib.util
+import json
+from pathlib import Path
+spec=importlib.util.spec_from_file_location('metrics',Path(__file__).with_name('loom-corebench-metrics.py'))
+metrics=importlib.util.module_from_spec(spec);spec.loader.exec_module(metrics)
+p=argparse.ArgumentParser(description=__doc__);p.add_argument('files',nargs='+',type=Path);p.add_argument('--json',type=Path);args=p.parse_args()
+rows=[r for file in args.files for r in json.loads(file.read_text())['results']]
+summary=metrics.summarize(rows)
+if args.json:args.json.parent.mkdir(parents=True,exist_ok=True);args.json.write_text(json.dumps({'sources':[str(f) for f in args.files],'summary':summary},ensure_ascii=False,indent=2)+'\n')
+print('| Model | Core / mode | Pass | Median worker s | Median verified success s | Input | Output | Total tokens / success (failures included) |')
+print('| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |')
+def f(v):return '—' if v is None else f'{v:.3f}' if isinstance(v,float) else str(v)
+for s in summary:print('| '+' | '.join([s['model'],s['version'],f"{s['passed']}/{s['runs']}",*[f(s[k]) for k in ['median_worker_seconds','median_verified_success_seconds','input','output','tokens_per_success_including_failures']]])+' |')

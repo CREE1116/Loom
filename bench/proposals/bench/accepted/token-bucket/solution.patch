@@ -1,0 +1,23 @@
+diff -ruN a/src/bucket.rs b/src/bucket.rs
+--- a/src/bucket.rs	2026-10-02 14:18:23
++++ b/src/bucket.rs	2026-10-02 14:18:23
+@@ -16,10 +16,16 @@
+     }
+ 
+     fn refill(&mut self) {
++        if self.per_second == 0 {
++            return;
++        }
+         let now = self.clock.now_ms();
+-        let elapsed_s = (now - self.last_ms) / 1000;
+-        self.tokens += elapsed_s * self.per_second;
+-        self.last_ms = now;
++        let earned = (now - self.last_ms) * self.per_second / 1000;
++        if earned > 0 {
++            self.tokens = (self.tokens + earned).min(self.capacity);
++            // keep the remainder of a partial token for the next refill
++            self.last_ms += earned * 1000 / self.per_second;
++        }
+     }
+ 
+     /// Take `n` tokens if available.

@@ -1,0 +1,21 @@
+{
+  "date": "2026-10-04",
+  "request": "너에게 주어진 도구가 뭔지 말해봐",
+  "failure": "Native overwrote Core Auto intent with Edit, rejecting a valid prose answer for no patch.",
+  "fix": "Preserve Auto. Explicit :edit/configured Edit patch gate and real patch validation/approval unchanged. No keyword shortcut or extra classifier request.",
+  "before": "Regression failed with No file changes proposed for an edit task; startup selfcheck failed 1/434.",
+  "after": {
+    "client_tests_passed": 212,
+    "selfcheck_passed": 434,
+    "model_calls_for_question": 1,
+    "native_pty_question": "passed",
+    "native_pty_edit_validation_approval_apply": "passed",
+    "native_pty_stop_report": "passed",
+    "pty_escape": "passed",
+    "debug_and_release_build": "passed"
+  },
+  "limits": [
+    "No new semantic classifier implemented. Auto reply acceptance does not prove fulfillment of arbitrary natural-language edit requests.",
+    "The observed 44-second model wait has not been resolved by this fix."
+  ]
+}

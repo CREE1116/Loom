@@ -1,0 +1,26 @@
+diff -ruN a/src/merge.rs b/src/merge.rs
+--- a/src/merge.rs	2026-10-02 14:18:23
++++ b/src/merge.rs	2026-10-02 14:18:23
+@@ -5,13 +5,17 @@
+     match (base, overlay) {
+         (Val::Map(mut b), Val::Map(o)) => {
+             for (k, v) in o {
+-                b.insert(k, v);
++                if v == Val::Null {
++                    b.remove(&k);
++                    continue;
++                }
++                let merged = match b.remove(&k) {
++                    Some(existing) => merge(existing, v),
++                    None => v,
++                };
++                b.insert(k, merged);
+             }
+             Val::Map(b)
+-        }
+-        (Val::List(mut b), Val::List(o)) => {
+-            b.extend(o);
+-            Val::List(b)
+         }
+         (_, o) => o,
+     }

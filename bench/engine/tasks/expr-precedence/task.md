@@ -1,0 +1,1 @@
+`eval` in src/parser.rs gets operator precedence wrong ("2+3*4" gives 20) and rejects unary minus ("-3", "2*-(1+1)"). Make it follow normal arithmetic: * and / bind tighter than + and -, unary minus is allowed, and division by zero is an error.

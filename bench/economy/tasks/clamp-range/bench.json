@@ -1,0 +1,5 @@
+{
+  "difficulty": "single-small",
+  "decomposable": false,
+  "source": "bench/engine/tasks/clamp-range"
+}

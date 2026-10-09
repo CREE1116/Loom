@@ -1,0 +1,10 @@
+{
+  "difficulty": "independent-mixed",
+  "decomposable": true,
+  "write_files": [
+    "src/limits.rs",
+    "src/names.rs",
+    "src/stats.rs",
+    "src/duration.rs"
+  ]
+}

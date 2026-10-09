@@ -1,0 +1,79 @@
+{
+  "date": "2026-10-09",
+  "artifact": "~/.loom/artifacts/lmx-native/Qwen3-Coder-30B-A3B-Instruct-3bit-e3f38b2b.lmx",
+  "identity": "e3f38b2b54da9f3cbf95edba46fc865a86eeebfdbaafc2bd5bc80488d73e6d90",
+  "model": {
+    "architecture": "qwen3_moe",
+    "attention": {
+      "head_dim": 128,
+      "heads": 32,
+      "kv_heads": 4,
+      "qk_norm": true,
+      "qkv_bias": false,
+      "rope_theta": 10000000.0
+    },
+    "context": 262144,
+    "feed_forward": {
+      "active": 8,
+      "experts": 128,
+      "intermediate": 768,
+      "kind": "moe",
+      "normalize_topk": true
+    },
+    "hidden": 2048,
+    "layers": 48,
+    "recipe_version": 1,
+    "rms_epsilon": 1e-06,
+    "tied_embeddings": false,
+    "vocab": 151936
+  },
+  "file_bytes": 13382200785,
+  "index_bytes": 9874897,
+  "tensors": 18867,
+  "expert_blocks": 6144,
+  "import_release": {
+    "wall_seconds": 118.96,
+    "maximum_rss_bytes": 223789056,
+    "peak_footprint_bytes": 195166832
+  },
+  "full_hash_verification_release": {
+    "wall_seconds": 25.54,
+    "maximum_rss_bytes": 51019776,
+    "peak_footprint_bytes": 43303440
+  },
+  "expert_io_debug": {
+    "file": 13382200785,
+    "resident_payload": 685980606,
+    "slots": 16,
+    "slot_pool": 33030144,
+    "metadata_ms": 1371.89,
+    "first_selected_ms": 604.0,
+    "cached_selected_ms": 0.019,
+    "first_selected_read_bytes": 16515072,
+    "wall_seconds": 4.07,
+    "maximum_rss_bytes": 112738304,
+    "peak_footprint_bytes": 98271832
+  },
+  "payload_verified": true,
+  "runtime_ready": false,
+  "scope": "Native file import and expert slot IO only; no generation, GPU paging, full resident-weight load or realistic router trace benchmark. Slot pool is 16 experts, not total inference memory.",
+  "validation": {
+    "core": {
+      "suites": 20,
+      "passed": 438,
+      "failed": 0,
+      "ignored": 13
+    },
+    "tui": {
+      "suites": 12,
+      "passed": 334,
+      "failed": 0,
+      "ignored": 3
+    },
+    "self_check": {
+      "checks": 794,
+      "failed": 0
+    }
+  },
+  "independent_reader_proof": "e3f38b2b54da9f3cbf95edba46fc865a86eeebfdbaafc2bd5bc80488d73e6d90: 18867 tensors, 6144 experts; no GGUF/MLX/llama dependencies"
+}

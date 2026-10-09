@@ -1,0 +1,63 @@
+{
+  "summary": {
+    "passed": 0,
+    "total": 1,
+    "input_tokens": 19227,
+    "output_tokens": 1175,
+    "seconds": 82,
+    "mean_steps": 12.0,
+    "orient_bytes": 1824,
+    "validate_bytes": 0,
+    "remote_input_tokens": 19227,
+    "remote_calls": 11,
+    "contract_recall": 1.0,
+    "scope_events": 0,
+    "slice_rereads": 0,
+    "slice_bytes": 0,
+    "validated": 0,
+    "false_finish": 0,
+    "escalated": 0
+  },
+  "results": [
+    {
+      "task": "average-empty",
+      "passed": false,
+      "finished": false,
+      "stop": "Unresolved",
+      "steps": 12,
+      "seconds": 82,
+      "input_tokens": 19227,
+      "remote_input_tokens": 19227,
+      "remote_calls": 11,
+      "output_tokens": 1175,
+      "phase_bytes": {
+        "edit": 124,
+        "message": 0,
+        "orient": 1824
+      },
+      "contract_recall": 1.0,
+      "scope_events": 0,
+      "slice_bytes": 0,
+      "slice_rereads": 0,
+      "validated": false,
+      "tiers": [
+        "Local"
+      ],
+      "models": {
+        "omniroute/openai/gpt-oss-120b": 11
+      },
+      "diff": "",
+      "test_tail": " --> tests/hidden.rs:3:46\n  |\n3 | #[test] fn none() { assert_eq!(average(&[]), None); }\n  |                                              ^^^^ expected `f64`, found `Option<_>`\n  |\n  = note: expected type `f64`\n             found enum `Option<_>`\n\nFor more information about this error, try `rustc --explain E0308`.\nerror: could not compile `bench_task` (test \"hidden\") due to 2 previous errors\n\nworker made no source changes",
+      "trace_tail": [
+        "find: Same find call as before, so the result is unchanged (see the earlier result). Original evidence: read_artifact(path=\"8c6ac820a0d30e497cd286c1a01df707c6f26eed8c7efae4bf69d31542556a18\", start=1, end=1)",
+        "find: Same find call as before, so the result is unchanged (see the earlier result). Original evidence: read_artifact(path=\"8c6ac820a0d30e497cd286c1a01df707c6f26eed8c7efae4bf69d31542556a18\", start=1, end=1)",
+        "edit: Edited src/lib.rs\n{\"matched\":\"exactly\",\"path\":\"src/lib.rs\"}",
+        "edit: Edited src/report.rs\n{\"matched\":\"exactly\",\"path\":\"src/report.rs\"}",
+        "repo_browser.find ERROR: unknown tool `repo_browser.find`",
+        "find: src/report.rs:5 [report] match average(values) {\nsrc/lib.rs:4 [average] pub fn average(values: &[f64]) -> Option<f64> {\n",
+        "find: Same find call as before, so the result is unchanged (see the earlier result). Original evidence: read_artifact(path=\"ca07731b2b106d2c3911339563dc164300d8bbf10a36aabb083459a547778a66\", start=1, end=1)",
+        "find: Same find call as before, so the result is unchanged (see the earlier result). Original evidence: read_artifact(path=\"ca07731b2b106d2c3911339563dc164300d8bbf10a36aabb083459a547778a66\", start=1, end=1)"
+      ]
+    }
+  ]
+}

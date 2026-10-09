@@ -1,0 +1,488 @@
+{
+  "summary": {
+    "passed": 12,
+    "total": 12,
+    "input_tokens": 162076,
+    "output_tokens": 9525,
+    "seconds": 221,
+    "mean_steps": 5.5,
+    "orient_bytes": 25805,
+    "validate_bytes": 10885,
+    "remote_input_tokens": 162076,
+    "remote_calls": 66,
+    "contract_recall": 0.472,
+    "scope_events": 13,
+    "slice_rereads": 22,
+    "slice_bytes": 7246,
+    "validated": 12,
+    "false_finish": 0,
+    "escalated": 0
+  },
+  "results": [
+    {
+      "task": "average-empty",
+      "passed": true,
+      "finished": true,
+      "stop": "Accepted",
+      "steps": 6,
+      "seconds": 13,
+      "input_tokens": 12030,
+      "remote_input_tokens": 12030,
+      "remote_calls": 6,
+      "output_tokens": 506,
+      "phase_bytes": {
+        "edit": 124,
+        "message": 303,
+        "orient": 1519,
+        "validate": 846
+      },
+      "contract_recall": 0.6666666666666666,
+      "scope_events": 1,
+      "slice_bytes": 568,
+      "slice_rereads": 4,
+      "validated": true,
+      "tiers": [
+        "Local"
+      ],
+      "models": {
+        "omniroute/z-ai/glm-5.2": 6
+      },
+      "diff": "src/lib.rs    | 8 ++++----\n src/report.rs | 5 ++++-\n 2 files changed, 8 insertions(+), 5 deletions(-)",
+      "test_tail": "",
+      "trace_tail": [
+        "read: src/report.rs lines 1-6 of 6\n    1| use crate::average;\n    2| \n    3| /// One-line summary like \"3 values, mean 2.00\".\n    4| pub fn report(values: &[f64]) -> String {\n    5|     format!(\"{} values, ",
+        "find: src/report.rs:1 [<imports>] use crate::average;\nsrc/report.rs:5 [report] format!(\"{} values, mean {:.2}\", values.len(), average(values))\nsrc/lib.rs:4 [average] pub fn average(values: &[f64]) -> f64 {\n",
+        "edit: Edited src/lib.rs\n{\"matched\":\"exactly\",\"path\":\"src/lib.rs\"}",
+        "edit: Edited src/report.rs\n{\"matched\":\"exactly\",\"path\":\"src/report.rs\"}",
+        "check: {\"commands\":[{\"artifact\":{\"bytes\":22,\"id\":\"83aa059287b57176a5ac99c90ef40d6cdb7ecf29ae0d2d70c8032324157686b5\"},\"artifact_path\":\"83aa059287b57176a5ac99c90ef40d6cdb7ecf29ae0d2d70c8032324157686b5\",\"failed",
+        "read: src/lib.rs lines 1-10 of 10\n    1| pub mod report;\n    2| \n    3| /// Arithmetic mean.\n    4| pub fn average(values: &[f64]) -> Option<f64> {\n    5|     if values.is_empty() {\n    6|         return No",
+        "read: src/report.rs lines 1-9 of 9\n    1| use crate::average;\n    2| \n    3| /// One-line summary like \"3 values, mean 2.00\".\n    4| pub fn report(values: &[f64]) -> String {\n    5|     match average(values",
+        "finish: ok"
+      ]
+    },
+    {
+      "task": "clamp-range",
+      "passed": true,
+      "finished": true,
+      "stop": "Accepted",
+      "steps": 5,
+      "seconds": 11,
+      "input_tokens": 8686,
+      "remote_input_tokens": 8686,
+      "remote_calls": 5,
+      "output_tokens": 433,
+      "phase_bytes": {
+        "edit": 59,
+        "message": 45,
+        "orient": 797,
+        "validate": 846
+      },
+      "contract_recall": 0.5,
+      "scope_events": 1,
+      "slice_bytes": 232,
+      "slice_rereads": 2,
+      "validated": true,
+      "tiers": [
+        "Local"
+      ],
+      "models": {
+        "omniroute/z-ai/glm-5.2": 5
+      },
+      "diff": "src/lib.rs | 8 ++++++--\n 1 file changed, 6 insertions(+), 2 deletions(-)",
+      "test_tail": "",
+      "trace_tail": [
+        "read: src/lib.rs lines 1-10 of 10\n    1| /// Clamp `value` into [lo, hi].\n    2| pub fn clamp_to(value: i64, lo: i64, hi: i64) -> i64 {\n    3|     if value < lo {\n    4|         hi\n    5|     } else if valu",
+        "edit: Edited src/lib.rs\n{\"matched\":\"exactly\",\"path\":\"src/lib.rs\"}",
+        "check: {\"commands\":[{\"artifact\":{\"bytes\":22,\"id\":\"83aa059287b57176a5ac99c90ef40d6cdb7ecf29ae0d2d70c8032324157686b5\"},\"artifact_path\":\"83aa059287b57176a5ac99c90ef40d6cdb7ecf29ae0d2d70c8032324157686b5\",\"failed",
+        "read: src/lib.rs lines 1-14 of 14\n    1| /// Clamp `value` into [lo, hi].\n    2| ///\n    3| /// If `lo > hi`, the bounds are swapped so the result is always clamped into\n    4| /// the interval between the ",
+        "finish: ok"
+      ]
+    },
+    {
+      "task": "config-merge",
+      "passed": true,
+      "finished": true,
+      "stop": "Accepted",
+      "steps": 13,
+      "seconds": 49,
+      "input_tokens": 45440,
+      "remote_input_tokens": 45440,
+      "remote_calls": 13,
+      "output_tokens": 2594,
+      "phase_bytes": {
+        "edit": 199,
+        "message": 2573,
+        "orient": 5790,
+        "validate": 1213
+      },
+      "contract_recall": 0.5,
+      "scope_events": 1,
+      "slice_bytes": 770,
+      "slice_rereads": 5,
+      "validated": true,
+      "tiers": [
+        "Local"
+      ],
+      "models": {
+        "omniroute/z-ai/glm-5.2": 13
+      },
+      "diff": "src/merge.rs | 24 +++++++++++++++++++-----\n 1 file changed, 19 insertions(+), 5 deletions(-)",
+      "test_tail": "",
+      "trace_tail": [
+        "edit: Edited src/merge.rs\n{\"matched\":\"exactly\",\"path\":\"src/merge.rs\"}",
+        "read: src/merge.rs lines 1-32 of 32\n    1| use crate::val::Val;\n    2| \n    3| /// Merge `overlay` onto `base` (configuration layering).\n    4| ///\n    5| /// * Maps merge recursively: nested keys from both",
+        "check ERROR: {\"commands\":[{\"artifact\":{\"bytes\":960,\"id\":\"2ee323dfeac0bcec252c99ff0481376e536c3c2b036cc89243a0cd520fe6f22c\"},\"artifact_path\":\"2ee323dfeac0bcec252c99ff0481376e536c3c2b036cc89243a0cd520fe6f22c\",\"faile",
+        "read_artifact:     1| $ cargo build --quiet\n    2| error[E0308]: mismatched types\n    3|   --> src/merge.rs:18:49\n    4|    |\n    5| 18 |                         b.insert(k, merge(prev, nested));\n    6|    |        ",
+        "edit: Edited src/merge.rs\n{\"matched\":\"exactly\",\"path\":\"src/merge.rs\"}",
+        "check: {\"commands\":[{\"artifact\":{\"bytes\":22,\"id\":\"83aa059287b57176a5ac99c90ef40d6cdb7ecf29ae0d2d70c8032324157686b5\"},\"artifact_path\":\"83aa059287b57176a5ac99c90ef40d6cdb7ecf29ae0d2d70c8032324157686b5\",\"failed",
+        "read: src/merge.rs lines 1-32 of 32\n    1| use crate::val::Val;\n    2| \n    3| /// Merge `overlay` onto `base` (configuration layering).\n    4| ///\n    5| /// * Maps merge recursively: nested keys from both",
+        "finish: ok"
+      ]
+    },
+    {
+      "task": "expr-precedence",
+      "passed": true,
+      "finished": true,
+      "stop": "Accepted",
+      "steps": 7,
+      "seconds": 36,
+      "input_tokens": 24129,
+      "remote_input_tokens": 24129,
+      "remote_calls": 7,
+      "output_tokens": 1667,
+      "phase_bytes": {
+        "edit": 65,
+        "message": 1693,
+        "orient": 6371,
+        "validate": 846
+      },
+      "contract_recall": 0.5,
+      "scope_events": 1,
+      "slice_bytes": 616,
+      "slice_rereads": 2,
+      "validated": true,
+      "tiers": [
+        "Local"
+      ],
+      "models": {
+        "omniroute/z-ai/glm-5.2": 7
+      },
+      "diff": "src/parser.rs | 49 ++++++++++++++++++++++++++++++++++++++++++++-----\n 1 file changed, 44 insertions(+), 5 deletions(-)",
+      "test_tail": "",
+      "trace_tail": [
+        "read: src/parser.rs lines 1-51 of 51\n    1| use crate::lexer::{tokenize, Token};\n    2| \n    3| /// Evaluate an arithmetic expression with + - * / and parentheses.\n    4| pub fn eval(src: &str) -> Result<f6",
+        "read: src/lexer.rs lines 1-31 of 31\n    1| #[derive(Debug, Clone, PartialEq)]\n    2| pub enum Token { Num(f64), Plus, Minus, Star, Slash, LParen, RParen }\n    3| \n    4| pub fn tokenize(src: &str) -> Result",
+        "read: src/lib.rs lines 1-3 of 3\n    1| pub mod lexer;\n    2| pub mod parser;\n    3| pub use parser::eval;\n",
+        "edit: Edited src/parser.rs\n{\"matched\":\"exactly\",\"path\":\"src/parser.rs\"}",
+        "check: {\"commands\":[{\"artifact\":{\"bytes\":22,\"id\":\"83aa059287b57176a5ac99c90ef40d6cdb7ecf29ae0d2d70c8032324157686b5\"},\"artifact_path\":\"83aa059287b57176a5ac99c90ef40d6cdb7ecf29ae0d2d70c8032324157686b5\",\"failed",
+        "read: src/parser.rs lines 1-90 of 90\n    1| use crate::lexer::{tokenize, Token};\n    2| \n    3| /// Evaluate an arithmetic expression with + - * / and parentheses.\n    4| pub fn eval(src: &str) -> Result<f6",
+        "find: no matches for `#\\[test\\]|#\\[cfg\\(test\\)\\]`",
+        "finish: ok"
+      ]
+    },
+    {
+      "task": "fix-build",
+      "passed": true,
+      "finished": true,
+      "stop": "Accepted",
+      "steps": 5,
+      "seconds": 16,
+      "input_tokens": 9376,
+      "remote_input_tokens": 9376,
+      "remote_calls": 5,
+      "output_tokens": 427,
+      "phase_bytes": {
+        "edit": 59,
+        "message": 754,
+        "orient": 1753,
+        "validate": 1210
+      },
+      "contract_recall": 0.0,
+      "scope_events": 2,
+      "slice_bytes": 0,
+      "slice_rereads": 0,
+      "validated": true,
+      "tiers": [
+        "Local"
+      ],
+      "models": {
+        "omniroute/z-ai/glm-5.2": 5
+      },
+      "diff": "src/lib.rs | 2 +-\n 1 file changed, 1 insertion(+), 1 deletion(-)",
+      "test_tail": "",
+      "trace_tail": [
+        "check ERROR: {\"commands\":[{\"artifact\":{\"bytes\":970,\"id\":\"ddb898a950805c826250ad08443b62fd1b3945247240b88e40f1b57e53ee4565\"},\"artifact_path\":\"ddb898a950805c826250ad08443b62fd1b3945247240b88e40f1b57e53ee4565\",\"faile",
+        "read_artifact:     1| $ cargo build --quiet\n    2| error[E0308]: mismatched types\n    3|  --> src/lib.rs:9:5\n    4|   |\n    5| 4 | pub fn word_counts(text: &str) -> HashMap<String, usize> {\n    6|   |               ",
+        "read: src/lib.rs lines 1-16 of 16\n    1| use std::collections::HashMap;\n    2| \n    3| /// Count how often each word occurs.\n    4| pub fn word_counts(text: &str) -> HashMap<String, usize> {\n    5|     let ",
+        "edit: Edited src/lib.rs\n{\"matched\":\"exactly\",\"path\":\"src/lib.rs\"}",
+        "check: {\"commands\":[{\"artifact\":{\"bytes\":22,\"id\":\"83aa059287b57176a5ac99c90ef40d6cdb7ecf29ae0d2d70c8032324157686b5\"},\"artifact_path\":\"83aa059287b57176a5ac99c90ef40d6cdb7ecf29ae0d2d70c8032324157686b5\",\"failed",
+        "finish: ok"
+      ]
+    },
+    {
+      "task": "last-n",
+      "passed": true,
+      "finished": true,
+      "stop": "Accepted",
+      "steps": 3,
+      "seconds": 12,
+      "input_tokens": 4737,
+      "remote_input_tokens": 4737,
+      "remote_calls": 3,
+      "output_tokens": 401,
+      "phase_bytes": {
+        "edit": 59,
+        "message": 560,
+        "validate": 846
+      },
+      "contract_recall": 0.5,
+      "scope_events": 1,
+      "slice_bytes": 273,
+      "slice_rereads": 0,
+      "validated": true,
+      "tiers": [
+        "Local"
+      ],
+      "models": {
+        "omniroute/z-ai/glm-5.2": 3
+      },
+      "diff": "src/lib.rs | 2 +-\n 1 file changed, 1 insertion(+), 1 deletion(-)",
+      "test_tail": "",
+      "trace_tail": [
+        "edit: Edited src/lib.rs\n{\"matched\":\"exactly\",\"path\":\"src/lib.rs\"}",
+        "check: {\"commands\":[{\"artifact\":{\"bytes\":22,\"id\":\"83aa059287b57176a5ac99c90ef40d6cdb7ecf29ae0d2d70c8032324157686b5\"},\"artifact_path\":\"83aa059287b57176a5ac99c90ef40d6cdb7ecf29ae0d2d70c8032324157686b5\",\"failed",
+        "finish: ok"
+      ]
+    },
+    {
+      "task": "lru-cache",
+      "passed": true,
+      "finished": true,
+      "stop": "Accepted",
+      "steps": 5,
+      "seconds": 21,
+      "input_tokens": 12344,
+      "remote_input_tokens": 12344,
+      "remote_calls": 5,
+      "output_tokens": 697,
+      "phase_bytes": {
+        "edit": 59,
+        "message": 336,
+        "orient": 2908,
+        "validate": 846
+      },
+      "contract_recall": 0.5,
+      "scope_events": 1,
+      "slice_bytes": 1183,
+      "slice_rereads": 2,
+      "validated": true,
+      "tiers": [
+        "Local"
+      ],
+      "models": {
+        "omniroute/z-ai/glm-5.2": 5
+      },
+      "diff": "src/lru.rs | 27 ++++++++++++++++++++++++---\n 1 file changed, 24 insertions(+), 3 deletions(-)",
+      "test_tail": "",
+      "trace_tail": [
+        "read: src/lru.rs lines 1-32 of 32\n    1| use std::collections::HashMap;\n    2| \n    3| /// Least-recently-used cache. `get` and `put` both count as a use.\n    4| pub struct LruCache {\n    5|     capacity: u",
+        "edit: Edited src/lru.rs\n{\"matched\":\"exactly\",\"path\":\"src/lru.rs\"}",
+        "check: {\"commands\":[{\"artifact\":{\"bytes\":22,\"id\":\"83aa059287b57176a5ac99c90ef40d6cdb7ecf29ae0d2d70c8032324157686b5\"},\"artifact_path\":\"83aa059287b57176a5ac99c90ef40d6cdb7ecf29ae0d2d70c8032324157686b5\",\"failed",
+        "read: src/lru.rs lines 1-53 of 53\n    1| use std::collections::HashMap;\n    2| \n    3| /// Least-recently-used cache. `get` and `put` both count as a use.\n    4| pub struct LruCache {\n    5|     capacity: u",
+        "finish: ok"
+      ]
+    },
+    {
+      "task": "median-even",
+      "passed": true,
+      "finished": true,
+      "stop": "Accepted",
+      "steps": 4,
+      "seconds": 9,
+      "input_tokens": 6968,
+      "remote_input_tokens": 6968,
+      "remote_calls": 4,
+      "output_tokens": 229,
+      "phase_bytes": {
+        "edit": 59,
+        "message": 17,
+        "orient": 615,
+        "validate": 848
+      },
+      "contract_recall": 0.5,
+      "scope_events": 1,
+      "slice_bytes": 508,
+      "slice_rereads": 1,
+      "validated": true,
+      "tiers": [
+        "Local"
+      ],
+      "models": {
+        "omniroute/z-ai/glm-5.2": 4
+      },
+      "diff": "src/lib.rs | 7 ++++++-\n 1 file changed, 6 insertions(+), 1 deletion(-)",
+      "test_tail": "",
+      "trace_tail": [
+        "read: src/lib.rs lines 1-19 of 19\n    1| /// Median of a non-empty slice.\n    2| pub fn median(values: &[f64]) -> f64 {\n    3|     let mut sorted = values.to_vec();\n    4|     sorted.sort_by(|a, b| a.partia",
+        "edit: Edited src/lib.rs\n{\"matched\":\"exactly\",\"path\":\"src/lib.rs\"}",
+        "check: {\"commands\":[{\"artifact\":{\"bytes\":22,\"id\":\"83aa059287b57176a5ac99c90ef40d6cdb7ecf29ae0d2d70c8032324157686b5\"},\"artifact_path\":\"83aa059287b57176a5ac99c90ef40d6cdb7ecf29ae0d2d70c8032324157686b5\",\"failed",
+        "finish: ok"
+      ]
+    },
+    {
+      "task": "parse-duration",
+      "passed": true,
+      "finished": true,
+      "stop": "Accepted",
+      "steps": 4,
+      "seconds": 14,
+      "input_tokens": 7240,
+      "remote_input_tokens": 7240,
+      "remote_calls": 4,
+      "output_tokens": 391,
+      "phase_bytes": {
+        "edit": 59,
+        "message": 195,
+        "orient": 675,
+        "validate": 846
+      },
+      "contract_recall": 0.5,
+      "scope_events": 1,
+      "slice_bytes": 560,
+      "slice_rereads": 1,
+      "validated": true,
+      "tiers": [
+        "Local"
+      ],
+      "models": {
+        "omniroute/z-ai/glm-5.2": 4
+      },
+      "diff": "src/lib.rs | 6 ++++++\n 1 file changed, 6 insertions(+)",
+      "test_tail": "",
+      "trace_tail": [
+        "read: src/lib.rs lines 1-19 of 19\n    1| /// Parse \"1h30m\", \"45m\", \"2h\", \"90s\" into seconds.\n    2| pub fn parse_duration(text: &str) -> Option<u64> {\n    3|     let mut total = 0;\n    4|     let mut number",
+        "edit: Edited src/lib.rs\n{\"matched\":\"exactly\",\"path\":\"src/lib.rs\"}",
+        "check: {\"commands\":[{\"artifact\":{\"bytes\":22,\"id\":\"83aa059287b57176a5ac99c90ef40d6cdb7ecf29ae0d2d70c8032324157686b5\"},\"artifact_path\":\"83aa059287b57176a5ac99c90ef40d6cdb7ecf29ae0d2d70c8032324157686b5\",\"failed",
+        "finish: ok"
+      ]
+    },
+    {
+      "task": "shape-perimeter",
+      "passed": true,
+      "finished": true,
+      "stop": "Accepted",
+      "steps": 4,
+      "seconds": 11,
+      "input_tokens": 7874,
+      "remote_input_tokens": 7874,
+      "remote_calls": 4,
+      "output_tokens": 398,
+      "phase_bytes": {
+        "edit": 195,
+        "message": 2,
+        "orient": 529,
+        "validate": 846
+      },
+      "contract_recall": 0.5,
+      "scope_events": 1,
+      "slice_bytes": 852,
+      "slice_rereads": 1,
+      "validated": true,
+      "tiers": [
+        "Local"
+      ],
+      "models": {
+        "omniroute/z-ai/glm-5.2": 4
+      },
+      "diff": "src/shapes.rs | 9 +++++++++\n 1 file changed, 9 insertions(+)",
+      "test_tail": "",
+      "trace_tail": [
+        "read: src/shapes.rs lines 1-24 of 24\n    1| pub trait Shape {\n    2|     fn area(&self) -> f64;\n    3| }\n    4| \n    5| pub struct Rect {\n    6|     pub w: f64,\n    7|     pub h: f64,\n    8| }\n    9| \n   10",
+        "edit: Edited src/shapes.rs\n{\"matched\":\"exactly\",\"path\":\"src/shapes.rs\"}",
+        "edit: Edited src/shapes.rs\n{\"matched\":\"exactly\",\"path\":\"src/shapes.rs\"}",
+        "edit: Edited src/shapes.rs\n{\"matched\":\"exactly\",\"path\":\"src/shapes.rs\"}",
+        "check: {\"commands\":[{\"artifact\":{\"bytes\":22,\"id\":\"83aa059287b57176a5ac99c90ef40d6cdb7ecf29ae0d2d70c8032324157686b5\"},\"artifact_path\":\"83aa059287b57176a5ac99c90ef40d6cdb7ecf29ae0d2d70c8032324157686b5\",\"failed",
+        "finish: ok"
+      ]
+    },
+    {
+      "task": "token-bucket",
+      "passed": true,
+      "finished": true,
+      "stop": "Accepted",
+      "steps": 5,
+      "seconds": 19,
+      "input_tokens": 13895,
+      "remote_input_tokens": 13895,
+      "remote_calls": 5,
+      "output_tokens": 1400,
+      "phase_bytes": {
+        "edit": 65,
+        "message": 1709,
+        "orient": 3395,
+        "validate": 846
+      },
+      "contract_recall": 0.5,
+      "scope_events": 1,
+      "slice_bytes": 1177,
+      "slice_rereads": 2,
+      "validated": true,
+      "tiers": [
+        "Local"
+      ],
+      "models": {
+        "omniroute/z-ai/glm-5.2": 5
+      },
+      "diff": "src/bucket.rs | 17 ++++++++++++-----\n 1 file changed, 12 insertions(+), 5 deletions(-)",
+      "test_tail": "",
+      "trace_tail": [
+        "read: src/bucket.rs lines 1-35 of 35\n    1| use crate::clock::Clock;\n    2| \n    3| /// Token bucket: holds up to `capacity` tokens, refilled at `per_second` tokens/s.\n    4| pub struct Bucket<C: Clock> {\n ",
+        "read: src/clock.rs lines 1-4 of 4\n    1| /// Time source in milliseconds, injectable for tests.\n    2| pub trait Clock {\n    3|     fn now_ms(&self) -> u64;\n    4| }\n",
+        "edit: Edited src/bucket.rs\n{\"matched\":\"exactly\",\"path\":\"src/bucket.rs\"}",
+        "find: src/bucket.rs:23 [Bucket::refill] self.tokens = self.tokens.saturating_add(elapsed_ms * self.per_second);\nsrc/bucket.rs:26 [Bucket::refill] if self.tokens > cap_milli {\nsrc/bucket.rs:27 [Bucket::refil",
+        "find: src/bucket.rs:4 [Bucket] pub struct Bucket<C: Clock> {\nsrc/bucket.rs:13 [impl Bucket] impl<C: Clock> Bucket<C> {\n",
+        "read: src/bucket.rs lines 1-42 of 42\n    1| use crate::clock::Clock;\n    2| \n    3| /// Token bucket: holds up to `capacity` tokens, refilled at `per_second` tokens/s.\n    4| pub struct Bucket<C: Clock> {\n ",
+        "check: {\"commands\":[{\"artifact\":{\"bytes\":22,\"id\":\"83aa059287b57176a5ac99c90ef40d6cdb7ecf29ae0d2d70c8032324157686b5\"},\"artifact_path\":\"83aa059287b57176a5ac99c90ef40d6cdb7ecf29ae0d2d70c8032324157686b5\",\"failed",
+        "finish: ok"
+      ]
+    },
+    {
+      "task": "word-freq-normalize",
+      "passed": true,
+      "finished": true,
+      "stop": "Accepted",
+      "steps": 5,
+      "seconds": 10,
+      "input_tokens": 9357,
+      "remote_input_tokens": 9357,
+      "remote_calls": 5,
+      "output_tokens": 382,
+      "phase_bytes": {
+        "edit": 59,
+        "message": 207,
+        "orient": 1453,
+        "validate": 846
+      },
+      "contract_recall": 0.5,
+      "scope_events": 1,
+      "slice_bytes": 507,
+      "slice_rereads": 2,
+      "validated": true,
+      "tiers": [
+        "Local"
+      ],
+      "models": {
+        "omniroute/z-ai/glm-5.2": 5
+      },
+      "diff": "src/lib.rs | 8 +++++++-\n 1 file changed, 7 insertions(+), 1 deletion(-)",
+      "test_tail": "",
+      "trace_tail": [
+        "read: src/lib.rs lines 1-13 of 13\n    1| use std::collections::HashMap;\n    2| \n    3| /// The `k` most frequent words, most frequent first; ties alphabetical.\n    4| pub fn top_words(text: &str, k: usize) ",
+        "edit: Edited src/lib.rs\n{\"matched\":\"exactly\",\"path\":\"src/lib.rs\"}",
+        "check: {\"commands\":[{\"artifact\":{\"bytes\":22,\"id\":\"83aa059287b57176a5ac99c90ef40d6cdb7ecf29ae0d2d70c8032324157686b5\"},\"artifact_path\":\"83aa059287b57176a5ac99c90ef40d6cdb7ecf29ae0d2d70c8032324157686b5\",\"failed",
+        "read: src/lib.rs lines 1-19 of 19\n    1| use std::collections::HashMap;\n    2| \n    3| /// The `k` most frequent words, most frequent first; ties alphabetical.\n    4| pub fn top_words(text: &str, k: usize) ",
+        "finish: ok"
+      ]
+    }
+  ]
+}

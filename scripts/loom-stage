@@ -1,0 +1,818 @@
+#!/usr/bin/env python3
+"""Loom live stage: a real Loom window that agents drive and people watch.
+
+Loom runs (demo mode, no model calls) inside a tmux session. Agents look at it and
+operate it with real keystrokes and mouse clicks; after a rebuild the stage restarts on
+the new binary. People watch read-only, with a status line saying what is happening.
+
+    scripts/loom-stage open                      # open a window that watches the stage
+    scripts/loom-stage start [--binary PATH]     # start (or replace) the stage
+    scripts/loom-stage restart --binary PATH     # load a new build
+    scripts/loom-stage screen                    # print what is on screen
+    scripts/loom-stage click "세션 ▾" [--nth 2]   # click the text where it appears
+    scripts/loom-stage send "마크다운 데모"          # type text (no Enter)
+    scripts/loom-stage key Enter                 # Enter Tab Escape Up Down C-c ...
+    scripts/loom-stage wait "✓ 완료" [--timeout 30]
+    scripts/loom-stage say "checking the session menu"
+    scripts/loom-stage watch                     # attach read-only in this terminal
+    scripts/loom-stage stop
+    scripts/loom-stage serve                     # relay for sandboxed agents (see below)
+    scripts/loom-stage start --live [--cwd DIR]  # real backend (real model) in a scratch repository
+    scripts/loom-stage worker --repo DIR "task"  # run the Loom worker on the stage; prints result + trace
+
+Sandboxed agents (Codex workspace-write) cannot connect to the tmux socket. When a
+command sees "Operation not permitted", it relays itself through files in the stage
+directory, and `serve` (run by the loop outside the sandbox) executes it.
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import shlex
+import subprocess
+import sys
+import time
+import unicodedata
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+# Several loops can each have their own stage: LOOM_STAGE_NAME=ui|core|engine.
+NAME = os.environ.get("LOOM_STAGE_NAME", "")
+STAGE_DIR = Path(os.environ.get("LOOM_STAGE_DIR", ROOT / ".custom-tui" / "stage" / NAME if NAME else ROOT / ".custom-tui" / "stage"))
+SOCKET = STAGE_DIR / "tmux.sock"
+SESSION = f"loom-stage-{NAME}" if NAME else "loom-stage"
+DEFAULT_BINARY = ROOT / "loom-tui" / "target" / "debug" / "loom"
+
+
+def tmux(*args: str, check: bool = True) -> str:
+    STAGE_DIR.mkdir(parents=True, exist_ok=True)
+    p = subprocess.run(["tmux", "-S", str(SOCKET), *args], capture_output=True, text=True)
+    if check and p.returncode != 0:
+        sys.exit(f"tmux {' '.join(args[:2])}: {p.stderr.strip() or 'failed'} (is the stage running? scripts/loom-stage start)")
+    return p.stdout
+
+
+def running() -> bool:
+    return SOCKET.exists() and subprocess.run(["tmux", "-S", str(SOCKET), "has-session", "-t", SESSION],
+                                              capture_output=True).returncode == 0
+
+
+def loom_command(binary: Path, cwd: Path) -> str:
+    # A fresh demo workspace each time so runs do not depend on earlier stage state.
+    workspace = STAGE_DIR / "workspace"
+    workspace.mkdir(parents=True, exist_ok=True)
+    return f"{shlex.quote(str(binary))} --demo --cwd {shlex.quote(str(cwd or workspace))}; echo; echo '[Loom exited — waiting for the next build]'; sleep 86400"
+
+
+def say(text: str):
+    if running():
+        stamp = time.strftime("%H:%M:%S")
+        tmux("set-option", "-t", SESSION, "@say", f"{stamp} {text}", check=False)
+        tmux("refresh-client", "-S", check=False)
+    log = STAGE_DIR / "narration.log"
+    with open(log, "a") as f:
+        f.write(f"{time.strftime('%H:%M:%S')} {text}\n")
+
+
+def start(binary: Path, cwd: Path | None, size: str, clean: bool = True):
+    if not binary.exists():
+        sys.exit(f"{binary} not found; build loom-tui first (cargo build)")
+    w, h = size.split("x")
+    command = loom_command(binary, cwd)
+    if running():
+        tmux("respawn-pane", "-k", "-t", SESSION, command)
+    else:
+        tmux("new-session", "-d", "-s", SESSION, "-x", w, "-y", h, command)
+        tmux("set-option", "-t", SESSION, "status", "on")
+        tmux("set-option", "-t", SESSION, "status-style", "bg=colour236,fg=colour250")
+        tmux("set-option", "-t", SESSION, "status-left-length", "40")
+        tmux("set-option", "-t", SESSION, "status-right-length", "160")
+        tmux("set-option", "-t", SESSION, "status-left", f" LOOM STAGE{f' [{NAME}]' if NAME else ''} · #{{@build}} ")
+        tmux("set-option", "-t", SESSION, "status-right", "#{@say} ")
+        tmux("set-option", "-t", SESSION, "status-interval", "1")
+        tmux("set-option", "-g", "-t", SESSION, "window-size", "manual", check=False)
+        tmux("resize-window", "-t", SESSION, "-x", w, "-y", h, check=False)
+    if clean:
+        clear_demo_fixture()
+    else:
+        deadline = time.time() + 15
+        while time.time() < deadline and "메시지 입력" not in screen():
+            time.sleep(0.2)
+    stamp = time.strftime("%H:%M")
+    built = time.strftime("%H:%M", time.localtime(binary.stat().st_mtime))
+    tmux("set-option", "-t", SESSION, "@build", f"build {built} · loaded {stamp}", check=False)
+    say(f"loaded {binary.parent.parent.parent.name}/{binary.name} (built {built})")
+
+
+def clear_demo_fixture():
+    """Demo mode opens with a sample approval request. Answer it with the keyboard and wait
+    until the composer is ready, so the stage begins clean (as the PTY tests do)."""
+    deadline = time.time() + 20
+    while time.time() < deadline and "승인 필요" not in screen():
+        time.sleep(0.2)
+    if "승인 필요" in screen():
+        tmux("send-keys", "-t", f"{SESSION}:0.0", "Down")
+        time.sleep(0.2)
+        tmux("send-keys", "-t", f"{SESSION}:0.0", "Enter")
+        deadline = time.time() + 10
+        while time.time() < deadline and "선택 완료" not in screen():
+            time.sleep(0.2)
+    deadline = time.time() + 10
+    while time.time() < deadline and "메시지 입력" not in screen():
+        time.sleep(0.2)
+    time.sleep(0.3)
+
+
+def screen() -> str:
+    return tmux("capture-pane", "-p", "-t", SESSION)
+
+
+def width(text: str) -> int:
+    return sum(2 if unicodedata.east_asian_width(ch) in "WF" else 0 if unicodedata.combining(ch) else 1 for ch in text)
+
+
+def locate(label: str, nth: int) -> tuple[int, int] | None:
+    found = 0
+    for y, line in enumerate(screen().splitlines()):
+        start = 0
+        while (i := line.find(label, start)) >= 0:
+            found += 1
+            if found == nth:
+                return width(line[:i]) + 1, y + 1  # 1-based terminal cells
+            start = i + len(label)
+    return None
+
+
+def click(label: str, nth: int, timeout: float):
+    deadline = time.time() + timeout
+    while (pos := locate(label, nth)) is None:
+        if time.time() > deadline:
+            sys.exit(f"`{label}` is not on screen")
+        time.sleep(0.2)
+    x, y = pos
+    say(f"click “{label}”")
+    # SGR mouse: press then release, as a terminal sends for a real click.
+    tmux("send-keys", "-t", f"{SESSION}:0.0", "-l", f"\x1b[<0;{x};{y}M")
+    tmux("send-keys", "-t", f"{SESSION}:0.0", "-l", f"\x1b[<0;{x};{y}m")
+    time.sleep(0.3)
+
+
+def wait(text: str, timeout: float):
+    deadline = time.time() + timeout
+    while text not in screen():
+        if time.time() > deadline:
+            print(screen())
+            sys.exit(f"`{text}` did not appear within {timeout:.0f}s")
+        time.sleep(0.25)
+
+
+def mirror():
+    """Draw the stage in this terminal, refreshed 5 times a second. Not a tmux client, so
+    it can never type into the stage and never blocks the agent's input."""
+    STAGE_DIR.mkdir(parents=True, exist_ok=True)
+    VIEWER_PID.write_text(str(os.getpid()))
+    import signal
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+    sys.stdout.write("\033[?25l\033[2J")
+    last = ""
+    try:
+        while True:
+            if not running():
+                frame = "\033[H\033[2J  Loom stage is not running. Waiting for the loop…\n"
+            else:
+                body = tmux("capture-pane", "-e", "-p", "-t", f"{SESSION}:0.0", check=False)
+                build = tmux("show-options", "-v", "-t", SESSION, "@build", check=False).strip()
+                said = tmux("show-options", "-v", "-t", SESSION, "@say", check=False).strip()
+                bar = f" LOOM STAGE{f' [{NAME}]' if NAME else ''} · {build}  │  {said}"
+                frame = "\033[H" + body.replace("\n", "\033[K\n") + "\033[J" + f"\033[7m{bar[:200]}\033[K\033[0m"
+            if frame != last:
+                sys.stdout.write(frame)
+                sys.stdout.flush()
+                last = frame
+            time.sleep(0.2)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        VIEWER_PID.unlink(missing_ok=True)
+        sys.stdout.write("\033[0m\033[?25h\n")
+
+
+VIEWER_ID = STAGE_DIR / "viewer.window"
+VIEWER_PID = STAGE_DIR / "viewer.pid"
+
+
+def osa(*lines: str) -> str:
+    args = []
+    for line in lines:
+        args += ["-e", line]
+    return subprocess.run(["osascript", *args], capture_output=True, text=True).stdout.strip()
+
+
+def viewer_alive() -> bool:
+    try:
+        os.kill(int(VIEWER_PID.read_text()), 0)
+        return True
+    except (FileNotFoundError, ValueError, ProcessLookupError, PermissionError):
+        return False
+
+
+def close_viewer():
+    """Stop the mirror and close its Terminal window (no 'process running' prompt)."""
+    try:
+        os.kill(int(VIEWER_PID.read_text()), 15)
+    except (FileNotFoundError, ValueError, ProcessLookupError, PermissionError):
+        pass
+    VIEWER_PID.unlink(missing_ok=True)
+    if sys.platform == "darwin" and VIEWER_ID.exists():
+        time.sleep(0.5)
+        osa(f'tell application "Terminal" to close (every window whose id is {VIEWER_ID.read_text().strip()})')
+        VIEWER_ID.unlink(missing_ok=True)
+
+
+def open_viewer():
+    if viewer_alive():
+        if sys.platform == "darwin" and VIEWER_ID.exists():
+            osa(f'tell application "Terminal" to set index of (every window whose id is {VIEWER_ID.read_text().strip()}) to 1',
+                'tell application "Terminal" to activate')
+        print("the stage viewer is already open")
+        return
+    command = f"env LOOM_STAGE_NAME={shlex.quote(NAME)} {shlex.quote(sys.executable)} {shlex.quote(str(Path(__file__).resolve()))} watch"
+    if sys.platform == "darwin":
+        window = osa(f'tell application "Terminal" to do script "exec {command}"',
+                     'tell application "Terminal" to activate',
+                     'tell application "Terminal" to return id of front window')
+        if window:
+            VIEWER_ID.write_text(window)
+        print("opened a Terminal window watching the stage (read-only)")
+    else:
+        print(f"run in another terminal:\n  {command}")
+
+
+QUEUE = STAGE_DIR / "queue"
+
+
+def sandboxed() -> bool:
+    if os.environ.get("LOOM_STAGE_SERVING"):
+        return False
+    if not SOCKET.exists():
+        return False
+    p = subprocess.run(["tmux", "-S", str(SOCKET), "has-session", "-t", SESSION], capture_output=True, text=True)
+    return "not permitted" in p.stderr.lower()
+
+
+def relay(argv: list[str], timeout: float = 120) -> int:
+    import json
+    import uuid
+    QUEUE.mkdir(parents=True, exist_ok=True)
+    rid = uuid.uuid4().hex
+    tmp = QUEUE / f"{rid}.tmp"
+    tmp.write_text(json.dumps(argv))
+    tmp.rename(QUEUE / f"{rid}.cmd")
+    done = QUEUE / f"{rid}.done"
+    deadline = time.time() + timeout
+    while not done.exists():
+        if time.time() > deadline:
+            sys.exit("stage relay did not answer; is the loop running `scripts/loom-stage serve`?")
+        time.sleep(0.1)
+    result = json.loads(done.read_text())
+    done.unlink(missing_ok=True)
+    sys.stdout.write(result["stdout"])
+    sys.stderr.write(result["stderr"])
+    return result["code"]
+
+
+def serve():
+    import json
+    QUEUE.mkdir(parents=True, exist_ok=True)
+    env = {**os.environ, "LOOM_STAGE_SERVING": "1"}
+    while True:
+        for cmd in sorted(QUEUE.glob("*.cmd")):
+            try:
+                argv = json.loads(cmd.read_text())
+            except (OSError, json.JSONDecodeError):
+                continue
+            cmd.unlink(missing_ok=True)
+            p = subprocess.run([sys.executable, str(Path(__file__).resolve()), *argv], capture_output=True, text=True, env=env, timeout=7300)
+            out = QUEUE / f"{cmd.stem}.tmp-done"
+            out.write_text(json.dumps({"code": p.returncode, "stdout": p.stdout, "stderr": p.stderr}))
+            out.rename(QUEUE / f"{cmd.stem}.done")
+        time.sleep(0.1)
+
+
+# ------------------------------------------------------------------ tour
+# A scripted walk through Loom's interfaces on the stage: people watch it, the loop reads
+# the result. Each step narrates, acts like a user (keys, clicks, resize) and checks that
+# the expected text appears.
+
+PACE = float(os.environ.get("LOOM_STAGE_PACE", "0.7"))
+CURRENT = {"binary": DEFAULT_BINARY}
+
+
+SPINNER = set("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏")
+
+
+def busy() -> bool:
+    """A turn is running: the stop control or a spinner is on the status line."""
+    text = screen()
+    return "■ 중단" in text or any(line.lstrip("─ ").startswith(tuple(SPINNER)) or "■ ─" in line
+                                   for line in text.splitlines() if line.startswith("──"))
+
+
+def wait_idle(timeout: float = 90):
+    """A user waits for the current answer before sending the next message (otherwise it
+    is queued)."""
+    deadline = time.time() + timeout
+    while time.time() < deadline and busy():
+        time.sleep(0.3)
+
+
+def act(kind: str, value: str = ""):
+    if kind == "send" and not value.startswith("/"):
+        wait_idle()
+    if kind == "send":
+        tmux("send-keys", "-t", f"{SESSION}:0.0", "-l", value)
+        time.sleep(0.2)
+        tmux("send-keys", "-t", f"{SESSION}:0.0", "Enter")
+    elif kind == "type":
+        tmux("send-keys", "-t", f"{SESSION}:0.0", "-l", value)
+    elif kind == "key":
+        tmux("send-keys", "-t", f"{SESSION}:0.0", *value.split())
+    elif kind == "click":
+        click(value, 1, 8)
+    elif kind == "reset":
+        # a fresh Loom (approval answered, new chat): one step's leftovers cannot break the next
+        tmux("respawn-pane", "-k", "-t", SESSION, loom_command(CURRENT["binary"], None))
+        tmux("resize-window", "-t", SESSION, "-x", "120", "-y", "36", check=False)
+        clear_demo_fixture()
+    elif kind == "resize":
+        w, h = value.split("x")
+        tmux("resize-window", "-t", SESSION, "-x", w, "-y", h, check=False)
+    time.sleep(PACE)
+
+
+def expect(text: str, timeout: float = 12) -> float | None:
+    """Seconds until `text` is on screen, or None."""
+    t0 = time.time()
+    while time.time() - t0 < timeout:
+        if text in screen():
+            return round(time.time() - t0, 2)
+        time.sleep(0.05)
+    return None
+
+
+R = ("reset", "")
+# Each step starts from a fresh Loom unless it continues the previous one (no R first).
+TOUR = [
+    ("예시 승인을 키보드로 처리", [("key", "Down"), ("key", "Enter")], ["데모 승인 선택 완료"]),
+    ("메시지 보내고 응답 받기", [R, ("send", "첫 번째 요청")], ["첫 번째 요청", "✓ 완료"]),
+    ("마크다운 렌더링", [R, ("send", "마크다운 데모")], ["취소선", "E = mc²"]),
+    ("대화 분기", [("click", "⑂ 분기")], ["분기"]),
+    ("세션 메뉴 열기", [R, ("click", "세션")], ["현재 대화", "최근 대화"]),
+    ("세션 메뉴 닫기", [("key", "Escape")], ["메시지 입력"]),
+    ("활동 그래프", [R, ("send", "활동 데모")], ["활동 그래프 데모"]),
+    ("작업 목록과 상세", [("send", "/agents"), ("send", "/task 1")], ["작업 상세"]),
+    ("작업 상세에서 목록으로", [("click", "← 작업 목록")], ["전체"]),
+    ("질문 폼 검증", [R, ("send", "질문 데모"), ("click", "답변 제출")], ["어느 기능부터 구현할까요?", "모든 질문에 답해주세요"]),
+    ("질문 미루기", [("key", "Escape")], ["질문 1 · 열기"]),
+    ("모델 선택", [R, ("send", "/model"), ("click", "○ fixture-fast")], ["선택한 모델 · fixture-fast"]),
+    ("도움말", [R, ("send", "/help")], ["명령 안내"]),
+    ("도움말에서 Esc로 복귀", [("key", "Escape")], ["메시지 입력"]),
+    ("설정", [R, ("send", "/settings")], ["설정"]),
+    ("로컬 코드 탐색", [R, ("send", "/explore refresh_session")], ["API 호출 0"]),
+    ("탐색 결과 재사용", [("send", "/explore refresh_session")], ["unique searches 1"]),
+    ("Ctrl+C로 실행 중단", [R, ("send", "오래 걸리는 요청"), ("key", "C-c")], ["중단"]),
+    ("Esc로 실행 중단", [R, ("send", "Esc 중단 확인"), ("key", "Escape")], ["중단"]),
+    ("대기열", [R, ("send", "첫 요청"), ("type", "두 번째 요청"), ("key", "Enter")], ["대기열"]),
+    ("대기열 우선 전송", [("click", "즉시")], ["우선 전송"]),
+    ("실행 중 새 대화 전환 차단", [R, ("send", "전환 차단 확인 요청"), ("type", "/new"), ("key", "Enter")], ["현재 응답이 완료되면"]),
+    ("여러 줄 붙여넣기 축약", [R, ("type", "\x1b[200~입력 초안\n두 번째 줄\x1b[201~")], ["[붙여넣은 내용"]),
+    ("좁은 화면", [R, ("resize", "60x24")], ["메시지 입력"]),
+    ("아주 좁은 화면", [("resize", "40x12")], ["›"]),
+    ("넓은 화면 복귀", [("resize", "120x36")], ["메시지 입력"]),
+]
+
+
+LIVE_TASK = "README.md에 '## 사용법' 섹션을 만들고 greet 함수 사용 예시 한 줄을 추가해줘. 다른 파일은 건드리지 마."
+
+
+def live_repo() -> Path:
+    repo = STAGE_DIR / "live-repo"
+    subprocess.run(["rm", "-rf", str(repo)])
+    repo.mkdir(parents=True)
+    (repo / "README.md").write_text("# demo-project\n\nA tiny project for Loom live checks.\n")
+    (repo / "app.py").write_text('def greet(name):\n    return "hello " + name\n')
+    (repo / ".gitignore").write_text(".custom-tui/\n")
+    for cmd in (["init", "-q"], ["add", "-A"], ["-c", "user.name=stage", "-c", "user.email=stage@localhost", "commit", "-qm", "init"]):
+        subprocess.run(["git", "-C", str(repo), *cmd], capture_output=True)
+    return repo
+
+
+def live_pane(binary: Path, repo: Path, size: str = "120x36"):
+    command = f"{shlex.quote(str(binary))} --new --cwd {shlex.quote(str(repo))}; echo; echo '[Loom exited]'; sleep 86400"
+    w, h = size.split("x")
+    if running():
+        tmux("respawn-pane", "-k", "-t", SESSION, command)
+        tmux("resize-window", "-t", SESSION, "-x", w, "-y", h, check=False)
+    else:
+        tmux("new-session", "-d", "-s", SESSION, "-x", w, "-y", h, command)
+    tmux("set-option", "-t", SESSION, "@build", f"실제 backend · {repo.name}", check=False)
+
+
+def live_start(binary: Path, repo: Path | None, size: str):
+    """Real Loom (real backend and model) in a scratch repository, folder already trusted."""
+    if not binary.exists():
+        sys.exit(f"{binary} not found; build loom-tui first (cargo build)")
+    repo = repo or live_repo()
+    CURRENT["binary"] = binary
+    live_pane(binary, repo, size)
+    deadline = time.time() + 30
+    while time.time() < deadline and not any(t in screen() for t in ("작업 폴더 신뢰 확인", "메시지 입력")):
+        time.sleep(0.3)
+    if "작업 폴더 신뢰 확인" in screen():
+        tmux("send-keys", "-t", f"{SESSION}:0.0", "Enter")
+        deadline = time.time() + 20
+        while time.time() < deadline and "메시지 입력" not in screen():
+            time.sleep(0.3)
+    say(f"실제 Loom · {repo}")
+    print(f"live Loom on the stage · repository {repo}")
+
+
+# ------------------------------------------------------------------ worker on the stage
+# The Loom worker (`loom-tui --run`) runs in the stage pane so people watch each step;
+# the caller (often a sandboxed agent, through the relay) gets the result and the trace.
+
+REPOS = STAGE_DIR / "repos"
+
+
+def worker(binary: Path, repo: Path, task: str, max_steps: int, timeout: int, max_cost: str):
+    import json
+    repo = repo.resolve()
+    if REPOS.resolve() not in repo.parents:
+        sys.exit(f"--repo must be a directory under {REPOS} (copy or create the project there first)")
+    if not repo.is_dir():
+        sys.exit(f"{repo} does not exist")
+    if not (repo / ".git").exists():
+        for cmd in (["init", "-q"], ["add", "-A"], ["-c", "user.name=stage", "-c", "user.email=stage@localhost", "commit", "-qm", "init"]):
+            subprocess.run(["git", "-C", str(repo), *cmd], capture_output=True)
+    runs = STAGE_DIR / "worker-runs"
+    runs.mkdir(parents=True, exist_ok=True)
+    tag = time.strftime("%H%M%S")
+    spec = runs / f"{tag}.json"
+    spec.write_text(json.dumps({"binary": str(binary), "repo": str(repo), "task": task, "max_steps": max_steps,
+                                "timeout": timeout, "max_cost": max_cost, "trace": str(runs / f"{tag}.trace.jsonl"),
+                                "log": str(runs / f"{tag}.log"), "rc": str(runs / f"{tag}.rc")}))
+    command = f"{shlex.quote(sys.executable)} {shlex.quote(str(Path(__file__).resolve()))} _pane-worker {shlex.quote(str(spec))}; sleep 86400"
+    if running():
+        tmux("respawn-pane", "-k", "-t", SESSION, command)
+    else:
+        tmux("new-session", "-d", "-s", SESSION, "-x", "120", "-y", "36", command)
+    tmux("set-option", "-t", SESSION, "@build", f"Loom worker · {repo.name}", check=False)
+    say(f"worker · {task[:60]}")
+    rc_file = runs / f"{tag}.rc"
+    deadline = time.time() + timeout + 60
+    while not rc_file.exists() and time.time() < deadline:
+        time.sleep(1)
+    rc = rc_file.read_text().strip() if rc_file.exists() else "timeout"
+    diff = subprocess.run(["git", "-C", str(repo), "diff", "--stat"], capture_output=True, text=True).stdout.strip()
+    print(f"exit: {rc}\nrepo: {repo}\ndiff: {diff or '(no changes)'}\ntrace: {runs / f'{tag}.trace.jsonl'}\nlog: {runs / f'{tag}.log'}")
+    log = runs / f"{tag}.log"
+    if log.exists():
+        print("--- worker output (tail)")
+        print("\n".join(log.read_text(errors="replace").splitlines()[-25:]))
+
+
+def pane_worker(spec_file: Path):
+    """Inside the stage pane: run the worker and print each step of its trace as it happens."""
+    import json
+    spec = json.loads(spec_file.read_text())
+    trace = Path(spec["trace"])
+    print(f"\033[1mLoom worker\033[0m · {spec['repo']}\n\033[2mtask: {spec['task'][:300]}\033[0m\n", flush=True)
+    env = {**os.environ, "LOOM_PREFER_REMOTE": "1"}
+    with open(spec["log"], "w") as log:
+        proc = subprocess.Popen([spec["binary"], "--run", spec["task"], "--cwd", spec["repo"], "--max-cost", spec["max_cost"],
+                                 "--max-steps", str(spec["max_steps"]), "--max-seconds", str(spec["timeout"]),
+                                 "--trace", str(trace)], stdout=log, stderr=subprocess.STDOUT, env=env, start_new_session=True)
+        seen = 0
+        while True:
+            done = proc.poll() is not None
+            lines = trace.read_text(errors="replace").splitlines() if trace.exists() else []
+            for line in lines[seen:]:
+                try:
+                    ev = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if "calls" in ev:
+                    if ev.get("text"):
+                        print(f"\033[1m●\033[0m {ev['text'][:400]}", flush=True)
+                    for c in ev["calls"]:
+                        print(f"\033[36m→ {c.get('tool')}\033[0m {json.dumps(c.get('args', {}), ensure_ascii=False)[:200]}", flush=True)
+                elif "tool" in ev:
+                    result = (ev.get("result") or "").replace("\n", " ⏎ ")
+                    color = "31" if ev.get("error") else "2"
+                    print(f"  \033[{color}m{result[:240]}\033[0m", flush=True)
+                elif "error" in ev:
+                    print(f"\033[31m! {str(ev['error'])[:300]}\033[0m", flush=True)
+                elif "outcome" in ev:
+                    o = ev["outcome"]
+                    print(f"\n\033[1m{o.get('stop_reason')}\033[0m · {o.get('steps')} steps · input {o.get('input_tokens')} tokens", flush=True)
+            seen = len(lines)
+            if done:
+                break
+            time.sleep(0.5)
+    Path(spec["rc"]).write_text(str(proc.returncode))
+    print(f"\n\033[2m[worker exited {proc.returncode}]\033[0m", flush=True)
+
+
+def bench_view(live: Path):
+    """Inside the stage pane: every bench task, its state and what the worker is doing now."""
+    import json
+    title = os.environ.get("LOOM_BENCH_TITLE", "engine bench")
+    while True:
+        try:
+            tasks = json.loads((live / "tasks.json").read_text())
+        except (OSError, json.JSONDecodeError):
+            tasks = []
+        rows, done, passed = [], 0, 0
+        for name in tasks:
+            result_file, trace = live / f"{name}.result.json", live / f"{name}.trace.jsonl"
+            if result_file.exists():
+                r = json.loads(result_file.read_text())
+                done += 1
+                passed += r["passed"]
+                mark = "\033[32m✓\033[0m" if r["passed"] else "\033[31m✗\033[0m"
+                rows.append(f" {mark} {name:<22} {r['steps']:>3} steps {r['seconds']:>4}s  input {r['input_tokens']:>7}  "
+                            f"\033[2m{(r['stop'] if isinstance(r['stop'], str) else r['stop'][0])[:40]}\033[0m")
+            elif trace.exists():
+                steps, now = 0, ""
+                for line in trace.read_text(errors="replace").splitlines():
+                    try:
+                        ev = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if "calls" in ev:
+                        steps = ev.get("step", steps)
+                        now = " ".join(f"{c.get('tool')} {json.dumps(c.get('args', {}), ensure_ascii=False)}" for c in ev["calls"]) \
+                            or "(answer without tool) " + ev.get("text", "")
+                    elif "error" in ev and "tool" not in ev:
+                        now = "! " + str(ev["error"])
+                rows.append(f" \033[33m⠿\033[0m {name:<22} {steps:>3} steps  \033[36m{now.replace(chr(10), ' ')[:70]}\033[0m")
+            else:
+                rows.append(f" \033[2m·  {name:<22} waiting\033[0m")
+        sys.stdout.write("\033[H\033[2J")
+        print(f"\033[1m{title}\033[0m · {done}/{len(tasks)} done · {passed} passed · {time.strftime('%H:%M:%S')}\n")
+        print("\n".join(rows) or " (waiting for the bench to start)", flush=True)
+        time.sleep(1)
+
+
+def show_bench(live: Path, title: str):
+    command = (f"LOOM_BENCH_TITLE={shlex.quote(title)} {shlex.quote(sys.executable)} "
+               f"{shlex.quote(str(Path(__file__).resolve()))} _bench-view {shlex.quote(str(live))}")
+    if running():
+        tmux("respawn-pane", "-k", "-t", SESSION, command)
+    else:
+        tmux("new-session", "-d", "-s", SESSION, "-x", "120", "-y", "36", command)
+    tmux("set-option", "-t", SESSION, "@build", "engine bench", check=False)
+    say(title)
+
+
+def live_tour(binary: Path) -> list[dict]:
+    """Real backend, real model: one small request in a scratch repository."""
+    results = []
+    repo = live_repo()
+
+    def step(title, fn):
+        say(f"실제 실행 · {title}")
+        t0 = time.time()
+        try:
+            ok, detail = fn()
+        except SystemExit as e:
+            ok, detail = False, str(e)
+        results.append({"step": f"live-{len(results) + 1}", "title": f"[실제] {title}", "ok": ok, "live": True,
+                        "actions": [], "response_seconds": round(time.time() - t0, 1),
+                        "detail": "" if ok else detail, "screen": screen()})
+        print(f"{'✓' if ok else '✗'} [실제] {title} ({results[-1]['response_seconds']}s)" + ("" if ok else f" — {detail}"), flush=True)
+        return ok
+
+    live_pane(binary, repo)
+
+    def trust():
+        if expect("작업 폴더 신뢰 확인", 30) is None and expect("메시지 입력", 5) is None:
+            return False, "neither the trust prompt nor the input appeared"
+        if "작업 폴더 신뢰 확인" in screen():
+            act("key", "Enter")
+        return expect("메시지 입력", 20) is not None, "input did not appear after trusting the folder"
+
+    def request():
+        act("send", LIVE_TASK)
+        deadline = time.time() + 240
+        outcome = None
+        while time.time() < deadline and outcome is None:
+            text = screen()
+            outcome = "done" if "✓ 완료" in text else "failed" if "! 실패" in text else None
+            time.sleep(0.5)
+        diff = subprocess.run(["git", "-C", str(repo), "diff", "--stat"], capture_output=True, text=True).stdout
+        if outcome == "failed":
+            shown = [l.strip() for l in screen().splitlines() if any(k in l for k in ("오류", "error", "Error", "capacity", "실패:"))]
+            reason = shown[0] if shown else "no reason is shown to the user on screen"
+            return False, f"the turn failed ({reason})"
+        if outcome is None:
+            return False, "the turn did not complete within 240s"
+        if "README.md" not in diff:
+            return False, f"README.md was not changed (diff: {diff.strip() or 'none'})"
+        return True, ""
+
+    def tokens():
+        line = next((l for l in screen().splitlines() if "tokens" in l and "in " in l), "")
+        return bool(line), "no token usage line after a real turn"
+
+    def branch():
+        act("click", "⑂ 분기")
+        return expect("분기", 30) is not None, "fork notice did not appear"
+
+    def next_turn(text, timeout=240):
+        """Send a follow-up and wait for that turn (busy, then idle) to end."""
+        act("send", text)
+        start = time.time()
+        while time.time() - start < 30 and "■ 중단" not in screen():
+            time.sleep(0.3)
+        wait_idle(timeout)
+        tail = screen()
+        if "! 실패" in tail.splitlines()[-6:][0:6].__str__():
+            return False, "the follow-up turn failed"
+        return True, ""
+
+    def follow_up():
+        ok, detail = next_turn("방금 바꾼 내용을 한 문장으로 요약해줘.")
+        return ok and "사용법" in screen(), detail or "the summary does not mention the change"
+
+    def cjk_markdown():
+        ok, detail = next_turn("다음 두 줄을 마크다운 서식 그대로 답해줘. 설명은 붙이지 마.\n**강조(예)**를 확인하고 **'세션'**을 연다\n~~취소(선)~~은 *기울임(괄호)*과 함께")
+        if not ok:
+            return ok, detail
+        raw = [mark for mark in ("**강조", "**'세션", "~~취소", "*기울임") if mark in screen()]
+        return not raw, f"raw markdown markers visible in a real answer: {raw}"
+
+    if step("작업 폴더 신뢰", trust) and step("실제 요청 처리와 파일 변경", request):
+        step("사용량 표시", tokens)
+        step("이어지는 두 번째 턴", follow_up)
+        step("실제 답변의 한국어 강조 마크다운", cjk_markdown)
+        step("실제 대화 분기", branch)
+    return results
+
+
+TOUR_EXTRA = ROOT / "bench" / "tour-extra.json"
+
+
+def load_steps(extra_file: Path | None = None) -> list:
+    """Built-in TOUR plus accepted proposals (bench/tour-extra.json), or one file to validate."""
+    import json
+    sources = [extra_file] if extra_file else [TOUR_EXTRA]
+    steps = [] if extra_file else list(TOUR)
+    for src in sources:
+        if src and src.exists():
+            data = json.loads(src.read_text())
+            for item in data if isinstance(data, list) else [data]:
+                steps.append((item["title"], [tuple(a) for a in item["actions"]], list(item["expects"])))
+    return steps
+
+
+def tour(binary: Path, out: Path | None, only: list[str] | None, with_live: bool = False, extra_file: Path | None = None):
+    import json
+    workspace = STAGE_DIR / "workspace"
+    workspace.mkdir(parents=True, exist_ok=True)
+    (workspace / "auth.rs").write_text("fn refresh_session() {}\n")
+    CURRENT["binary"] = binary
+    results = live_tour(binary) if with_live else []
+    t0 = time.time()
+    start(binary, None, "120x36", clean=False)
+    startup = round(time.time() - t0, 2)
+    steps = load_steps(extra_file)
+    if extra_file:
+        # a proposal is validated after the standard warm-up (approval handled, chat open)
+        act("key", "Down"); act("key", "Enter"); act("send", "/chat")
+    for i, (title, actions, expects) in enumerate(steps, 1):
+        if only and not any(o in title for o in only):
+            continue
+        say(f"투어 {i}/{len(steps)} · {title}")
+        error = None
+        try:
+            for kind, value in actions:
+                act(kind, value)
+        except SystemExit as e:
+            error = str(e)
+        waits = {t: expect(t) for t in expects} if error is None else {t: None for t in expects}
+        missing = [t for t, w in waits.items() if w is None]
+        ok = error is None and not missing
+        # What the user saw after this step, and how long the UI took to show it.
+        results.append({"step": i, "title": title, "ok": ok,
+                        "actions": [f"{k} {v}".strip() for k, v in actions],
+                        "response_seconds": max((w for w in waits.values() if w is not None), default=None),
+                        "detail": error or (f"not on screen: {missing}" if missing else ""),
+                        "screen": screen()})
+        mark = "✓" if ok else "✗"
+        print(f"{mark} {i:>2}. {title}" + ("" if ok else f" — {results[-1]['detail']}"), flush=True)
+    passed = sum(r["ok"] for r in results)
+    say(f"투어 끝 · {passed}/{len(results)} 통과")
+    if out:
+        out.write_text(json.dumps({"passed": passed, "total": len(results), "startup_seconds": startup,
+                                   "steps": results}, ensure_ascii=False, indent=2))
+    return passed == len(results)
+
+
+def main():
+    if len(sys.argv) > 1 and sys.argv[1] not in ("serve", "-h", "--help") and sandboxed():
+        sys.exit(relay(sys.argv[1:], timeout=7200 if sys.argv[1] == "worker" else 120))
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    for name in ("start", "restart"):
+        p = sub.add_parser(name)
+        p.add_argument("--binary", default=str(DEFAULT_BINARY))
+        p.add_argument("--cwd")
+        p.add_argument("--size", default="120x36")
+        p.add_argument("--live", action="store_true", help="real backend and model instead of demo mode")
+    p = sub.add_parser("worker")
+    p.add_argument("task")
+    p.add_argument("--repo", required=True)
+    p.add_argument("--binary", default=str(DEFAULT_BINARY))
+    p.add_argument("--max-steps", type=int, default=30)
+    p.add_argument("--timeout", type=int, default=900)
+    p.add_argument("--max-cost", default="free", choices=["local", "free", "subscription"])
+    p = sub.add_parser("bench-view")
+    p.add_argument("dir")
+    p.add_argument("--title", default="engine bench")
+    p = sub.add_parser("_bench-view")
+    p.add_argument("dir")
+    p = sub.add_parser("_pane-worker")
+    p.add_argument("spec")
+    sub.add_parser("screen")
+    p = sub.add_parser("click")
+    p.add_argument("label")
+    p.add_argument("--nth", type=int, default=1)
+    p.add_argument("--timeout", type=float, default=5)
+    p = sub.add_parser("send")
+    p.add_argument("text")
+    p = sub.add_parser("key")
+    p.add_argument("keys", nargs="+")
+    p = sub.add_parser("wait")
+    p.add_argument("text")
+    p.add_argument("--timeout", type=float, default=15)
+    p = sub.add_parser("say")
+    p.add_argument("text")
+    sub.add_parser("watch")
+    sub.add_parser("open")
+    sub.add_parser("stop")
+    sub.add_parser("serve")
+    p = sub.add_parser("tour")
+    p.add_argument("--binary", default=str(DEFAULT_BINARY))
+    p.add_argument("--json", help="write step results here")
+    p.add_argument("--only", nargs="*")
+    p.add_argument("--live", action="store_true", help="also run a real request with the real backend first")
+    p.add_argument("--steps-file", help="run only the steps in this JSON file (validating a proposal)")
+    sub.add_parser("close")
+    args = ap.parse_args()
+
+    if args.cmd in ("start", "restart") and args.live:
+        live_start(Path(args.binary), Path(args.cwd) if args.cwd else None, args.size)
+    elif args.cmd in ("start", "restart"):
+        start(Path(args.binary), Path(args.cwd) if args.cwd else None, args.size)
+    elif args.cmd == "worker":
+        worker(Path(args.binary), Path(args.repo), args.task, args.max_steps, args.timeout, args.max_cost)
+    elif args.cmd == "bench-view":
+        show_bench(Path(args.dir), args.title)
+    elif args.cmd == "_bench-view":
+        bench_view(Path(args.dir))
+    elif args.cmd == "_pane-worker":
+        pane_worker(Path(args.spec))
+    elif args.cmd == "screen":
+        print(screen(), end="")
+    elif args.cmd == "click":
+        click(args.label, args.nth, args.timeout)
+    elif args.cmd == "send":
+        say(f"type “{args.text[:40]}”")
+        tmux("send-keys", "-t", f"{SESSION}:0.0", "-l", args.text)
+    elif args.cmd == "key":
+        say(f"key {' '.join(args.keys)}")
+        tmux("send-keys", "-t", f"{SESSION}:0.0", *args.keys)
+    elif args.cmd == "wait":
+        wait(args.text, args.timeout)
+    elif args.cmd == "say":
+        say(args.text)
+    elif args.cmd == "watch":
+        mirror()
+    elif args.cmd == "open":
+        open_viewer()
+    elif args.cmd == "serve":
+        serve()
+    elif args.cmd == "tour":
+        sys.exit(0 if tour(Path(args.binary), Path(args.json) if args.json else None, args.only, args.live,
+                           Path(args.steps_file) if args.steps_file else None) else 1)
+    elif args.cmd == "close":
+        close_viewer()
+    elif args.cmd == "stop":
+        if running():
+            tmux("kill-session", "-t", SESSION)
+
+
+if __name__ == "__main__":
+    main()

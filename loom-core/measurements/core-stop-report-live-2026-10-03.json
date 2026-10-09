@@ -1,0 +1,55 @@
+{
+  "summary": {
+    "passed": 0,
+    "total": 1,
+    "input_tokens": 1342,
+    "output_tokens": 27,
+    "seconds": 63,
+    "mean_steps": 3.0,
+    "orient_bytes": 319,
+    "validate_bytes": 0,
+    "remote_input_tokens": 1342,
+    "remote_calls": 1,
+    "contract_recall": 1.0,
+    "scope_events": 0,
+    "slice_rereads": 0,
+    "slice_bytes": 0,
+    "validated": 0,
+    "false_finish": 0,
+    "escalated": 0
+  },
+  "results": [
+    {
+      "task": "average-empty",
+      "passed": false,
+      "finished": false,
+      "stop": "Unresolved",
+      "steps": 3,
+      "seconds": 63,
+      "input_tokens": 1342,
+      "remote_input_tokens": 1342,
+      "remote_calls": 1,
+      "output_tokens": 27,
+      "phase_bytes": {
+        "message": 0,
+        "orient": 319
+      },
+      "contract_recall": 1.0,
+      "scope_events": 0,
+      "slice_bytes": 0,
+      "slice_rereads": 0,
+      "validated": false,
+      "tiers": [
+        "Local"
+      ],
+      "models": {
+        "omniroute/gemini-3.8-flash": 1
+      },
+      "diff": "",
+      "test_tail": " --> tests/hidden.rs:3:46\n  |\n3 | #[test] fn none() { assert_eq!(average(&[]), None); }\n  |                                              ^^^^ expected `f64`, found `Option<_>`\n  |\n  = note: expected type `f64`\n             found enum `Option<_>`\n\nFor more information about this error, try `rustc --explain E0308`.\nerror: could not compile `bench_task` (test \"hidden\") due to 2 previous errors\n\nworker made no source changes",
+      "trace_tail": [
+        "read: src/lib.rs lines 1-10 of 10\n    1| pub mod report;\n    2| \n    3| /// Arithmetic mean.\n    4| pub fn average(values: &[f64]) -> f64 {\n    5|     let sum: f64 = values.iter().sum();\n    6|     if value"
+      ]
+    }
+  ]
+}

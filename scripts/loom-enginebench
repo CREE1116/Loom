@@ -1,0 +1,247 @@
+#!/usr/bin/env python3
+"""Benchmark the Loom worker engine on bench/engine/tasks with hidden tests.
+
+Each task is copied to a scratch directory, the worker runs on it (local/free models
+only), then the task's hidden tests are added and `cargo test` decides pass/fail.
+
+    scripts/loom-enginebench                       # build loom-core, run all tasks
+    scripts/loom-enginebench --engine PATH --json out.json --only median-even last-n
+
+Temperature is fixed at 0 so repeated runs of the same engine are comparable.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+TASKS = ROOT / "bench" / "engine" / "tasks"
+TARGET = ROOT / "bench" / "engine" / ".target"
+TARGET = Path(os.environ.get("LOOM_BENCH_TARGET_ROOT", str(TARGET)))
+
+
+def run_task(task: Path, engine: Path, args) -> dict:
+    text = (task / "task.md").read_text().strip()
+    work = Path(tempfile.mkdtemp(prefix=f"loom-bench-{task.name}-"))
+    repo = work / "repo"
+    shutil.copytree(task / "repo", repo, copy_function=shutil.copy)  # fresh mtimes: cargo must rebuild
+    git = lambda *a: subprocess.run(["git", "-C", str(repo), *a], capture_output=True, text=True)
+    git("init", "-q")
+    git("add", "-A")
+    git("-c", "user.name=bench", "-c", "user.email=bench@localhost", "commit", "-qm", "task")
+    live = Path(args.progress) if args.progress else None
+    trace = live / f"{task.name}.trace.jsonl" if live else work / "trace.jsonl"
+    if live:
+        trace.unlink(missing_ok=True)
+        (live / f"{task.name}.result.json").unlink(missing_ok=True)
+    env = {**os.environ, "LOOM_TEMPERATURE": "0", "CARGO_TARGET_DIR": str(TARGET / task.name)}
+    if not args.prefer_local:
+        env["LOOM_PREFER_REMOTE"] = "1"  # free remote models first (OmniRoute, free API tiers); local is the fallback
+    t0 = time.time()
+    # Output goes to files and the worker gets its own process group: on timeout the whole
+    # group (worker, cargo, test binaries) is killed and nothing can hold a pipe open.
+    err_file = work / "stderr.log"
+    if args.codex:
+        # Vanilla Codex as the reference: the official client, its own tools and loop, the
+        # same task text and hidden tests. Its JSON event stream goes where a Loom trace would.
+        (TARGET / task.name).mkdir(parents=True, exist_ok=True)
+        command = ["codex", "exec", "--json", "--ephemeral", "--ignore-user-config", "--skip-git-repo-check",
+                   "-s", "workspace-write", "-C", str(repo), "-m", args.codex,
+                   "--add-dir", str(TARGET / task.name), "--add-dir", str(Path.home() / ".cargo"), "-"]
+    else:
+        command = [str(engine), *( ["--run",text] if args.legacy else ["run",text]), "--cwd", str(repo), "--max-cost", args.max_cost,
+                   *(["--model", args.model] if args.model else []),
+                   *(["--with-context"] if args.with_context else []),
+                   "--max-steps", str(args.max_steps), "--max-seconds", str(args.timeout - 30), "--trace", str(trace)]
+    with open(err_file, "w") as err_out, open(trace, "w") if args.codex else open(os.devnull, "w") as codex_out:
+        proc = subprocess.Popen(
+            command, stdin=subprocess.PIPE if args.codex else subprocess.DEVNULL,
+            stdout=codex_out if args.codex else subprocess.DEVNULL, stderr=err_out, env=env, start_new_session=True,
+        )
+        if args.codex:
+            proc.stdin.write(text.encode())
+            proc.stdin.close()
+        try:
+            rc = proc.wait(timeout=args.timeout)
+        except subprocess.TimeoutExpired:
+            os.killpg(proc.pid, 9)
+            proc.wait()
+            rc = -9
+    err = err_file.read_text(errors="replace") + ("\ntimeout" if rc == -9 else "")
+    seconds = round(time.time() - t0)
+    outcome = {}
+    steps = []
+    for line in trace.read_text().splitlines() if trace.exists() else []:
+        try:
+            ev = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if args.codex:
+            # codex exec --json: usage per turn, one item per command / file change / message
+            if ev.get("type") == "turn.completed":
+                u = ev.get("usage", {})
+                outcome["input_tokens"] = outcome.get("input_tokens", 0) + u.get("input_tokens", 0)
+                outcome["output_tokens"] = outcome.get("output_tokens", 0) + u.get("output_tokens", 0)
+                outcome["remote_input_tokens"] = outcome["input_tokens"]
+                outcome["stop_reason"] = "turn completed"
+            elif ev.get("type") in ("turn.failed", "error"):
+                outcome["stop_reason"] = str(ev.get("error", ev).get("message", "") if isinstance(ev.get("error", ev), dict) else ev)[:120]
+            elif ev.get("type") == "item.completed" and (ev.get("item") or {}).get("type") in ("command_execution", "file_change", "mcp_tool_call"):
+                outcome["steps"] = outcome.get("steps", 0) + 1
+                item = ev["item"]
+                steps.append(f"{item['type']}: {(item.get('command') or str(item.get('changes', '')))[:200]}")
+        elif "outcome" in ev:
+            outcome = ev["outcome"]
+        elif "tool" in ev:
+            steps.append(f"{ev['tool']}{' ERROR' if ev.get('error') else ''}: {ev.get('result', '')[:200]}")
+        elif "calls" in ev and not ev["calls"]:
+            steps.append(f"(no tool call) {ev.get('text', '')[:200]}")
+    diff = git("diff", "--stat").stdout.strip()
+    # Ignore .loom session artifacts: only a production-source edit may receive credit.
+    changed = git("status", "--porcelain", "--untracked-files=all", "--",
+                  "src", "Cargo.toml", "Cargo.lock", "build.rs").stdout.strip()
+    (repo / "tests").mkdir(exist_ok=True)
+    shutil.copy(task / "hidden" / "hidden.rs", repo / "tests" / "hidden.rs")
+    try:
+        test = subprocess.run(["cargo", "test", "-q"], cwd=repo, capture_output=True, text=True, timeout=300, env=env,
+                              start_new_session=True)
+        passed, test_out = test.returncode == 0 and bool(changed), test.stdout + test.stderr
+        if not changed:
+            test_out += "\nworker made no source changes"
+    except subprocess.TimeoutExpired as e:
+        passed, test_out = False, f"hidden tests timed out\n{e.stdout or ''}"
+    result = {
+        "task": task.name,
+        "passed": passed,
+        "finished": rc == 0,
+        "stop": outcome.get("stop_reason") or err.strip().splitlines()[-1:] or ["?"],
+        "steps": outcome.get("steps", 0),
+        "seconds": seconds,
+        "input_tokens": outcome.get("input_tokens", 0),
+        "remote_input_tokens": outcome.get("remote_input_tokens"),
+        "remote_calls": outcome.get("remote_calls"),
+        "output_tokens": outcome.get("output_tokens", 0),
+        "phase_bytes": outcome.get("phase_bytes", {}),
+        # design metrics (docs/loom-experiment-findings.md §5), present once the engine records them
+        "contract_recall": outcome.get("contract_recall"),
+        "scope_events": len(outcome.get("scope_events") or []),
+        "slice_bytes": outcome.get("slice_bytes"),
+        "slice_rereads": outcome.get("slice_rereads"),
+        "validated": outcome.get("validated"),
+        "tiers": outcome.get("tiers"),
+        "models": outcome.get("models", {}),
+        "diff": diff,
+        "test_tail": "" if passed else "\n".join(test_out.strip().splitlines()[-12:]),
+        "trace_tail": steps[-8:],
+    }
+    if live:
+        (live / f"{task.name}.result.json").write_text(json.dumps(result, ensure_ascii=False))
+    if not args.keep:
+        shutil.rmtree(work, ignore_errors=True)
+    else:
+        result["workdir"] = str(work)
+    return result
+
+
+def summarize(results: list[dict]) -> dict:
+    n = len(results) or 1
+    out = {
+        "passed": sum(r["passed"] for r in results),
+        "total": len(results),
+        "input_tokens": sum(r["input_tokens"] for r in results),
+        "output_tokens": sum(r["output_tokens"] for r in results),
+        "seconds": sum(r["seconds"] for r in results),
+        "mean_steps": round(sum(r["steps"] for r in results) / n, 1),
+        "orient_bytes": sum(r["phase_bytes"].get("orient", 0) for r in results),
+        "validate_bytes": sum(r["phase_bytes"].get("validate", 0) for r in results),
+    }
+    recalls = [r["contract_recall"] for r in results if r.get("contract_recall") is not None]
+    if results and all(r.get("remote_input_tokens") is not None for r in results):
+        out["remote_input_tokens"] = sum(r["remote_input_tokens"] for r in results)
+        out["remote_calls"] = sum(r.get("remote_calls") or 0 for r in results)
+    if recalls:
+        out["contract_recall"] = round(sum(recalls) / len(recalls), 3)
+        out["scope_events"] = sum(r.get("scope_events", 0) for r in results)
+    rereads = [r["slice_rereads"] for r in results if r.get("slice_rereads") is not None]
+    if rereads:
+        out["slice_rereads"] = sum(rereads)
+        out["slice_bytes"] = sum(r.get("slice_bytes") or 0 for r in results)
+    validated = [r["validated"] for r in results if r.get("validated") is not None]
+    if validated:
+        out["validated"] = sum(validated)
+        # false "finished": the engine said done, the hidden tests disagree
+        out["false_finish"] = sum(1 for r in results if r["finished"] and not r["passed"])
+    escalated = [r for r in results if r.get("tiers") and len(r["tiers"]) > 1]
+    if any(r.get("tiers") for r in results):
+        out["escalated"] = len(escalated)
+    return out
+
+
+def table(summary: dict, results: list[dict]) -> str:
+    lines = [f"engine bench: {summary['passed']}/{summary['total']} passed · input {summary['input_tokens']} tokens · "
+             f"{summary['seconds']}s · mean {summary['mean_steps']} steps · orient {summary['orient_bytes']}B · "
+             f"validate {summary['validate_bytes']}B"
+             + "".join(f" · {k} {summary[k]}" for k in ("contract_recall", "scope_events", "slice_rereads", "validated",
+                                                        "false_finish", "escalated") if k in summary)]
+    for r in results:
+        lines.append(f"  {'✓' if r['passed'] else '✗'} {r['task']:<22} {r['steps']:>3} steps {r['seconds']:>4}s "
+                     f"input {r['input_tokens']:>7} · {r['stop'] if isinstance(r['stop'], str) else r['stop'][0]}")
+    return "\n".join(lines)
+
+
+def build_engine(crate: Path, legacy: bool) -> Path:
+    target = ROOT / ("loom-tui" if legacy else "loom-core") / "target-enginebench"
+    p = subprocess.run(["cargo", "build", "-q"], cwd=crate, capture_output=True, text=True,
+                       env={**os.environ, "CARGO_TARGET_DIR": str(target)})
+    if p.returncode != 0:
+        sys.exit(f"build failed:\n{p.stderr[-2000:]}")
+    return target / "debug" / ("loom-tui" if legacy else "loom")
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--engine", help="loom binary (default: build loom-core)")
+    ap.add_argument("--legacy", action="store_true", help="compare the legacy loom-tui --run interface")
+    ap.add_argument("--codex", metavar="MODEL", help="run vanilla Codex (codex exec, ChatGPT login) with this model instead of Loom")
+    ap.add_argument("--with-context", action="store_true", help="opt in to the Native context compiler for a paired measurement")
+    ap.add_argument("--crate", help="crate to build when --engine is not given")
+    ap.add_argument("--only", nargs="*")
+    ap.add_argument("--max-cost", default="free", choices=["local", "free", "subscription"])
+    ap.add_argument("--model", help="pin the same Loom model for baseline and candidate")
+    ap.add_argument("--max-steps", type=int, default=30)
+    ap.add_argument("--timeout", type=int, default=900)
+    ap.add_argument("--jobs", type=int, default=3, help="parallel tasks (remote models serve them concurrently)")
+    ap.add_argument("--prefer-local", action="store_true", help="local model first (serial: use --jobs 1)")
+    ap.add_argument("--json", help="write results here")
+    ap.add_argument("--keep", action="store_true", help="keep scratch repos")
+    ap.add_argument("--progress", help="directory for live per-task traces and results (scripts/loom-stage bench-view)")
+    args = ap.parse_args()
+    if args.engine and Path(args.engine).name == "loom-tui": args.legacy = True
+    if args.legacy and args.with_context:
+        ap.error("--with-context requires the Native engine")
+    crate = Path(args.crate) if args.crate else ROOT / ("loom-tui" if args.legacy else "loom-core")
+    engine = None if args.codex else (Path(args.engine) if args.engine else build_engine(crate, args.legacy)).resolve()
+    tasks = [t for t in sorted(TASKS.iterdir()) if t.is_dir() and (not args.only or t.name in args.only)]
+    if args.progress:
+        Path(args.progress).mkdir(parents=True, exist_ok=True)
+        (Path(args.progress) / "tasks.json").write_text(json.dumps([t.name for t in tasks]))
+    with ThreadPoolExecutor(args.jobs) as pool:
+        results = list(pool.map(lambda t: run_task(t, engine, args), tasks))
+    summary = summarize(results)
+    print(table(summary, results), flush=True)
+    if args.json:
+        Path(args.json).write_text(json.dumps({"summary": summary, "results": results}, ensure_ascii=False, indent=2))
+    sys.exit(0 if summary["passed"] == summary["total"] else 1)
+
+
+if __name__ == "__main__":
+    main()

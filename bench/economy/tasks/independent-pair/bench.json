@@ -1,0 +1,8 @@
+{
+  "difficulty": "independent-medium",
+  "decomposable": true,
+  "write_files": [
+    "src/limits.rs",
+    "src/names.rs"
+  ]
+}

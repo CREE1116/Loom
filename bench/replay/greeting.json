@@ -1,0 +1,7 @@
+{"id": "greeting", "goal": "안녕", "base": "b734d56548b90279efb4f87d694514ae6e5bb615",
+ "origin": "2026-10-02: a greeting ran for hours (explored, validated, escalated)",
+ "focus": [{"path": "loom-core/src/worker/mod.rs", "needle": "answered: patch.files.is_empty()"},
+           {"path": "loom-core/src/control.rs", "needle": "if result.patch.files.is_empty()"},
+           {"path": "loom-core/tests/control_gate.rs", "needle": "a_prose_reply_ends_the_turn_without_exploring_validating_or_retrying"}],
+ "invariants": "A finish-only conversational reply should complete in one step; an explicit edit request that makes no changes must still remain unresolved.",
+ "grade": {"max_steps": 1, "answer_regex": ["\\S"]}}

@@ -1,0 +1,53 @@
+{
+  "date": "2026-10-04",
+  "result": {
+    "cached_input_tokens": 0,
+    "contract_recall": 1.0,
+    "decision": {
+      "estimated_work": 4,
+      "groups": [
+        {
+          "anchors": [
+            "left.py::clamp_score"
+          ],
+          "read_files": [],
+          "write_files": [
+            "left.py"
+          ]
+        },
+        {
+          "anchors": [
+            "right.py::slugify"
+          ],
+          "read_files": [],
+          "write_files": [
+            "right.py"
+          ]
+        }
+      ],
+      "mode": "Split",
+      "observed_fixed_ms": null,
+      "reason": "AST 그래프에서 쓰기·의존 범위가 분리된 2개 작업을 병렬 배분합니다. 병합 후 Core가 검증합니다."
+    },
+    "finished": false,
+    "id": "task-18db13f39bdcbab8-18065",
+    "input_tokens": 0,
+    "models": {},
+    "output_tokens": 0,
+    "phase_bytes": {},
+    "remote_calls": 0,
+    "remote_input_tokens": 0,
+    "scope_events": [],
+    "slice_bytes": 0,
+    "slice_rereads": 0,
+    "status": "Unresolved",
+    "steps": 2,
+    "stop_reason": "Unresolved",
+    "summary": "작업을 완료하지 못했습니다.\n\nCore 실행 보고\n그래프 분배: 2개 · 모델 요청 2회\n작업 1: BadRequest: HTTP 400: {\"error\":{\"message\":\"Model 'claude-sonnet-4-6' is not available in the active live catalog for provider 'antigravity'.\",\"type\":\"invalid_request_error\",\"code\":\"bad_request\"}}\n진행 결과:\n실행 완료된 도구 기록 없음\n격리 사본 수정 제안: 없음\n이번 시도: 모델 요청 1/8회 · 토큰 0/500000 · 경과 0초/107초 · 모델 대기 0초\n마지막 모델 오류: BadRequest: HTTP 400: {\"error\":{\"message\":\"Model 'claude-sonnet-4-6' is not available in the active live catalog for provider 'antigravity'.\",\"type\":\"invalid_request_error\",\"code\":\"bad_request\"}}\n작업 2: Quota: every matching model is unavailable: omniroute/agy/claude-sonnet-4-6: cooling down 599s\n진행 결과:\n실행 완료된 도구 기록 없음\n격리 사본 수정 제안: 없음\n이번 시도: 모델 요청 1/8회 · 토큰 0/500000 · 경과 0초/107초 · 모델 대기 0초\n마지막 모델 오류: Quota: every matching model is unavailable: omniroute/agy/claude-sonnet-4-6: cooling down 599s\n누적 실행: 시도 1회 · 모델 요청 2회 · 토큰 0 · 모델 대기 0초\n최근 모델 실패: BadRequest: HTTP 400: {\"error\":{\"message\":\"Model 'claude-sonnet-4-6' is not available in the active live catalog for provider 'antigravity'.\",\"type\":\"invalid_request_error\",\"code\":\"bad_request\"}}\nCore 검증: 아직 수행하지 않음\n원본 반영: 없음 · 미수락 제안은 적용되지 않았습니다.\n남은 작업: Fix clamp_score to clamp numbers to the inclusive range 0 through 10, and fix slugify to lowercase, trim, and join whitespace-separated words with one hyphen. Keep the public function names and files.\n중단 사유: one or more graph workers could not complete their scoped proposal\n실행 근거: .loom/artifacts/af9bd7311ed9137476e07c1f9c2506d51bccab13b84c9b34adc30b0674894ce7",
+    "tiers": [
+      "Local"
+    ],
+    "validated": false
+  },
+  "diagnosis": "Static gateway catalog advertised Sonnet, but live provider rejected it as unavailable. No tools ran and no source was modified."
+}

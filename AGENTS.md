@@ -1,18 +1,11 @@
-# Loom implementation rules
+# Repository notes for agents
 
-Read docs/orchestrator-implementation-plan.md and docs/tui-completion-plan.md for ownership, milestones and acceptance criteria.
-
-- Core owns state, evidence, scheduling, context, costs and patch decisions. Workers return results and proposals.
-- UI consumes typed AgentEvent and emits AgentCommand. Keep provider wire formats in backend adapters.
-- Reuse shared local evidence and immutable repository snapshots. Do not broadcast identical exploration to remote workers.
-- Preserve drafts, explicit user choice, opaque approval tokens and session scope. Never auto-submit a question default.
-- Mark transitional Codex dependencies and planned features honestly. Do not display synthetic cost savings as measurements.
-- Implement complete, focused product slices in TUI plan order; do not start with a router.
-
-Checks (no remote inference):
-
-    cargo fmt --manifest-path custom-tui/Cargo.toml -- --check
-    cargo test --locked --manifest-path custom-tui/Cargo.toml
-    cargo clippy --locked --manifest-path custom-tui/Cargo.toml --all-targets -- -D warnings
-    cargo build --locked --manifest-path custom-tui/Cargo.toml
-    python3 custom-tui/tests/terminal_smoke.py
+- `loom-core/` is the Core: agent loop, tools, workspace isolation, model routing and
+  local inference (including the native LMX engine in `loom-core/native/lmx`).
+- `loom-tui/` is the terminal UI and the `loom` binary. Before changing anything there,
+  read `loom-tui/AGENTS.md`: every UI change needs a self-check
+  (`cargo run --manifest-path loom-tui/Cargo.toml -- --self-check`), and a running Loom
+  window does not show a change until it is restarted.
+- `docs/` holds design notes and measurements; `bench/` holds benchmark fixtures used by
+  the `scripts/loom-*` tools.
+- Run `cargo test` for both crates before proposing a change.
