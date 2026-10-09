@@ -198,6 +198,8 @@ fn model(config: &Value) -> Result<Model> {
         feed_forward,
         tied_embeddings: required_boolean(config, "tie_word_embeddings")?,
         hybrid: None,
+        shortconv: None,
+        routing: None,
     };
     result.roles()?;
     Ok(result)

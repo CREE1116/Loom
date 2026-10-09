@@ -93,7 +93,8 @@ fn model(args: &[OsString]) -> Result<()> {
             let models = loom_core::models::checkpoints::installed()?;
             let prepared = loom_core::models::import::installed()?;
             let executables = loom_core::models::lmx::installed()?;
-            if models.is_empty() && prepared.is_empty() && executables.is_empty() {
+            let native = loom_core::models::lmx_native_runtime::installed();
+            if models.is_empty() && prepared.is_empty() && executables.is_empty() && native.is_empty() {
                 println!(
                     "no LOOM-managed models in {}",
                     loom_core::models::local::models_dir().display()
@@ -107,6 +108,10 @@ fn model(args: &[OsString]) -> Result<()> {
                 }
                 for model in executables {
                     println!("{:.2} GB · {} ({})", model.bytes as f64 / 1e9, model.display_name(), model.id());
+                }
+                for model in native {
+                    let bytes = std::fs::metadata(&model.path).map_or(0, |m| m.len());
+                    println!("{:.2} GB · LMX {} ({})", bytes as f64 / 1e9, model.name(), model.id());
                 }
             }
             Ok(())
@@ -173,7 +178,13 @@ fn model(args: &[OsString]) -> Result<()> {
         }
         "remove" => {
             let id = arg(args, 1, "loom model remove <ID from loom model list>")?;
-            loom_core::models::checkpoints::remove(&id)?;
+            if let Some(model) = loom_core::models::lmx_native_runtime::installed().into_iter().find(|m| m.id() == id) {
+                loom_core::models::lmx_native_runtime::remove(&model)?;
+            } else if let Some(file) = loom_core::models::lmx::installed()?.into_iter().find(|f| f.id() == id) {
+                std::fs::remove_file(&file.path).with_context(|| format!("remove {}", file.path.display()))?;
+            } else {
+                loom_core::models::checkpoints::remove(&id)?;
+            }
             println!("Removed {id}"); Ok(())
         }
         "serve" => {

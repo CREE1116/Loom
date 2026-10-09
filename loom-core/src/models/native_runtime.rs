@@ -1385,8 +1385,9 @@ pub(super) fn render_template(
         let _ = format;
         String::new()
     });
+    let template = without_generation_tags(template);
     environment
-        .add_template("chat", template)
+        .add_template("chat", &template)
         .map_err(|error| error.to_string())?;
     let mut context = json!({
         "messages": messages,
@@ -1402,6 +1403,21 @@ pub(super) fn render_template(
         .get_template("chat")
         .and_then(|template| template.render(minijinja::Value::from_serialize(&context)))
         .map_err(|error| error.to_string())
+}
+
+/// HF chat templates mark assistant text for training masks with `{% generation %}` …
+/// `{% endgeneration %}`. They render nothing at inference; Jinja engines without the
+/// extension reject them, so drop them.
+fn without_generation_tags(template: &str) -> String {
+    let mut out = template.to_owned();
+    for tag in ["generation", "endgeneration"] {
+        for (open, close) in [("{%", "%}"), ("{%-", "%}"), ("{%", "-%}"), ("{%-", "-%}")] {
+            for spaced in [format!("{open} {tag} {close}"), format!("{open}{tag}{close}")] {
+                out = out.replace(&spaced, "");
+            }
+        }
+    }
+    out
 }
 
 fn parse_spark_tool_calls(text: &str) -> Vec<Part> {
@@ -1700,5 +1716,19 @@ mod tests {
         assert_eq!(name, "edit");
         assert_eq!(arguments["path"], "a.rs");
         assert_eq!(arguments["line"], 3);
+    }
+}
+
+#[cfg(test)]
+mod generation_tags {
+    #[test]
+    fn templates_with_training_generation_tags_render() {
+        let template = "{% for m in messages %}{% if m.role == 'assistant' %}{% generation %}{{ m.content }}{%- endgeneration %}{% else %}{{ m.content }}{% endif %}{% endfor %}";
+        let request = crate::models::Request {
+            messages: vec![crate::models::Message::user("hi")],
+            ..Default::default()
+        };
+        let text = super::render_template_prompt(template, &request, false, "", "").unwrap();
+        assert_eq!(text, "hi");
     }
 }

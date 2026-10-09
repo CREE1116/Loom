@@ -403,22 +403,42 @@ pub fn run(
     let mut repeated = 0;
     let mut unusable = 0;
     let mut connection = None;
+    let mut exploring = 0usize;
+    let mut last_call = Duration::ZERO;
     while !shared.stopped() {
+        // Near a configured limit, ask for the answer instead of letting the next tool
+        // call run out the budget and lose everything gathered so far.
+        let calls_left = shared
+            .options
+            .steps
+            .saturating_sub(shared.calls.load(Ordering::SeqCst));
+        // Tiny limits are deliberate (a single scripted step), so leave those alone.
+        let wrap_up = shared.options.steps >= 8 && calls_left <= 1
+            || !last_call.is_zero()
+                && shared.worker_time() < last_call * 2 + Duration::from_secs(1);
         let mut available = tools::specs(!child, readonly || host.orchestrating);
         available.extend(host.extension_tools());
         if child {
             available.retain(|t| t.name != "ask");
         }
+        if wrap_up {
+            available.clear();
+        }
         let request = Request {
             model: shared.options.model.clone().unwrap_or_default(),
             system: Some(format!(
-                "{system}\nCurrent role: {}",
+                "{system}\nCurrent role: {}{}",
                 if host.orchestrating {
                     "orchestration; coordinate the DAG and its blockers"
                 } else if shared.options.inquiry {
                     "read-only parallel inquiry; main task continues independently"
                 } else {
                     "assistant; answer the current request, perform repository work only when needed"
+                },
+                if wrap_up {
+                    "\nThe task limit is almost used up. Do not call tools. Give your final answer now from the evidence above and say briefly what you could not verify."
+                } else {
+                    ""
                 }
             )),
             messages: messages.clone(),
@@ -434,6 +454,7 @@ pub fn run(
             gateway_connection: connection.clone(),
             ..Default::default()
         };
+        let asked = Instant::now();
         let response = match shared.complete(id, &request) {
             Ok(r) => r,
             Err(e) => {
@@ -442,6 +463,7 @@ pub fn run(
             }
         };
         connection = response.gateway_connection.clone();
+        last_call = asked.elapsed();
         if shared.stopped() {
             summary = "cancelled or deadline reached".into();
             break;
@@ -451,7 +473,7 @@ pub fn run(
             .map(|(cid, n, a)| (cid.to_owned(), n.to_owned(), a.clone()))
             .collect();
         if calls.is_empty() {
-            if response.stop == Stop::EndTurn
+            if (response.stop == Stop::EndTurn || wrap_up)
                 && !response.text().trim().is_empty()
                 && !failed_delegation
                 && !pending_failure
@@ -487,6 +509,7 @@ pub fn run(
         // reading further ranges or pages of one target is progress, not repetition.
         let revision = host.view.revision().to_owned();
         let call_key = serde_json::to_string(&calls.iter().map(|(_, n, a)| (n, a)).collect::<Vec<_>>())?;
+        let calls_names: Vec<String> = calls.iter().map(|(_, n, _)| n.clone()).collect();
         messages.push(Message {
             role: Role::Assistant,
             parts: response.parts,
@@ -626,6 +649,17 @@ pub fn run(
         } else {
             repeated = 0;
             last_calls = Some(fingerprint);
+        }
+        let navigation_only = calls_names
+            .iter()
+            .all(|n| matches!(n.as_str(), "find" | "expand" | "combine" | "project" | "open"));
+        exploring = if navigation_only { exploring + 1 } else { 0 };
+        if exploring >= 12 && exploring % 6 == 0 {
+            if let Some(Part::ToolResult { output, .. }) = results.last_mut() {
+                *output = format!(
+                    "{output}\n[{exploring} steps of reading without changing or running anything. If the evidence already answers the request, answer now; otherwise take the next concrete step.]"
+                );
+            }
         }
         if repeated > 0 {
             // Tell the model inside the results: text beside tool results breaks the

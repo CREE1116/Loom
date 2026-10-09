@@ -1073,8 +1073,8 @@ impl VersionBackend {
 
         // Auto-update session title on first submit if it is "새 대화"
         if let Some(mut stored) = self.get_stored_session(&self.session) {
-            if stored.title == "새 대화" {
-                stored.title = goal.chars().take(45).collect();
+            if stored.title == "새 대화" && !crate::agent::title_of(&goal, 45).is_empty() {
+                stored.title = crate::agent::title_of(&goal, 45);
                 self.save_stored_session(&stored);
                 self.refresh_sessions();
             }
@@ -1179,8 +1179,10 @@ impl VersionBackend {
             if let Some(turn) = &self.turn {
                 stored.turn_tasks.insert(turn.clone(), o.id.clone());
             }
-            if stored.title == "새 대화" || stored.title.starts_with("Loom ") {
-                stored.title = o.goal.chars().take(45).collect();
+            if (stored.title == "새 대화" || stored.title.starts_with("Loom ") || stored.title.trim().is_empty())
+                && !crate::agent::title_of(&o.goal, 45).is_empty()
+            {
+                stored.title = crate::agent::title_of(&o.goal, 45);
             }
             stored.updated_at = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -1942,8 +1944,8 @@ impl AgentBackend for VersionBackend {
         self.settings.attempts = attempts.clamp(1, 5);
     }
     fn update_execution_budget(&mut self, steps: usize, seconds: u64) {
-        self.settings.steps = steps.max(1);
-        self.settings.seconds = seconds.max(1);
+        self.settings.steps = steps;
+        self.settings.seconds = seconds;
     }
 
     fn shutdown(&mut self) -> Result<()> {

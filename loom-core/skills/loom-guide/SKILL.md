@@ -51,7 +51,7 @@ From a shell (`loom` is the installed binary; in the source tree `scripts/loom`)
 
 - A downloaded GGUF is converted to LMX when "받은 GGUF를 LMX로 변환" is on in `/runtime`;
   "변환 후 원본 GGUF 보관" decides whether the GGUF stays. Each model is listed once.
-- LMX v2 files run on Loom's own engine (currently Qwen3.5/3.6 MoE GGUFs); others run
+- LMX v2 files run on Loom's own engine (Qwen3.5/3.6 and LFM2/LFM2.5, dense or MoE); others run
   through the bundled llama.cpp (Metal or CUDA when present) or MLX.
 - Native engine settings are automatic; overrides: `LOOM_LMX_EXPERT_MB`, `LOOM_LMX_CONTEXT`,
   `LOOM_LMX_KV` (`q8_0`, `q4_0`, `f16`), `LOOM_LMX_GPU=0`.

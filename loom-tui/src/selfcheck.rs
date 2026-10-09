@@ -2475,6 +2475,16 @@ fn settings_categories(report: &mut Report) {
     }
     report.check(
         S,
+        "작업 한도 기본값은 제한 없음, 버전 안내 문구 없음",
+        app.preferences.core_steps == 0
+            && app.preferences.core_seconds == 0
+            && canvas.hits.iter().any(|hit| hit.action == Action::Setting("set:core_steps:0".into()))
+            && canvas.hits.iter().any(|hit| hit.action == Action::Setting("set:core_seconds:0".into()))
+            && !text.contains("V4/V5"),
+        "",
+    );
+    report.check(
+        S,
         "악센트 별도 선택 화면",
         app.activate(Action::Setting("page:accent".into()))
             .is_none()
@@ -3389,6 +3399,23 @@ fn native_model_recovery(report: &mut Report) {
 fn escape_stops_active_turn(report: &mut Report) {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+    {
+        // On another screen Escape returns to the conversation; the running work goes on.
+        let mut app = App::new(false);
+        app.apply_event(loaded("main", "Escape"));
+        app.turn = Some("running".into());
+        app.busy = true;
+        app.activate(Action::Command("/model".into()));
+        let opened = app.view != View::Chat;
+        let canvas = app.render(80, 24);
+        let intent = app.key(esc, &canvas);
+        report.check("escape", "다른 화면의 Esc는 대화 화면으로 돌아가고 작업은 계속",
+            opened && intent != Some(Intent::Interrupt) && app.view == View::Chat && app.turn.is_some(),
+            format!("{intent:?} {:?}", app.view));
+        let canvas = app.render(80, 24);
+        report.check("escape", "대화 화면에서 누르는 Esc는 작업 중단",
+            app.key(esc, &canvas) == Some(Intent::Interrupt), "");
+    }
     for obstruction in ["menu", "selection", "approval", "pending submission"] {
         let mut app = App::new(false);
         app.apply_event(loaded("main", "Escape"));
@@ -4686,8 +4713,19 @@ fn lmx_models_are_shown_as_loom_engine(report: &mut Report) {
     let canvas = app.render(100, 30);
     let text = screen_text(&canvas);
     report.check(S, "응답 후에도 LMX 모델 이름 유지 (원본 경로로 바뀌지 않음)",
-        text.contains("LMX · Qwen3.8-35B-A3B") && !text.contains("empero-ai/") && !text.contains("Distill-GGUF"), &text);
+        text.contains("Qwen3.8-35B-A3B") && !text.contains("empero-ai/") && !text.contains("Distill-GGUF"), &text);
     report.dump(S, &canvas);
+    // A narrow window still names the model; LMX is marked by colour, not a prefix.
+    app.apply_event(AgentEvent::global(AgentUpdate::ModelSpeed { tokens_per_second: 15.0 }));
+    app.view = View::Chat;
+    app.panel_open = false;
+    for width in [48u16, 70] {
+        let canvas = app.render(width, 30);
+        let text = screen_text(&canvas);
+        report.check(S, format!("{width}: 좁은 화면에서도 LMX 모델 이름이 색으로 구분되어 보임"),
+            text.contains("Qwen3.8") && !text.contains("LMX ·") && tone_of(&canvas, "Qwen3.8") == Some(Tone::Success), &text);
+        report.dump(S, &canvas);
+    }
 }
 
 fn searchable_model_catalog(report: &mut Report) {

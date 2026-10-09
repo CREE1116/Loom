@@ -59,10 +59,11 @@ and shows the diff; nothing touches your working tree until you approve.
 - Downloaded GGUF files are converted to **LMX**, Loom's single-file model format, by
   default. `/runtime` has two switches: convert after download, and keep the original
   GGUF. Each model appears once in `/model`.
-- Mixture-of-experts models supported by the native engine (currently Qwen3.5/3.6 MoE
-  GGUFs) run on Loom's own engine: only the experts a token uses are loaded, into a
-  memory budget chosen from the machine's RAM and returned to the system under memory
-  pressure. Other models run through llama.cpp (Metal, CUDA or CPU) or MLX.
+- Models the native engine supports run on Loom's own engine: Qwen3.5/3.6 (dense and
+  MoE) and LFM2/LFM2.5 (dense and MoE) GGUFs. For mixture-of-experts models only the
+  experts a token uses are loaded, into a memory budget chosen from the machine's RAM and
+  returned to the system under memory pressure. Other models run through llama.cpp
+  (Metal, CUDA or CPU) or MLX.
 - The prompt prefix shared by every session (system prompt and tool definitions) is
   cached on disk, so a new session's first answer does not recompute it.
 

@@ -294,6 +294,13 @@ impl InputRequest {
     }
 }
 
+/// A conversation title from a request: its first line with text, whitespace collapsed,
+/// so a request pasted after a blank line still names the conversation.
+pub fn title_of(text: &str, chars: usize) -> String {
+    let line = text.lines().find(|l| !l.trim().is_empty()).unwrap_or("");
+    line.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(chars).collect()
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SessionSummary {
     pub id: String,

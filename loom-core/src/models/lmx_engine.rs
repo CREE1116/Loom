@@ -3,11 +3,14 @@
 //! Resident weights are uploaded once; routed experts are paged from the file into a
 //! bounded slot pool as the router picks them; the token embedding stays in the file.
 //!
-//! Supported recipes: recipe 2 `qwen35_moe` (hybrid Gated DeltaNet + gated attention MoE).
+//! Supported recipes: recipe 2 `qwen35` / `qwen35_moe` (hybrid Gated DeltaNet + gated
+//! attention, dense or MoE) and recipe 3 `lfm2` / `lfm2_moe` (short convolution + GQA,
+//! dense or sigmoid-routed MoE with leading dense layers).
 //! Storage must be dense or ggml blocks; affine storage (MLX imports) is not executable here.
 
 use super::lmx_native::{
-    Architecture, Dtype, FeedForward, LinearPart, Manifest, Projection, Role, Storage,
+    Architecture, ConvPart, Dtype, FeedForward, Gating, LinearPart, Manifest, Projection, Role,
+    Storage,
 };
 use super::lmx_native_file::NativeFile;
 use anyhow::{Context, Result, bail, ensure};
@@ -60,7 +63,16 @@ struct RawConfig {
     kv_type: i32,
     kv_rotate: u32,
     pad: u32,
-    linear: *const u8,
+    /// Per layer: 0 gated attention, 1 Gated DeltaNet, 2 attention, 3 short convolution.
+    mixer: *const u8,
+    /// Per layer: 1 = dense FFN, 0 = routed experts.
+    dense: *const u8,
+    /// 0 = softmax router, 1 = sigmoid router (with optional selection bias).
+    gating: u32,
+    normalize_topk: u32,
+    /// 0 = interleaved multi-section RoPE (Qwen3.5), 1 = split-half (NEOX) RoPE.
+    rope_neox: u32,
+    pad2: u32,
 }
 
 #[repr(C)]
@@ -154,6 +166,11 @@ const SHARED_GATE: i32 = 21;
 // 22, 23: shared expert up, down (SHARED_GATE + 1, + 2)
 const SHARED_ROUTER: i32 = 24;
 const EXPERT_GATE: i32 = 25;
+const SC_IN: i32 = 28;
+const SC_CONV: i32 = 29;
+const SC_OUT: i32 = 30;
+const EXPERT_BIAS: i32 = 31;
+const FFN_GATE: i32 = 32;
 
 const MAP_NONE: i32 = 0;
 const MAP_PLUS_ONE: i32 = 1;
@@ -295,14 +312,28 @@ fn kind_of(role: &Role) -> Result<(i32, i32, i32)> {
         Role::Expert { layer, expert, projection } => {
             (mlp(projection, EXPERT_GATE)?, layer as i32, expert as i32)
         }
-        Role::AttentionBias { .. } | Role::FeedForward { .. } => {
+        Role::FeedForward { layer, projection } => (mlp(projection, FFN_GATE)?, layer as i32, -1),
+        Role::ShortConv { layer, part } => (
+            match part {
+                ConvPart::InProj => SC_IN,
+                ConvPart::Conv => SC_CONV,
+                ConvPart::OutProj => SC_OUT,
+            },
+            layer as i32,
+            -1,
+        ),
+        Role::ExpertBias { layer } => (EXPERT_BIAS, layer as i32, -1),
+        Role::AttentionBias { .. } => {
             bail!("{} is not part of a recipe this engine runs yet", role.hf_name())
         }
     })
 }
 
-/// Executed form of a stored value (recipe 2 keeps HF values).
-fn map_of(role: &Role) -> i32 {
+/// Executed form of a stored value (recipe 2 keeps HF values; LFM2 norms are plain).
+fn map_of(architecture: Architecture, role: &Role) -> i32 {
+    if !architecture.is_qwen35() {
+        return MAP_NONE;
+    }
     match role {
         Role::AttentionNorm { .. }
         | Role::FeedForwardNorm { .. }
@@ -312,6 +343,14 @@ fn map_of(role: &Role) -> i32 {
         Role::LinearAttention { part: LinearPart::ALog, .. } => MAP_NEG_EXP,
         _ => MAP_NONE,
     }
+}
+
+/// Architectures the engine executes.
+pub fn runnable(architecture: Architecture) -> bool {
+    matches!(
+        architecture,
+        Architecture::Qwen35 | Architecture::Qwen35Moe | Architecture::Lfm2 | Architecture::Lfm2Moe
+    )
 }
 
 fn describe(m: &Manifest) -> Result<Vec<RawTensor>> {
@@ -338,7 +377,7 @@ fn describe(m: &Manifest) -> Result<Vec<RawTensor>> {
             ne[i] = i64::try_from(*d)?;
         }
         let block = &m.blocks[&buffer.block];
-        let map = map_of(&t.role);
+        let map = map_of(m.model.architecture, &t.role);
         ensure!(
             map == MAP_NONE || matches!(&t.storage, Storage::Dense { values } if values.dtype == Dtype::F32),
             "{name}: expected F32 values"
@@ -382,22 +421,41 @@ impl Engine {
         let file = NativeFile::open(path)?;
         let m = &file.manifest;
         ensure!(
-            m.model.architecture == Architecture::Qwen35Moe,
-            "the native engine runs qwen35_moe for now, not {:?}",
+            runnable(m.model.architecture),
+            "the native engine does not run {:?} yet",
             m.model.architecture
         );
-        let hybrid = m.model.hybrid.as_ref().context("qwen35_moe without hybrid fields")?;
-        let FeedForward::Moe { intermediate, experts, active, normalize_topk } = m.model.feed_forward else {
-            bail!("qwen35_moe without MoE");
-        };
-        ensure!(normalize_topk, "unnormalized top-k routing is not supported");
-        let tensors = describe(m)?;
-        let mut linear = vec![0u8; m.model.layers as usize];
-        for &l in &hybrid.linear_layers {
-            *linear.get_mut(l as usize).context("linear layer out of range")? = 1;
-        }
+        let layers = m.model.layers as usize;
         let a = &m.model.attention;
-        let sections = hybrid.rope_sections.map(|s| s as i32);
+        let (experts, active, expert_ff, normalize_topk) = match m.model.feed_forward {
+            FeedForward::Moe { intermediate, experts, active, normalize_topk } => {
+                (experts, active, intermediate, normalize_topk)
+            }
+            FeedForward::Dense { .. } => (0, 0, 0, true),
+        };
+        let routing = m.model.routing.as_ref();
+        let mut dense = vec![u8::from(experts == 0); layers];
+        if let Some(r) = routing {
+            for d in dense.iter_mut().take(r.dense_layers as usize) {
+                *d = 1;
+            }
+        }
+        let mut mixer = vec![if m.model.architecture.is_lfm2() { 2u8 } else { 0 }; layers];
+        let mut cfg_hybrid = None;
+        if let Some(hybrid) = &m.model.hybrid {
+            for &l in &hybrid.linear_layers {
+                *mixer.get_mut(l as usize).context("linear layer out of range")? = 1;
+            }
+            cfg_hybrid = Some(hybrid);
+        }
+        let mut conv_kernel = cfg_hybrid.map_or(0, |h| h.conv_kernel);
+        if let Some(sc) = &m.model.shortconv {
+            for &l in &sc.conv_layers {
+                *mixer.get_mut(l as usize).context("conv layer out of range")? = 3;
+            }
+            conv_kernel = sc.kernel;
+        }
+        let tensors = describe(m)?;
         let cfg = RawConfig {
             layers: m.model.layers,
             hidden: m.model.hidden,
@@ -405,19 +463,19 @@ impl Engine {
             heads: a.heads,
             kv_heads: a.kv_heads,
             head_dim: a.head_dim,
-            rope_dims: hybrid.rope_dims,
-            rope_sections: sections,
+            rope_dims: cfg_hybrid.map_or(a.head_dim, |h| h.rope_dims),
+            rope_sections: cfg_hybrid.map_or([0; 4], |h| h.rope_sections.map(|s| s as i32)),
             rope_theta: a.rope_theta as f32,
             rms_eps: m.model.rms_epsilon as f32,
             experts,
             active,
-            expert_ff: intermediate,
-            shared_ff: hybrid.shared_intermediate,
-            conv_kernel: hybrid.conv_kernel,
-            key_heads: hybrid.key_heads,
-            value_heads: hybrid.value_heads,
-            key_dim: hybrid.key_dim,
-            value_dim: hybrid.value_dim,
+            expert_ff,
+            shared_ff: cfg_hybrid.map_or(0, |h| h.shared_intermediate),
+            conv_kernel,
+            key_heads: cfg_hybrid.map_or(0, |h| h.key_heads),
+            value_heads: cfg_hybrid.map_or(0, |h| h.value_heads),
+            key_dim: cfg_hybrid.map_or(0, |h| h.key_dim),
+            value_dim: cfg_hybrid.map_or(0, |h| h.value_dim),
             context: if options.context == 0 { 0 } else { options.context.min(m.model.context) },
             chunk: options.chunk.max(1),
             threads: options.threads,
@@ -428,7 +486,12 @@ impl Engine {
             kv_type: ggml_type(&options.kv)?,
             kv_rotate: options.kv_rotate as u32,
             pad: 0,
-            linear: linear.as_ptr(),
+            mixer: mixer.as_ptr(),
+            dense: dense.as_ptr(),
+            gating: u32::from(routing.is_some_and(|r| r.gating == Gating::Sigmoid)),
+            normalize_topk: u32::from(normalize_topk),
+            rope_neox: u32::from(m.model.architecture.is_lfm2()),
+            pad2: 0,
         };
         let vocab = m.model.vocab as usize;
         let eog = m.tokenizer.eog.clone();
@@ -635,6 +698,22 @@ mod tests {
         assert!(ts.iter().any(|t| t.expert >= 0 && t.kind == EXPERT_GATE + 2));
     }
 
+    #[test]
+    fn lfm2_manifest_maps_every_role_to_an_engine_tensor() {
+        let (m, _) = fixtures::manifest_for(fixtures::lfm2_moe_model());
+        let ts = describe(&m).unwrap();
+        assert_eq!(ts.len(), m.tensors.len());
+        let conv = ts.iter().find(|t| t.kind == SC_CONV).unwrap();
+        assert_eq!((conv.layer, conv.ne[0]), (0, 3));
+        // The dense lead layer has a dense FFN, the routed layer a selection bias.
+        assert!(ts.iter().any(|t| t.kind == FFN_GATE && t.layer == 0));
+        assert!(ts.iter().any(|t| t.kind == EXPERT_BIAS && t.layer == 1));
+        assert!(!ts.iter().any(|t| t.expert >= 0 && t.layer == 0));
+        // LFM2 norms are plain RMS norms.
+        assert!(ts.iter().all(|t| t.map == MAP_NONE));
+        assert!(runnable(m.model.architecture));
+    }
+
     /// Greedy decoding on the native engine matches llama.cpp on the GGUF the LMX was
     /// imported from. `LOOM_LMX_ENGINE_PARITY=/path/model.gguf:/path/model.lmx cargo test
     /// --release --lib engine_matches_llama_cpp -- --ignored --nocapture`
@@ -744,11 +823,14 @@ mod tests {
             before.build_ms, before.alloc_ms, before.compute_ms, before.route_ms, before.misses
         );
         let started = Instant::now();
+        let mut greedy = Vec::new();
         for _ in 0..steps {
             let next = logits.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).unwrap().0 as u32;
+            greedy.push(next);
             logits = engine.eval(&[next]).unwrap();
         }
         let decode = started.elapsed();
+        eprintln!("greedy {:?}", &greedy[..greedy.len().min(16)]);
         let s = engine.stats();
         let (h, m) = (s.hits - before.hits, s.misses - before.misses);
         eprintln!(

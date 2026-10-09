@@ -559,7 +559,7 @@ impl App {
             && entry.kind == Kind::User
             && !entry.body.trim().is_empty()
         {
-            self.session_title = one_line(entry.body.lines().next().unwrap_or(""), 55);
+            self.session_title = one_line(&crate::agent::title_of(&entry.body, 200), 55);
         }
         if let Some(turn) = &self.turn {
             self.entry_turns.insert(entry.id.clone(), turn.clone());
@@ -661,8 +661,8 @@ impl App {
 
     fn set_session(&mut self, snapshot: SessionSnapshot) {
         self.thread = Some(snapshot.id);
-        if let Some(title) = snapshot.title {
-            self.session_title = one_line(title.lines().next().unwrap_or(&title), 55);
+        if let Some(title) = snapshot.title.filter(|t| !t.trim().is_empty()) {
+            self.session_title = one_line(&crate::agent::title_of(&title, 200), 55);
         }
         if let Some(status) = &snapshot.status {
             self.status.clone_from(status);

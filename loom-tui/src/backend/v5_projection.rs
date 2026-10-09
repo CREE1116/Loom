@@ -48,6 +48,12 @@ pub fn failure_summary(summary: &str) -> Option<&'static str> {
         Some(("RateLimited", _)) => Some("모델 서버의 요청 제한으로 응답을 받지 못했습니다."),
         Some(("Quota", _)) => Some("모델 사용 한도로 응답을 받지 못했습니다."),
         Some(("BadRequest", _)) => Some("모델이 요청을 받아들이지 못했습니다."),
+        _ if summary == "cancelled or deadline reached" => {
+            Some("작업 시간 한도에 도달해 멈췄습니다. /settings에서 한도를 바꿀 수 있습니다.")
+        }
+        _ if summary.contains("model-call budget exhausted") => {
+            Some("모델 요청 한도에 도달해 멈췄습니다. /settings에서 한도를 바꿀 수 있습니다.")
+        }
         _ => None,
     }
 }
@@ -75,7 +81,15 @@ pub struct Projection {
 impl Projection {
     pub fn observe(&mut self, event: &Event) {
         if event.target == "preparation" {
+            if event.detail["initialized"] == true {
+                self.commentary.push((
+                    self.records.len(),
+                    event.worker.clone(),
+                    "이 폴더는 Git 저장소가 아니어서 변경 추적을 위해 `git init`을 실행했습니다. 파일은 그대로입니다.".into(),
+                ));
+            }
             self.current = match event.detail["phase"].as_str() {
+                Some("repository") => "Git 저장소 준비 중",
                 Some("revision") => "저장소 상태 확인 중",
                 Some("overlay") => "작업 공간 준비 중",
                 Some("index") => "코드 인덱스 확인 중",
@@ -465,6 +479,17 @@ mod tests {
             assert_eq!(entries[0].kind, Kind::Assistant);
             assert_eq!(entries[0].body, label);
         }
+    }
+
+    #[test]
+    fn initializing_a_repository_is_announced_once() {
+        let mut p = Projection::default();
+        p.observe(&Event::new("main", Stage::Direct, "preparation", serde_json::json!({"phase":"repository","initialized":true})));
+        assert_eq!(p.current, "Git 저장소 준비 중");
+        assert_eq!(p.commentary.len(), 1);
+        assert!(p.commentary[0].2.contains("git init"));
+        p.observe(&Event::new("main", Stage::Direct, "preparation", serde_json::json!({"phase":"revision","started":true})));
+        assert_eq!(p.commentary.len(), 1);
     }
 
     #[test]

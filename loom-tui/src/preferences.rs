@@ -134,8 +134,8 @@ impl Default for Preferences {
             startup_screen: StartupScreen::Chat,
             restore_session: true,
             reopen_workspace: false,
-            core_steps: 80,
-            core_seconds: 600,
+            core_steps: 0,
+            core_seconds: 0,
             core_call_seconds: 90,
             core_attempts: 3,
             experimental_explore: true,
@@ -241,7 +241,14 @@ pub fn load(cwd: &Path) -> Result<Preferences> {
     if !path.exists() {
         return Ok(Preferences::default());
     }
-    Ok(serde_json::from_slice(&fs::read(path)?)?)
+    let mut preferences: Preferences = serde_json::from_slice(&fs::read(path)?)?;
+    // 80 requests / 10 minutes were the old defaults rather than a choice; they now
+    // mean no limit.
+    if preferences.core_steps == 80 && preferences.core_seconds == 600 {
+        preferences.core_steps = 0;
+        preferences.core_seconds = 0;
+    }
+    Ok(preferences)
 }
 pub fn save(cwd: &Path, preferences: &Preferences) -> Result<()> {
     let dir = cwd.join(".custom-tui");

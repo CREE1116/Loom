@@ -61,6 +61,29 @@ pub enum Architecture {
     Qwen3Moe,
     /// Recipe 2: Qwen3.5/3.6 MoE, Gated DeltaNet layers between gated full attention.
     Qwen35Moe,
+    /// Recipe 2 with a dense feed-forward network in every layer.
+    Qwen35,
+    /// Recipe 3: LFM2, gated short-convolution layers between GQA attention layers.
+    Lfm2,
+    /// Recipe 3 with MoE feed-forward layers after `routing.dense_layers` dense ones.
+    Lfm2Moe,
+}
+
+impl Architecture {
+    /// Gated DeltaNet hybrids (recipe 2).
+    pub fn is_qwen35(self) -> bool {
+        matches!(self, Self::Qwen35 | Self::Qwen35Moe)
+    }
+    /// Short-convolution hybrids (recipe 3).
+    pub fn is_lfm2(self) -> bool {
+        matches!(self, Self::Lfm2 | Self::Lfm2Moe)
+    }
+    pub fn is_moe(self) -> bool {
+        matches!(self, Self::Qwen3Moe | Self::Qwen35Moe | Self::Lfm2Moe)
+    }
+    pub fn recipe(self) -> u32 {
+        if self.is_qwen35() { 2 } else if self.is_lfm2() { 3 } else { 1 }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -79,6 +102,53 @@ pub struct Model {
     /// Recipe 2 only; absent from recipe 1 files so their identity is unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hybrid: Option<Hybrid>,
+    /// Recipe 3 only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shortconv: Option<ShortConv>,
+    /// MoE routing beyond recipe 1's softmax top-k; absent means softmax, no bias.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub routing: Option<Routing>,
+}
+
+/// Recipe 3 (LFM2). Layers in `conv_layers` replace attention with a gated short
+/// convolution: `in_proj` yields `[b, c, x]`; `y = c · conv(b · x)` with a causal
+/// depthwise kernel of `kernel` taps, then `out_proj`. Other layers use GQA attention with
+/// Q/K RMS norms and split-half (NEOX) RoPE over the whole head. Norms are plain
+/// RMS norms (`x̂·w`); the final norm is HF's `embedding_norm`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ShortConv {
+    pub conv_layers: Vec<u32>,
+    pub kernel: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Gating {
+    Softmax,
+    Sigmoid,
+}
+
+/// How experts are chosen and weighted: probabilities from `gating`; selection adds the
+/// per-expert bias when `expert_bias`; the chosen probabilities are renormalized when the
+/// feed-forward says `normalize_topk`. The first `dense_layers` layers use a dense
+/// feed-forward network of `dense_intermediate`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Routing {
+    pub gating: Gating,
+    pub expert_bias: bool,
+    pub dense_layers: u32,
+    pub dense_intermediate: u32,
+}
+
+/// Short-convolution tensors of one layer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConvPart {
+    InProj,
+    Conv,
+    OutProj,
 }
 
 /// Recipe 2 (Qwen3.5 MoE). Layers listed in `linear_layers` use Gated DeltaNet linear
@@ -209,9 +279,47 @@ pub enum Role {
     SharedExpertGate {
         layer: u32,
     },
+    ShortConv {
+        layer: u32,
+        part: ConvPart,
+    },
+    ExpertBias {
+        layer: u32,
+    },
 }
 
 impl Role {
+    /// The HF name of this role in a model of `architecture`.
+    pub fn name_in(&self, architecture: Architecture) -> String {
+        if !architecture.is_lfm2() {
+            return self.hf_name();
+        }
+        let ffn = |p: Projection| match p {
+            Projection::Gate => "w1",
+            Projection::Up => "w3",
+            _ => "w2",
+        };
+        match self {
+            Self::FinalNorm => "model.embedding_norm.weight".into(),
+            Self::AttentionNorm { layer } => format!("model.layers.{layer}.operator_norm.weight"),
+            Self::FeedForwardNorm { layer } => format!("model.layers.{layer}.ffn_norm.weight"),
+            Self::Attention { layer, projection: Projection::Output } => {
+                format!("model.layers.{layer}.self_attn.out_proj.weight")
+            }
+            Self::QueryNorm { layer } => format!("model.layers.{layer}.self_attn.q_layernorm.weight"),
+            Self::KeyNorm { layer } => format!("model.layers.{layer}.self_attn.k_layernorm.weight"),
+            Self::FeedForward { layer, projection } => {
+                format!("model.layers.{layer}.feed_forward.{}.weight", ffn(*projection))
+            }
+            Self::Router { layer } => format!("model.layers.{layer}.feed_forward.gate.weight"),
+            Self::Expert { layer, expert, projection } => {
+                format!("model.layers.{layer}.feed_forward.experts.{expert}.{}.weight", ffn(*projection))
+            }
+            Self::ExpertBias { layer } => format!("model.layers.{layer}.feed_forward.expert_bias"),
+            _ => self.hf_name(),
+        }
+    }
+
     pub fn hf_name(&self) -> String {
         fn attention(p: Projection) -> &'static str {
             match p {
@@ -281,6 +389,15 @@ impl Role {
             Self::SharedExpertGate { layer } => {
                 format!("model.layers.{layer}.mlp.shared_expert_gate.weight")
             }
+            Self::ShortConv { layer, part } => format!(
+                "model.layers.{layer}.conv.{}.weight",
+                match part {
+                    ConvPart::InProj => "in_proj",
+                    ConvPart::Conv => "conv",
+                    ConvPart::OutProj => "out_proj",
+                }
+            ),
+            Self::ExpertBias { layer } => format!("model.layers.{layer}.mlp.expert_bias"),
         }
     }
 }
@@ -514,9 +631,12 @@ impl Model {
     pub(crate) fn roles(&self) -> Result<BTreeMap<Role, Vec<u64>>> {
         use Projection::*;
         let a = &self.attention;
-        let hybrid_recipe = self.architecture == Architecture::Qwen35Moe;
+        let arch = self.architecture;
         ensure!(
-            (self.recipe_version, self.hybrid.is_some()) == if hybrid_recipe { (2, true) } else { (1, false) },
+            self.recipe_version == arch.recipe()
+                && self.hybrid.is_some() == arch.is_qwen35()
+                && self.shortconv.is_some() == arch.is_lfm2()
+                && (self.routing.is_none() || arch == Architecture::Lfm2Moe),
             "unsupported model recipe"
         );
         ensure!(
@@ -549,6 +669,7 @@ impl Model {
             a.qk_norm == (self.architecture != Architecture::Qwen2),
             "architecture and Q/K normalization disagree"
         );
+        let routing = self.routing.clone();
         let h = u64::from(self.hidden);
         let q = u64::from(a.heads) * u64::from(a.head_dim);
         let kv = u64::from(a.kv_heads) * u64::from(a.head_dim);
@@ -559,10 +680,7 @@ impl Model {
         ]);
         let (intermediate, experts) = match self.feed_forward {
             FeedForward::Dense { intermediate } => {
-                ensure!(
-                    !matches!(self.architecture, Architecture::Qwen3Moe | Architecture::Qwen35Moe),
-                    "MoE recipe requires experts"
-                );
+                ensure!(!arch.is_moe(), "MoE recipe requires experts");
                 (intermediate, None)
             }
             FeedForward::Moe {
@@ -571,12 +689,7 @@ impl Model {
                 active,
                 ..
             } => {
-                ensure!(
-                    matches!(self.architecture, Architecture::Qwen3Moe | Architecture::Qwen35Moe)
-                        && active > 0
-                        && active <= experts,
-                    "invalid MoE routing"
-                );
+                ensure!(arch.is_moe() && active > 0 && active <= experts, "invalid MoE routing");
                 ensure!(
                     u64::from(experts) * u64::from(self.layers) * 3 <= MAX_TENSORS as u64,
                     "too many expert tensors"
@@ -587,10 +700,12 @@ impl Model {
         ensure!(intermediate > 0, "zero intermediate dimension");
         if let Some(hy) = &self.hybrid {
             ensure!(
-                [hy.conv_kernel, hy.key_heads, hy.value_heads, hy.key_dim, hy.value_dim, hy.shared_intermediate]
+                [hy.conv_kernel, hy.key_heads, hy.value_heads, hy.key_dim, hy.value_dim]
                     .iter()
                     .all(|&v| v > 0)
-                    && hy.value_heads % hy.key_heads == 0,
+                    && hy.value_heads % hy.key_heads == 0
+                    // Only MoE models have a shared expert.
+                    && (hy.shared_intermediate > 0) == arch.is_moe(),
                 "invalid linear attention dimensions"
             );
             ensure!(
@@ -601,6 +716,20 @@ impl Model {
                 hy.linear_layers.windows(2).all(|w| w[0] < w[1])
                     && hy.linear_layers.last().is_none_or(|&l| l < self.layers),
                 "linear attention layers must be sorted, unique and in range"
+            );
+        }
+        if let Some(sc) = &self.shortconv {
+            ensure!(sc.kernel >= 2, "invalid short convolution kernel");
+            ensure!(
+                sc.conv_layers.windows(2).all(|w| w[0] < w[1])
+                    && sc.conv_layers.last().is_none_or(|&l| l < self.layers),
+                "convolution layers must be sorted, unique and in range"
+            );
+        }
+        if let Some(r) = &routing {
+            ensure!(
+                r.dense_layers < self.layers && (r.dense_layers == 0 || r.dense_intermediate > 0),
+                "invalid dense lead layers"
             );
         }
         for layer in 0..self.layers {
@@ -637,11 +766,22 @@ impl Model {
                     roles.insert(Role::QueryNorm { layer }, vec![a.head_dim.into()]);
                     roles.insert(Role::KeyNorm { layer }, vec![a.head_dim.into()]);
                 }
-                let si = u64::from(hy.shared_intermediate);
-                for (projection, shape) in [(Gate, vec![si, h]), (Up, vec![si, h]), (Down, vec![h, si])] {
-                    roles.insert(Role::SharedExpert { layer, projection }, shape);
+                if experts.is_some() {
+                    let si = u64::from(hy.shared_intermediate);
+                    for (projection, shape) in [(Gate, vec![si, h]), (Up, vec![si, h]), (Down, vec![h, si])] {
+                        roles.insert(Role::SharedExpert { layer, projection }, shape);
+                    }
+                    roles.insert(Role::SharedExpertGate { layer }, vec![1, h]);
                 }
-                roles.insert(Role::SharedExpertGate { layer }, vec![1, h]);
+            }
+            let conv_layer = self
+                .shortconv
+                .as_ref()
+                .is_some_and(|sc| sc.conv_layers.binary_search(&layer).is_ok());
+            if let Some(sc) = self.shortconv.as_ref().filter(|_| conv_layer) {
+                roles.insert(Role::ShortConv { layer, part: ConvPart::InProj }, vec![3 * h, h]);
+                roles.insert(Role::ShortConv { layer, part: ConvPart::Conv }, vec![h, sc.kernel.into()]);
+                roles.insert(Role::ShortConv { layer, part: ConvPart::OutProj }, vec![h, h]);
             }
             for (projection, shape) in [
                 (Query, vec![q, h]),
@@ -650,19 +790,28 @@ impl Model {
                 (Output, vec![h, q]),
             ]
             .into_iter()
-            .filter(|_| self.hybrid.is_none())
+            .filter(|_| self.hybrid.is_none() && !conv_layer)
             {
                 if a.qkv_bias && projection != Output {
                     roles.insert(Role::AttentionBias { layer, projection }, vec![shape[0]]);
                 }
                 roles.insert(Role::Attention { layer, projection }, shape);
             }
-            if a.qk_norm && self.hybrid.is_none() {
+            if a.qk_norm && self.hybrid.is_none() && !conv_layer {
                 roles.insert(Role::QueryNorm { layer }, vec![a.head_dim.into()]);
                 roles.insert(Role::KeyNorm { layer }, vec![a.head_dim.into()]);
             }
-            if let Some(experts) = experts {
+            let dense_lead = routing.as_ref().filter(|r| layer < r.dense_layers);
+            if let Some(r) = dense_lead {
+                let di = u64::from(r.dense_intermediate);
+                for (projection, shape) in [(Gate, vec![di, h]), (Up, vec![di, h]), (Down, vec![h, di])] {
+                    roles.insert(Role::FeedForward { layer, projection }, shape);
+                }
+            } else if let Some(experts) = experts {
                 roles.insert(Role::Router { layer }, vec![experts.into(), h]);
+                if routing.as_ref().is_some_and(|r| r.expert_bias) {
+                    roles.insert(Role::ExpertBias { layer }, vec![experts.into()]);
+                }
                 for expert in 0..experts {
                     for projection in [Gate, Up, Down] {
                         let shape = if projection == Down {
@@ -750,7 +899,7 @@ impl Manifest {
         let mut references: BTreeMap<&str, Vec<(u64, u64)>> = BTreeMap::new();
         for (name, tensor) in &self.tensors {
             ensure!(
-                *name == tensor.role.hf_name(),
+                *name == tensor.role.name_in(self.model.architecture),
                 "noncanonical HF tensor name: {name}"
             );
             let shape = required
@@ -856,8 +1005,8 @@ impl Manifest {
             required.keys().take(4).collect::<Vec<_>>()
         );
         if self.model.tied_embeddings {
-            let embedding = &self.tensors[&Role::Embedding.hf_name()];
-            let head = &self.tensors[&Role::Head.hf_name()];
+            let embedding = &self.tensors[&Role::Embedding.name_in(self.model.architecture)];
+            let head = &self.tensors[&Role::Head.name_in(self.model.architecture)];
             ensure!(
                 embedding.storage == head.storage,
                 "tied head must share embedding storage"
@@ -1072,6 +1221,8 @@ pub(crate) mod fixtures {
             },
             tied_embeddings: true,
             hybrid: None,
+            shortconv: None,
+            routing: None,
         }
     }
 
@@ -1091,6 +1242,22 @@ pub(crate) mod fixtures {
             rope_dims: 4,
             rope_sections: [1, 1, 0, 0],
             shared_intermediate: 16,
+        });
+        model
+    }
+
+    /// LFM2 MoE: layer 0 dense short convolution, layer 1 routed attention.
+    pub fn lfm2_moe_model() -> Model {
+        let mut model = model(true);
+        model.recipe_version = 3;
+        model.architecture = Architecture::Lfm2Moe;
+        model.layers = 2;
+        model.shortconv = Some(ShortConv { conv_layers: vec![0], kernel: 3 });
+        model.routing = Some(Routing {
+            gating: Gating::Sigmoid,
+            expert_bias: true,
+            dense_layers: 1,
+            dense_intermediate: 48,
         });
         model
     }

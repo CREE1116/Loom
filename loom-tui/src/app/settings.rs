@@ -356,25 +356,17 @@ impl App {
                     &mut rows,
                     l("모델 요청 한도", "Model request limit"),
                     "core_steps",
-                    &[("40", "40"), ("80", "80"), ("160", "160")],
+                    &[("0", l("제한 없음", "None")), ("80", "80"), ("160", "160")],
                 );
                 option(
                     &mut rows,
                     l("작업 시간 한도", "Task time limit"),
                     "core_seconds",
                     &[
-                        ("300", l("5분", "5 min")),
+                        ("0", l("제한 없음", "None")),
                         ("600", l("10분", "10 min")),
                         ("1200", l("20분", "20 min")),
                     ],
-                );
-                hint(
-                    &mut rows,
-                    l(
-                        "V4/V5에서 다음 작업부터 적용 · CLI --max-steps/--max-seconds가 우선",
-                        "Applies to the next V4/V5 task · CLI --max-steps/--max-seconds take priority",
-                    ),
-                    width,
                 );
                 section(&mut rows, l("웹 도구", "Web tools"));
                 rows.push((

@@ -567,6 +567,12 @@ impl Router {
                     h.no_tools = true;
                     return None;
                 }
+                // A local model is not busy or rationed: the same request fails the same
+                // way (a template it cannot render, an unsupported file). Cooling it down
+                // only hides that error behind "unavailable" for ten minutes.
+                if c.cost == CostClass::Local {
+                    return None;
+                }
                 Duration::from_secs(600)
             }
             ErrorKind::Auth => unreachable!(),

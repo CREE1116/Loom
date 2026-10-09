@@ -1228,3 +1228,21 @@ fn invalid_expand_handle_explains_how_to_find_a_set_and_recover() {
     let files = sets.expand(&view, found["set"].as_str().unwrap(), Relation::Files).unwrap();
     assert_eq!(files["count"], 2);
 }
+
+#[test]
+fn a_folder_that_is_not_a_repository_is_initialized_and_answered() {
+    let d = tempfile::tempdir().unwrap();
+    std::fs::write(d.path().join("notes.txt"), "hello\n").unwrap();
+    let mut core = Core::open(d.path()).unwrap();
+    let model = ScriptedModel::new([response(vec![("finish", json!({"summary":"hi"}))])]);
+    let events = std::sync::Mutex::new(Vec::new());
+    let task = core
+        .execute("hi", Intent::Auto, options(), &model, cancel(), &|event| {
+            events.lock().unwrap().push(event.detail.clone())
+        })
+        .unwrap();
+    assert!(d.path().join(".git").exists());
+    assert_eq!(std::fs::read_to_string(d.path().join("notes.txt")).unwrap(), "hello\n");
+    assert!(events.lock().unwrap().iter().any(|e| e["initialized"] == true));
+    assert!(!matches!(task.status, Status::Unresolved), "{}", task.summary);
+}

@@ -9,3 +9,4 @@
 .DS_Store
 loom-core/vendor/
 dist/
+**/.loom/

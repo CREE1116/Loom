@@ -95,9 +95,9 @@ impl Instructions {
         Ok(())
     }
 }
-/// Skills installed for Loom or for other agents: `.agents`, `.codex` and `.claude` skill
-/// directories of the project and of the home directory, and the skills that Claude Code
-/// and Codex plugins ship. Project skills come first and win a name clash; a skill that
+/// Skills installed for Loom or for other agents: `.loom`, `.agents`, `.codex` and `.claude`
+/// skill directories of the project and of the home directory (plus Claude Code and Codex
+/// plugin caches when `LOOM_PLUGIN_SKILLS` is set). Project skills come first and win a name clash; a skill that
 /// cannot be read is skipped rather than hiding every other one.
 /// Skills that ship with Loom, installed into `~/.loom/skills` on first use.
 const BUNDLED: [(&str, &str); 3] = [
@@ -140,8 +140,10 @@ pub fn discover(root: &Path) -> Result<Vec<Skill>> {
             directories.push((base.join(agent).join("skills"), 2));
         }
     }
-    if let Some(home) = &home {
-        // Plugin caches: <cache>/<plugin>/<version>/skills/<skill>/SKILL.md and similar.
+    // Plugin caches hold skills written for another agent's own tools (and every cached
+    // version); they are listed only on request.
+    if let Some(home) = home.as_ref().filter(|_| std::env::var_os("LOOM_PLUGIN_SKILLS").is_some()) {
+        // <cache>/<plugin>/<version>/skills/<skill>/SKILL.md and similar.
         directories.push((home.join(".claude/plugins/cache"), 6));
         directories.push((home.join(".codex/plugins/cache"), 6));
     }
@@ -158,12 +160,8 @@ pub fn discover(root: &Path) -> Result<Vec<Skill>> {
                 continue;
             }
             let Ok(text) = fs::read_to_string(&path) else { continue };
-            let value = |key: &str| {
-                text.lines()
-                    .find_map(|l| l.strip_prefix(key))
-                    .map(|s| s.trim().trim_matches(['\'', '"']).to_owned())
-            };
-            let name = value("name:").unwrap_or_else(|| {
+            let (name, description) = frontmatter(&text);
+            let name = name.unwrap_or_else(|| {
                 path.parent()
                     .and_then(|p| p.file_name())
                     .map(|n| n.to_string_lossy().into_owned())
@@ -172,7 +170,7 @@ pub fn discover(root: &Path) -> Result<Vec<Skill>> {
             if name.is_empty() || !names.insert(name.clone()) {
                 continue;
             }
-            skills.push(Skill { name, description: value("description:").unwrap_or_default(), path });
+            skills.push(Skill { name, description: description.unwrap_or_default(), path });
         }
     }
     skills.sort_by(|a, b| a.name.cmp(&b.name));
@@ -196,7 +194,11 @@ fn find_skills(directory: &Path, depth: usize, out: &mut Vec<PathBuf>) {
             continue;
         }
         let name = entry.file_name();
-        if depth > 1 && !matches!(name.to_str(), Some("node_modules" | ".git" | "target" | "dist" | "build")) {
+        // Hidden folders hold another agent's internals (e.g. Codex's `.system` skills).
+        if name.to_str().is_some_and(|n| n.starts_with('.')) {
+            continue;
+        }
+        if depth > 1 && !matches!(name.to_str(), Some("node_modules" | "target" | "dist" | "build")) {
             find_skills(&path, depth - 1, out);
         }
     }
@@ -224,6 +226,9 @@ pub fn initial(root: &Path, goal: &str, selected: &[PathBuf]) -> Result<String> 
 /// The skills part of the system prompt: installed skills by name (project skills with
 /// their description; global ones only named, since this goes with every model call), and
 /// the full text of skills the user selected or named as `$name` in the request.
+/// Characters of skill descriptions shown per request; the most relevant skills come first.
+const SKILL_LIST_BUDGET: usize = 3500;
+
 pub fn skill_guidance(root: &Path, goal: &str, selected: &[PathBuf], how: &str) -> Result<String> {
     let mut out = String::new();
     let skills = discover(root)?;
@@ -233,26 +238,47 @@ pub fn skill_guidance(root: &Path, goal: &str, selected: &[PathBuf], how: &str) 
             chosen.insert(skill.path.clone());
         }
     }
-    let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
-    let (project, global): (Vec<_>, Vec<_>) =
-        skills.iter().partition(|s| s.path.starts_with(&root));
-    if !project.is_empty() || !global.is_empty() {
-        out.push_str(&format!("\nSkills ({how}):\n"));
-        for skill in project {
-            let mut description: String = skill.description.chars().take(160).collect();
+    if !skills.is_empty() {
+        // A model only reaches for a skill it can recognise as relevant, so every skill
+        // comes with what it is for. Workspace skills and the ones closest to the request
+        // go first; past the budget only names remain.
+        let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+        let words: BTreeSet<String> = goal
+            .split(|c: char| !c.is_alphanumeric())
+            .filter(|w| w.chars().count() > 2)
+            .map(str::to_lowercase)
+            .collect();
+        let score = |s: &Skill| {
+            let text = format!("{} {}", s.name, s.description).to_lowercase();
+            words.iter().filter(|w| text.contains(w.as_str())).count()
+                + if s.path.starts_with(&root) { 100 } else { 0 }
+        };
+        let mut ranked: Vec<&Skill> = skills.iter().collect();
+        ranked.sort_by_key(|s| std::cmp::Reverse(score(s)));
+        out.push_str(&format!(
+            "\nSkills ({how}). Before starting, check this list: when a skill's description fits \
+             the request, call use_skill with its name first and follow it.\n"
+        ));
+        let mut used = 0;
+        let mut rest = Vec::new();
+        for skill in ranked {
+            let mut description: String = skill.description.chars().take(150).collect();
             if description.len() < skill.description.len() {
                 description.push('…');
             }
-            out.push_str(&format!("{}: {description}\n", skill.name));
+            let line = format!("- {}: {description}\n", skill.name);
+            if used + line.len() <= SKILL_LIST_BUDGET {
+                used += line.len();
+                out.push_str(&line);
+            } else {
+                rest.push(skill.name.as_str());
+            }
         }
-        if global.iter().any(|s| s.name == "loom-guide") {
+        if !rest.is_empty() {
+            out.push_str(&format!("- also installed: {}\n", rest.join(", ")));
+        }
+        if skills.iter().any(|s| s.name == "loom-guide") {
             out.push_str("For a question or problem about Loom itself (its files, models, skills, extensions, settings), load loom-guide first.\n");
-        }
-        if !global.is_empty() {
-            out.push_str(&format!(
-                "user skills: {}\n",
-                global.iter().map(|s| s.name.as_str()).collect::<Vec<_>>().join(", ")
-            ));
         }
     }
     for path in chosen {
@@ -260,6 +286,34 @@ pub fn skill_guidance(root: &Path, goal: &str, selected: &[PathBuf], how: &str) 
         out.push('\n');
     }
     Ok(out)
+}
+
+/// `name` and `description` from YAML frontmatter, including folded (`>`) and literal
+/// (`|`) multi-line descriptions.
+fn frontmatter(text: &str) -> (Option<String>, Option<String>) {
+    let mut lines = text.lines();
+    if lines.next().map(str::trim) != Some("---") {
+        // No frontmatter block: fall back to the first matching lines.
+        let find = |key: &str| text.lines().find_map(|l| l.strip_prefix(key)).map(|s| s.trim().trim_matches(['\'', '"']).to_owned());
+        return (find("name:"), find("description:"));
+    }
+    let block: Vec<&str> = lines.take_while(|l| l.trim() != "---").collect();
+    let value = |key: &str| -> Option<String> {
+        let index = block.iter().position(|l| l.starts_with(key))?;
+        let first = block[index][key.len()..].trim();
+        if matches!(first, ">" | "|" | ">-" | "|-" | "") {
+            let joined = block[index + 1..]
+                .iter()
+                .take_while(|l| l.starts_with(' ') || l.starts_with('\t') || l.trim().is_empty())
+                .map(|l| l.trim())
+                .filter(|l| !l.is_empty())
+                .collect::<Vec<_>>()
+                .join(" ");
+            return (!joined.is_empty()).then_some(joined);
+        }
+        Some(first.trim_matches(['\'', '"']).to_owned())
+    };
+    (value("name:"), value("description:"))
 }
 
 #[cfg(test)]
@@ -312,5 +366,17 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+}
+
+#[cfg(test)]
+mod print_guidance {
+    /// `cargo test --lib print_skill_guidance -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn print_skill_guidance() {
+        let root = std::env::current_dir().unwrap();
+        let text = super::skill_guidance(&root, "MCP 서버를 Loom에 붙이고 싶어", &[], "load one with use_skill before following it").unwrap();
+        eprintln!("{} chars\n{text}", text.len());
     }
 }

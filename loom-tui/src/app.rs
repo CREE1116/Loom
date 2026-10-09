@@ -2733,9 +2733,11 @@ impl App {
             return Some(Intent::Quit);
         }
         // Escape takes priority over menus, selections and blocking UI while
-        // a turn is active. Submit can precede assignment of the turn ID.
+        // a turn is active. Submit can precede assignment of the turn ID. On another
+        // screen (models, settings, ...) Escape first returns to the conversation.
         if key.code == KeyCode::Esc
             && !self.readonly
+            && self.view == View::Chat
             && (self.turn.is_some()
                 || self.submitted.is_some()
                 || (self.busy && self.status == "inProgress"))
@@ -2951,7 +2953,7 @@ impl App {
                 if self.editor.anchor.take().is_some() {
                     return None;
                 }
-                if !self.readonly && self.turn.is_some() {
+                if !self.readonly && self.turn.is_some() && self.view == View::Chat {
                     return self.activate(Action::Interrupt);
                 }
                 if self.branch_entry.take().is_some() {
@@ -3222,7 +3224,8 @@ impl App {
         let shown = match &self.resolved_model {
             // An LMX model answers under another of its names (source path, hash); the
             // selection already names it.
-            _ if self.model.starts_with("lmx/") => format!("LMX · {}", self.model_display(&self.model)),
+            // An LMX model is marked by colour (below), leaving the narrow header to its name.
+            _ if self.model.starts_with("lmx/") => self.model_display(&self.model),
             Some((requested, _, served))
                 if requested == &self.model
                     && !served.is_empty()
@@ -3240,11 +3243,17 @@ impl App {
             }
             _ => String::new(),
         };
+        // A narrow header keeps the model's name and drops the speed first.
+        let name_room = usize::from(width / 3).max(14);
+        let speed = if width < 72 && UnicodeWidthStr::width(shown.as_str()) + UnicodeWidthStr::width(speed.as_str()) > name_room {
+            String::new()
+        } else {
+            speed
+        };
         let model_label = if shown.is_empty() {
             self.label("모델 선택").to_string()
         } else {
-            let room = usize::from(width / 3).saturating_sub(UnicodeWidthStr::width(speed.as_str())).max(8);
-            format!("{}{speed}", one_line(&shown, room))
+            format!("{}{speed}", one_line(&shown, name_room.saturating_sub(UnicodeWidthStr::width(speed.as_str())).max(8)))
         };
         let model_width = UnicodeWidthStr::width(model_label.as_str()) + 4;
         let status_phrase = self.status_phrase();
@@ -3299,13 +3308,19 @@ impl App {
         }
         // The model button pads itself; one separator space is enough.
         let model_x = header.text(state_x, 0, " ·", Tone::Muted);
-        let model_end = header.button(
-            model_x,
-            0,
-            &model_label,
-            Action::Command("/model".into()),
-            false,
-        );
+        let model_end = if self.model.starts_with("lmx/") {
+            let end = header.text(model_x, 0, &format!(" {model_label} "), Tone::Success);
+            header.hits.push(crate::engine::Hit {
+                x: model_x,
+                y: 0,
+                width: end.saturating_sub(model_x),
+                height: 1,
+                action: Action::Command("/model".into()),
+            });
+            end
+        } else {
+            header.button(model_x, 0, &model_label, Action::Command("/model".into()), false)
+        };
         header.text(
             model_end,
             0,
@@ -8178,5 +8193,13 @@ mod tests {
         assert_eq!(app.session_title, "새 대화");
         app.upsert(&json!({"id":"user","type":"userMessage","content":[{"text":"Build an agent\nand keep the workspace"}]}));
         assert_eq!(app.session_title, "Build an agent");
+    }
+
+    #[test]
+    fn request_pasted_after_a_blank_line_still_names_the_conversation() {
+        let mut app = App::new(false);
+        app.set_thread(&json!({"id":"new"}));
+        app.upsert(&json!({"id":"user","type":"userMessage","content":[{"text":"\n  \n  Fix   the parser\nmore"}]}));
+        assert_eq!(app.session_title, "Fix the parser");
     }
 }

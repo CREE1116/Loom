@@ -70,6 +70,8 @@ pub fn directory() -> PathBuf {
 }
 
 /// Installed native models that this build can run. Unreadable files are skipped.
+/// Opening a file parses and validates its whole index (tens of thousands of tensors), so
+/// results are cached by path, size and modification time; model lists call this often.
 pub fn installed() -> Vec<NativeModel> {
     if !Engine::available() {
         return Vec::new();
@@ -77,15 +79,32 @@ pub fn installed() -> Vec<NativeModel> {
     let Ok(entries) = std::fs::read_dir(directory()) else {
         return Vec::new();
     };
-    let mut out: Vec<NativeModel> = entries
+    type Key = (PathBuf, u64, std::time::SystemTime);
+    static CACHE: Mutex<Vec<(Key, Option<NativeModel>)>> = Mutex::new(Vec::new());
+    let keys: Vec<Key> = entries
         .flatten()
         .filter(|e| e.path().extension().is_some_and(|x| x == "lmx"))
         .filter_map(|e| {
-            let file = NativeFile::open(&e.path()).ok()?;
-            let runnable = file.manifest.model.architecture == super::lmx_native::Architecture::Qwen35Moe;
-            runnable.then(|| NativeModel { path: e.path(), identity: file.identity.clone(), manifest: file.manifest })
+            let meta = e.metadata().ok()?;
+            Some((e.path(), meta.len(), meta.modified().ok()?))
         })
         .collect();
+    let mut cache = CACHE.lock().unwrap_or_else(|p| p.into_inner());
+    cache.retain(|(key, _)| keys.contains(key));
+    let mut out = Vec::new();
+    for key in keys {
+        if let Some((_, model)) = cache.iter().find(|(k, _)| *k == key) {
+            out.extend(model.clone());
+            continue;
+        }
+        let model = (|| {
+            let file = NativeFile::open(&key.0).ok()?;
+            let runnable = super::lmx_engine::runnable(file.manifest.model.architecture);
+            runnable.then(|| NativeModel { path: key.0.clone(), identity: file.identity.clone(), manifest: file.manifest })
+        })();
+        out.extend(model.clone());
+        cache.push((key, model));
+    }
     out.sort_by_key(NativeModel::id);
     out
 }
@@ -123,7 +142,10 @@ pub fn install_gguf(source: &Path, keep_source: bool, progress: &mut dyn FnMut(u
     use anyhow::Context as _;
     let source = std::fs::canonicalize(source)?;
     let runnable = Engine::available()
-        && super::lmx_native_gguf::architecture_of(&source).as_deref() == Some("qwen35moe");
+        && matches!(
+            super::lmx_native_gguf::architecture_of(&source).as_deref(),
+            Some("qwen35moe" | "qwen35" | "lfm2" | "lfm2moe")
+        );
     let installed = if runnable {
         let dir = directory();
         std::fs::create_dir_all(&dir)?;
@@ -146,6 +168,17 @@ pub fn install_gguf(source: &Path, keep_source: bool, progress: &mut dyn FnMut(u
     }
     std::fs::remove_file(&source).with_context(|| format!("remove {}", source.display()))?;
     Ok(Installed { removed_source: true, ..installed })
+}
+
+/// Deletes an installed native model and its saved prompt prefixes.
+pub fn remove(model: &NativeModel) -> anyhow::Result<()> {
+    use anyhow::Context as _;
+    std::fs::remove_file(&model.path).with_context(|| format!("remove {}", model.path.display()))?;
+    let prefixes = directory().join(".prefix").join(&model.identity[..16.min(model.identity.len())]);
+    if prefixes.exists() {
+        std::fs::remove_dir_all(&prefixes).with_context(|| format!("remove {}", prefixes.display()))?;
+    }
+    Ok(())
 }
 
 pub fn by_name(name: &str) -> Option<NativeModel> {
@@ -509,6 +542,9 @@ pub fn infer(
         }
     }
     let restored_at = started.elapsed();
+    // A local model's time limit is for a stall, not for the whole answer: loading,
+    // each prompt slice and each token are progress, and restart the clock.
+    let mut progress = Instant::now();
     let mut logits = Vec::new();
     // Prefill in engine-sized slices so cancellation and timeouts are honoured; checkpoint
     // at the shared prefix (also saved to disk), the conversation boundary and the end.
@@ -519,8 +555,9 @@ pub fn infer(
             continue;
         }
         for chunk in tokens[at..stop].chunks(slice) {
-            check_limits(request, started)?;
+            check_limits(request, progress)?;
             logits = live.eval(chunk).map_err(transient)?;
+            progress = Instant::now();
         }
         at = stop;
         live.remember().map_err(transient)?;
@@ -555,7 +592,7 @@ pub fn infer(
             last_speed = Instant::now();
             observe(StreamEvent::Speed { tokens: generated as u64, seconds: decode_started.elapsed().as_secs_f64() });
         }
-        check_limits(request, started)?;
+        check_limits(request, progress)?;
         let token = sampler.sample(&logits);
         if t.eog.contains(&token) {
             hit_eog = true;
@@ -569,6 +606,7 @@ pub fn infer(
         }
         generated += 1;
         logits = live.eval(&[token]).map_err(transient)?;
+        progress = Instant::now();
     }
     if generated > 0 {
         observe(StreamEvent::Speed { tokens: generated as u64, seconds: decode_started.elapsed().as_secs_f64() });
@@ -618,6 +656,16 @@ mod tests {
         }
     }
 
+    /// The installed native model the ignored tests use: `LOOM_LMX_NATIVE_MODEL` (a name
+    /// fragment) or the first one.
+    fn test_model() -> NativeModel {
+        let wanted = std::env::var("LOOM_LMX_NATIVE_MODEL").unwrap_or_default();
+        installed()
+            .into_iter()
+            .find(|m| m.display_name().contains(&wanted))
+            .expect("an installed native LMX")
+    }
+
     /// A follow-up request reuses the previous prompt through its checkpoint even though
     /// the template rewrote the previous answer. `LOOM_LMX_NATIVE_CHAT=1 cargo test
     /// --release --lib native_chat_reuses_prompt_prefix -- --ignored --nocapture`
@@ -625,12 +673,12 @@ mod tests {
     #[ignore]
     fn native_chat_reuses_prompt_prefix() {
         std::env::var("LOOM_LMX_NATIVE_CHAT").expect("set LOOM_LMX_NATIVE_CHAT=1");
-        let model = installed().into_iter().next().expect("an installed native LMX");
+        let model = test_model();
         let mut request = Request {
             model: model.id(),
             system: Some("You are a terse assistant.".into()),
             messages: vec![Message::user("Name one prime number greater than 10. Reply with the number only.")],
-            max_output_tokens: Some(16),
+            max_output_tokens: Some(std::env::var("LOOM_LMX_TEST_TOKENS").ok().and_then(|v| v.parse().ok()).unwrap_or(16)),
             temperature: Some(0.0),
             ..Request::default()
         };
@@ -653,7 +701,7 @@ mod tests {
     #[ignore]
     fn first_token_latency() {
         std::env::var("LOOM_LMX_NATIVE_CHAT").expect("set LOOM_LMX_NATIVE_CHAT=1");
-        let model = installed().into_iter().next().expect("an installed native LMX");
+        let model = test_model();
         let rules: String = (0..60)
             .map(|i| format!("Rule {i}: keep edits minimal, explain the change, run the tests that cover file number {i}.\n"))
             .collect();
@@ -688,5 +736,17 @@ mod tests {
             started.elapsed().as_secs_f64(),
             response.usage
         );
+    }
+}
+
+#[cfg(test)]
+mod open_cost {
+    /// `cargo test --release --lib native_open_cost -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn native_open_cost() {
+        let t = std::time::Instant::now();
+        let models = super::installed();
+        eprintln!("installed(): {} models in {:.0} ms", models.len(), t.elapsed().as_secs_f64() * 1e3);
     }
 }

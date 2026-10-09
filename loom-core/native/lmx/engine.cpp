@@ -80,6 +80,13 @@ enum LoomLmxKind : int32_t {
     LOOM_EXPERT_GATE,
     LOOM_EXPERT_UP,
     LOOM_EXPERT_DOWN,
+    LOOM_SC_IN,       // short convolution (LFM2): in_proj [3*hidden, hidden]
+    LOOM_SC_CONV,     // depthwise kernel [hidden, taps]
+    LOOM_SC_OUT,      // out_proj
+    LOOM_EXPERT_BIAS, // selection bias of a sigmoid router [experts]
+    LOOM_FFN_GATE,    // dense FFN
+    LOOM_FFN_UP,
+    LOOM_FFN_DOWN,
     LOOM_KIND_COUNT,
 };
 
@@ -120,7 +127,12 @@ struct LoomLmxConfig {
     int32_t kv_type;        // ggml type of the KV cache (f16, q8_0, q4_0, ...)
     uint32_t kv_rotate;     // 1 = rotate K/V/Q per head before caching (TurboQuant-style)
     uint32_t pad;
-    const uint8_t * linear; // [layers], 1 = Gated DeltaNet layer
+    const uint8_t * mixer;  // [layers], see Mixer
+    const uint8_t * dense;  // [layers], 1 = dense FFN, 0 = routed experts
+    uint32_t gating;        // 0 = softmax router, 1 = sigmoid router (+ selection bias)
+    uint32_t normalize_topk;
+    uint32_t rope_neox;     // 0 = interleaved multi-section RoPE, 1 = split-half RoPE
+    uint32_t pad2;
 };
 
 struct LoomLmxStats {
@@ -266,7 +278,16 @@ private:
     bool stop_ = false;
 };
 
+// Token mixer of a layer.
+enum Mixer : uint8_t {
+    MIX_GATED_ATTENTION = 0, // Qwen3.5: query carries an output gate
+    MIX_DELTANET = 1,        // Qwen3.5 Gated DeltaNet
+    MIX_ATTENTION = 2,       // plain GQA (LFM2)
+    MIX_SHORTCONV = 3,       // LFM2 gated short convolution
+};
+
 constexpr int64_t kNoOwner = -1;
+constexpr size_t kNodes = 16384; // graph capacity
 constexpr uint64_t kMaxSlots = 1024; // experts one mul_mat_id may index
 
 // One slot pool per expert layout (types and shapes of gate/up/down). A layer's experts all
@@ -292,11 +313,15 @@ struct ExpertSource {
 
 struct Layer {
     std::array<ggml_tensor *, LOOM_KIND_COUNT> t{};
-    bool linear = false;
+    uint8_t mixer = MIX_GATED_ATTENTION;
+    bool linear = false;    // Gated DeltaNet
+    bool recurrent = false; // keeps state between tokens (DeltaNet or short convolution)
+    bool attention = false; // keeps KV
+    bool dense = false;     // dense FFN instead of routed experts
     int pool = -1;
     // Recurrent state, double-buffered: a pass reads [cur] and writes [cur ^ 1]; the write
     // is committed (cur flips) only once the pass is known to be valid.
-    ggml_tensor * conv[2] = {}; // [kernel-1, channels]
+    ggml_tensor * conv[2] = {}; // [kernel-1, channels]; short convolution: [kernel-1, hidden]
     ggml_tensor * ssm[2] = {};  // [v_dim, v_dim, v_heads]
     uint8_t cur = 0;
     ggml_tensor * k_cache = nullptr, * v_cache = nullptr;
@@ -347,7 +372,7 @@ uint32_t pad_to(uint32_t x, uint32_t m) { return (x + m - 1) / m * m; }
 
 struct Engine {
     LoomLmxConfig cfg{};
-    std::vector<uint8_t> linear;
+    std::vector<uint8_t> mixer, dense;
     File file;
 
     ggml_backend_t gpu = nullptr, cpu = nullptr;
@@ -385,6 +410,25 @@ struct Engine {
 
     uint32_t position = 0, context = 0, chunk = 0;
     uint64_t tick = 0;
+    ggml_tensor * kv_rows = nullptr; // while building a reusable graph: KV rows to write
+
+    // Whole-model decode graphs kept between tokens, one per recurrent-state parity (the
+    // double buffers swap every token). Each has its own scheduler so its allocation
+    // survives the layer-by-layer passes; rebuilt when the attended KV length grows.
+    struct Cached {
+        std::vector<uint8_t> meta;
+        ggml_context * ctx = nullptr;
+        ggml_cgraph * g = nullptr;
+        ggml_backend_sched_t sched = nullptr;
+        ggml_tensor * embd = nullptr, * pos = nullptr, * mask = nullptr, * rows = nullptr, * out = nullptr;
+        int64_t n_kv = -1;
+        void release() {
+            if (ctx) ggml_free(ctx);
+            if (sched) ggml_backend_sched_free(sched);
+            ctx = nullptr, sched = nullptr, n_kv = -1;
+        }
+    };
+    Cached cached[2];
     uint64_t hits = 0, misses = 0, bytes_read = 0;
 
     std::vector<uint8_t> meta, staging;
@@ -425,6 +469,7 @@ struct Engine {
 
     ~Engine() {
         stop_warmup();
+        for (auto & cg : cached) cg.release();
         try {
             finish_prefetch();
         } catch (...) {
@@ -459,11 +504,16 @@ struct Engine {
                 if (gpu) backend_name = ggml_backend_dev_name(dev);
             }
         }
+        sched = new_sched();
+    }
+
+    ggml_backend_sched_t new_sched() {
         std::vector<ggml_backend_t> list;
         if (gpu) list.push_back(gpu);
         list.push_back(cpu);
-        sched = ggml_backend_sched_new(list.data(), nullptr, int(list.size()), 8192, false, true);
-        if (!sched) throw std::runtime_error("ggml scheduler");
+        ggml_backend_sched_t s = ggml_backend_sched_new(list.data(), nullptr, int(list.size()), kNodes, false, true);
+        if (!s) throw std::runtime_error("ggml scheduler");
+        return s;
     }
 
     // Reads `bytes` at `offset` into `t` at byte `at`, directly when the buffer is host memory.
@@ -485,7 +535,16 @@ struct Engine {
     void load(const LoomLmxTensor * ts, size_t count) {
         const uint32_t L = cfg.layers, E = cfg.experts;
         layers.assign(L, Layer{});
-        for (uint32_t l = 0; l < L; ++l) layers[l].linear = linear[l] != 0;
+        for (uint32_t l = 0; l < L; ++l) {
+            auto & lay = layers[l];
+            lay.mixer = mixer[l];
+            if (lay.mixer > MIX_SHORTCONV) throw std::runtime_error("bad layer mixer");
+            lay.linear = lay.mixer == MIX_DELTANET;
+            lay.recurrent = lay.linear || lay.mixer == MIX_SHORTCONV;
+            lay.attention = !lay.recurrent;
+            lay.dense = dense[l] != 0;
+            if (!lay.dense && E == 0) throw std::runtime_error("routed layer in a model without experts");
+        }
         experts.assign(size_t(L) * E, ExpertSource{});
 
         // Resident tensors.
@@ -550,6 +609,7 @@ struct Engine {
 
         // Expert pools, one per layout.
         for (uint32_t l = 0; l < L; ++l) {
+            if (layers[l].dense) continue;
             auto & lay = layout[l];
             if (!lay[0] || !lay[1] || !lay[2]) throw std::runtime_error("layer without routed experts");
             for (uint32_t e = 0; e < E; ++e)
@@ -588,13 +648,28 @@ struct Engine {
             for (int k : kinds)
                 if (!t[k]) throw std::runtime_error("layer " + std::to_string(l) + " misses tensor kind " + std::to_string(k));
         };
-        need({LOOM_ATTN_NORM, LOOM_POST_NORM, LOOM_ROUTER, LOOM_SHARED_GATE, LOOM_SHARED_UP, LOOM_SHARED_DOWN,
-              LOOM_SHARED_ROUTER});
-        if (layers[l].linear)
+        need({LOOM_ATTN_NORM, LOOM_POST_NORM});
+        if (layers[l].dense)
+            need({LOOM_FFN_GATE, LOOM_FFN_UP, LOOM_FFN_DOWN});
+        else
+            need({LOOM_ROUTER});
+        // The shared expert is optional, but whole.
+        if (t[LOOM_SHARED_GATE] || t[LOOM_SHARED_UP] || t[LOOM_SHARED_DOWN] || t[LOOM_SHARED_ROUTER])
+            need({LOOM_SHARED_GATE, LOOM_SHARED_UP, LOOM_SHARED_DOWN, LOOM_SHARED_ROUTER});
+        if (cfg.gating == 1 && !layers[l].dense) need({LOOM_EXPERT_BIAS});
+        switch (layers[l].mixer) {
+        case MIX_DELTANET:
             need({LOOM_QKV, LOOM_Z, LOOM_BETA, LOOM_ALPHA, LOOM_CONV, LOOM_DT_BIAS, LOOM_A_LOG, LOOM_SSM_NORM,
                   LOOM_SSM_OUT});
-        else
+            break;
+        case MIX_SHORTCONV:
+            need({LOOM_SC_IN, LOOM_SC_CONV, LOOM_SC_OUT});
+            if (t[LOOM_SC_CONV]->ne[0] != cfg.conv_kernel || t[LOOM_SC_IN]->ne[1] != 3 * int64_t(cfg.hidden))
+                throw std::runtime_error("short convolution shapes disagree");
+            break;
+        default:
             need({LOOM_Q, LOOM_K, LOOM_V, LOOM_O, LOOM_Q_NORM, LOOM_K_NORM});
+        }
     }
 
     void allocate_state() {
@@ -616,7 +691,8 @@ struct Engine {
         // serving a subset of its layers.
         std::vector<Pool> banks;
         std::vector<std::vector<uint32_t>> layout_layers(pools.size());
-        for (uint32_t l = 0; l < L; ++l) layout_layers[layers[l].pool].push_back(l);
+        for (uint32_t l = 0; l < L; ++l)
+            if (layers[l].pool >= 0) layout_layers[layers[l].pool].push_back(l);
         for (size_t pi = 0; pi < pools.size(); ++pi) {
             const Pool & p = pools[pi];
             uint64_t share = budget * p.layers / std::max<uint64_t>(total_layers, 1);
@@ -677,6 +753,9 @@ struct Engine {
                     lay.conv[b] = ggml_new_tensor_2d(sctx, GGML_TYPE_F32, cfg.conv_kernel - 1, channels);
                     lay.ssm[b] = ggml_new_tensor_3d(sctx, GGML_TYPE_F32, cfg.value_dim, cfg.value_dim, cfg.value_heads);
                 }
+            } else if (lay.mixer == MIX_SHORTCONV) {
+                for (int b = 0; b < 2; ++b)
+                    lay.conv[b] = ggml_new_tensor_2d(sctx, GGML_TYPE_F32, cfg.conv_kernel - 1, cfg.hidden);
             } else {
                 lay.k_cache = ggml_new_tensor_3d(sctx, ggml_type(cfg.kv_type), cfg.head_dim, cfg.kv_heads, context);
                 lay.v_cache = ggml_new_tensor_3d(sctx, ggml_type(cfg.kv_type), cfg.head_dim, cfg.kv_heads, context);
@@ -684,14 +763,16 @@ struct Engine {
         }
         act_x = ggml_new_tensor_2d(sctx, GGML_TYPE_F32, cfg.hidden, chunk);
         act_in = ggml_new_tensor_2d(sctx, GGML_TYPE_F32, cfg.hidden, chunk);
-        act_w = ggml_new_tensor_3d(sctx, GGML_TYPE_F32, 1, K, chunk);
-        act_ids = ggml_new_tensor_2d(sctx, GGML_TYPE_I32, K, chunk);
+        // Dense models route nothing; the routing tensors keep one element per row.
+        const int64_t Kr = std::max<int64_t>(K, 1), Er = std::max<int64_t>(E, 1);
+        act_w = ggml_new_tensor_3d(sctx, GGML_TYPE_F32, 1, Kr, chunk);
+        act_ids = ggml_new_tensor_2d(sctx, GGML_TYPE_I32, Kr, chunk);
         // Speculative decoding of one token through every layer (see forward_whole).
-        spec_map = ggml_new_tensor_2d(sctx, GGML_TYPE_I32, E, L);
+        spec_map = ggml_new_tensor_2d(sctx, GGML_TYPE_I32, Er, L);
         spec_x1 = ggml_new_tensor_2d(sctx, GGML_TYPE_F32, cfg.hidden, L);
         spec_in = ggml_new_tensor_2d(sctx, GGML_TYPE_F32, cfg.hidden, L);
-        spec_w = ggml_new_tensor_2d(sctx, GGML_TYPE_F32, K, L);
-        spec_ids = ggml_new_tensor_2d(sctx, GGML_TYPE_I32, K, L);
+        spec_w = ggml_new_tensor_2d(sctx, GGML_TYPE_F32, Kr, L);
+        spec_ids = ggml_new_tensor_2d(sctx, GGML_TYPE_I32, Kr, L);
         sbuf = ggml_backend_alloc_ctx_tensors(sctx, main_backend());
         if (!sbuf) throw std::runtime_error("allocate state");
         reset();
@@ -702,7 +783,8 @@ struct Engine {
         const uint32_t E = cfg.experts;
         if (pools.empty() || !slots_host) return;
         std::vector<std::vector<uint32_t>> members(pools.size());
-        for (uint32_t l = 0; l < cfg.layers; ++l) members[layers[l].pool].push_back(l);
+        for (uint32_t l = 0; l < cfg.layers; ++l)
+            if (layers[l].pool >= 0) members[layers[l].pool].push_back(l);
         for (uint32_t pi = 0; pi < pools.size(); ++pi) {
             auto & p = pools[pi];
             // Even coverage: expert-major over the bank's layers until the slots run out.
@@ -920,7 +1002,7 @@ struct Engine {
         uint64_t total = 0, available = 0;
         system_memory(total, available);
         uint64_t full = 0;
-        for (auto & lay : layers) full += lay.linear ? 0 : 1;
+        for (auto & lay : layers) full += lay.attention ? 1 : 0;
         uint64_t per_position = 2 * full * ggml_row_size(ggml_type(cfg.kv_type), int64_t(cfg.head_dim) * cfg.kv_heads);
         uint64_t kv_budget = std::clamp<uint64_t>(total / 32, 256ull << 20, 4ull << 30);
         uint64_t positions = per_position ? kv_budget / per_position : cfg.train_context;
@@ -947,7 +1029,7 @@ struct Engine {
         for (auto & p : pools) all += slot_bytes(p) * cfg.experts * p.layers;
         const uint64_t hd = cfg.head_dim, kvh = cfg.kv_heads;
         uint64_t full = 0;
-        for (auto & lay : layers) full += lay.linear ? 0 : 1;
+        for (auto & lay : layers) full += lay.attention ? 1 : 0;
         uint64_t kv = 2 * full * ggml_row_size(ggml_type(cfg.kv_type), int64_t(hd * kvh)) * context;
         uint64_t workspace = GiB / 2 + uint64_t(std::max(1u, cfg.chunk)) * cfg.hidden * 64;
         uint64_t resident = wbuf ? ggml_backend_buffer_get_size(wbuf) : 0;
@@ -1045,31 +1127,54 @@ struct Engine {
         auto & t = lay.t;
         const int64_t hd = cfg.head_dim, H = cfg.heads, KV = cfg.kv_heads;
 
-        ggml_tensor * qg = ggml_mul_mat(c, t[LOOM_Q], x); // [2*hd*H, n]: per head [query, gate]
-        const size_t es = ggml_element_size(qg);
-        ggml_tensor * q = ggml_view_3d(c, qg, hd, H, n, es * hd * 2, es * hd * 2 * H, 0);
+        const bool gated = lay.mixer == MIX_GATED_ATTENTION;
+        ggml_tensor * q, * gate = nullptr;
+        if (gated) {
+            ggml_tensor * qg = ggml_mul_mat(c, t[LOOM_Q], x); // [2*hd*H, n]: per head [query, gate]
+            const size_t es = ggml_element_size(qg);
+            q = ggml_view_3d(c, qg, hd, H, n, es * hd * 2, es * hd * 2 * H, 0);
+            gate = ggml_view_3d(c, qg, hd, H, n, es * hd * 2, es * hd * 2 * H, es * hd);
+            gate = ggml_cont_2d(c, gate, hd * H, n);
+        } else {
+            q = ggml_reshape_3d(c, ggml_mul_mat(c, t[LOOM_Q], x), hd, H, n);
+        }
         q = norm(c, q, t[LOOM_Q_NORM]);
-        ggml_tensor * gate = ggml_view_3d(c, qg, hd, H, n, es * hd * 2, es * hd * 2 * H, es * hd);
-        gate = ggml_cont_2d(c, gate, hd * H, n);
 
         ggml_tensor * k = ggml_reshape_3d(c, ggml_mul_mat(c, t[LOOM_K], x), hd, KV, n);
         k = norm(c, k, t[LOOM_K_NORM]);
         ggml_tensor * v = ggml_reshape_3d(c, ggml_mul_mat(c, t[LOOM_V], x), hd, KV, n);
 
-        int sections[4] = {cfg.rope_sections[0], cfg.rope_sections[1], cfg.rope_sections[2], cfg.rope_sections[3]};
-        q = ggml_rope_multi(c, q, pos, nullptr, int(cfg.rope_dims), sections, GGML_ROPE_TYPE_IMROPE,
-                            int(cfg.train_context), cfg.rope_theta, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f);
-        k = ggml_rope_multi(c, k, pos, nullptr, int(cfg.rope_dims), sections, GGML_ROPE_TYPE_IMROPE,
-                            int(cfg.train_context), cfg.rope_theta, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f);
+        if (cfg.rope_neox) {
+            // Positions are the first n of the multi-section layout.
+            ggml_tensor * p1 = ggml_view_1d(c, pos, n, 0);
+            q = ggml_rope_ext(c, q, p1, nullptr, int(cfg.rope_dims), GGML_ROPE_TYPE_NEOX, int(cfg.train_context),
+                              cfg.rope_theta, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f);
+            k = ggml_rope_ext(c, k, p1, nullptr, int(cfg.rope_dims), GGML_ROPE_TYPE_NEOX, int(cfg.train_context),
+                              cfg.rope_theta, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f);
+        } else {
+            int sections[4] = {cfg.rope_sections[0], cfg.rope_sections[1], cfg.rope_sections[2], cfg.rope_sections[3]};
+            q = ggml_rope_multi(c, q, pos, nullptr, int(cfg.rope_dims), sections, GGML_ROPE_TYPE_IMROPE,
+                                int(cfg.train_context), cfg.rope_theta, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f);
+            k = ggml_rope_multi(c, k, pos, nullptr, int(cfg.rope_dims), sections, GGML_ROPE_TYPE_IMROPE,
+                                int(cfg.train_context), cfg.rope_theta, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f);
+        }
 
         q = rotate(c, rot, q);
         k = rotate(c, rot, k);
         v = rotate(c, rot, v);
         ggml_tensor * kc = lay.k_cache, * vc = lay.v_cache;
-        ggml_build_forward_expand(
-            g, ggml_cpy(c, k, ggml_view_3d(c, kc, hd, KV, n, kc->nb[1], kc->nb[2], kc->nb[2] * position)));
-        ggml_build_forward_expand(
-            g, ggml_cpy(c, v, ggml_view_3d(c, vc, hd, KV, n, vc->nb[1], vc->nb[2], vc->nb[2] * position)));
+        if (kv_rows) {
+            // Rows from an input tensor, so the graph does not depend on the position.
+            ggml_build_forward_expand(g, ggml_set_rows(c, ggml_reshape_2d(c, kc, hd * KV, context),
+                                                       ggml_reshape_2d(c, k, hd * KV, n), kv_rows));
+            ggml_build_forward_expand(g, ggml_set_rows(c, ggml_reshape_2d(c, vc, hd * KV, context),
+                                                       ggml_reshape_2d(c, v, hd * KV, n), kv_rows));
+        } else {
+            ggml_build_forward_expand(
+                g, ggml_cpy(c, k, ggml_view_3d(c, kc, hd, KV, n, kc->nb[1], kc->nb[2], kc->nb[2] * position)));
+            ggml_build_forward_expand(
+                g, ggml_cpy(c, v, ggml_view_3d(c, vc, hd, KV, n, vc->nb[1], vc->nb[2], vc->nb[2] * position)));
+        }
 
         ggml_tensor * kv_k = ggml_permute(c, ggml_view_3d(c, kc, hd, KV, n_kv, kc->nb[1], kc->nb[2], 0), 0, 2, 1, 3);
         ggml_tensor * kv_v = ggml_permute(c, ggml_view_3d(c, vc, hd, KV, n_kv, vc->nb[1], vc->nb[2], 0), 0, 2, 1, 3);
@@ -1078,8 +1183,61 @@ struct Engine {
         ggml_prec_set_acc(a, GGML_PREC_F32);
         a = rotate(c, rot_t, ggml_reshape_3d(c, a, hd, H, n));
         a = ggml_reshape_2d(c, a, hd * H, n);
-        a = ggml_mul(c, a, ggml_sigmoid(c, gate));
+        if (gate) a = ggml_mul(c, a, ggml_sigmoid(c, gate));
         return ggml_mul_mat(c, t[LOOM_O], a);
+    }
+
+    // LFM2 gated short convolution: in_proj gives [b, c, x]; y = c * conv(b * x) with a
+    // causal depthwise kernel over the last taps-1 inputs plus this chunk; then out_proj.
+    ggml_tensor * short_conv(ggml_context * c, ggml_cgraph * g, uint32_t l, ggml_tensor * x, int64_t n) {
+        auto & lay = layers[l];
+        auto & t = lay.t;
+        const int64_t D = cfg.hidden, taps = cfg.conv_kernel;
+        ggml_tensor * bcx = ggml_mul_mat(c, t[LOOM_SC_IN], x); // [3D, n]
+        const size_t es = ggml_element_size(bcx);
+        auto part = [&](int i) { return ggml_view_3d(c, bcx, D, n, 1, bcx->nb[1], bcx->nb[1] * n, size_t(i) * D * es); };
+        ggml_tensor * bx = ggml_transpose(c, ggml_mul(c, part(0), part(2))); // [n, D, 1]
+        ggml_tensor * state = ggml_reshape_3d(c, lay.conv[lay.cur], taps - 1, D, 1);
+        ggml_tensor * next = ggml_reshape_3d(c, lay.conv[lay.cur ^ 1], taps - 1, D, 1);
+        ggml_tensor * in = ggml_concat(c, state, bx, 0); // [taps-1+n, D, 1]
+        ggml_tensor * last = ggml_view_3d(c, in, taps - 1, D, 1, in->nb[1], in->nb[2], ggml_row_size(in->type, n));
+        ggml_build_forward_expand(g, ggml_cpy(c, last, next));
+        ggml_tensor * conv = ggml_ssm_conv(c, in, t[LOOM_SC_CONV]); // [D, n, 1]
+        ggml_tensor * y = ggml_reshape_2d(c, ggml_mul(c, part(1), conv), D, n);
+        return ggml_mul_mat(c, t[LOOM_SC_OUT], y);
+    }
+
+    ggml_tensor * mix(ggml_context * c, ggml_cgraph * g, uint32_t l, ggml_tensor * x, int64_t n, ggml_tensor * pos,
+                      ggml_tensor * mask, int64_t n_kv) {
+        switch (layers[l].mixer) {
+        case MIX_DELTANET: return linear_attention(c, g, l, x, n);
+        case MIX_SHORTCONV: return short_conv(c, g, l, x, n);
+        default: return full_attention(c, g, l, x, n, pos, mask, n_kv);
+        }
+    }
+
+    // A dense layer whole: mixer, then the dense FFN; returns the residual stream after it.
+    ggml_tensor * dense_layer(ggml_context * c, ggml_cgraph * g, uint32_t l, ggml_tensor * x, int64_t n,
+                              ggml_tensor * pos, ggml_tensor * mask, int64_t n_kv) {
+        auto & t = layers[l].t;
+        ggml_tensor * x1 = ggml_add(c, mix(c, g, l, norm(c, x, t[LOOM_ATTN_NORM]), n, pos, mask, n_kv), x);
+        ggml_tensor * in = norm(c, x1, t[LOOM_POST_NORM]);
+        ggml_tensor * gate = ggml_mul_mat(c, t[LOOM_FFN_GATE], in);
+        ggml_tensor * up = ggml_mul_mat(c, t[LOOM_FFN_UP], in);
+        return ggml_add(c, ggml_mul_mat(c, t[LOOM_FFN_DOWN], ggml_swiglu_split(c, gate, up)), x1);
+    }
+
+    // Router scores: what top-k selects on, and what the chosen experts are weighted by.
+    std::pair<ggml_tensor *, ggml_tensor *> router(ggml_context * c, uint32_t l, ggml_tensor * in) {
+        auto & t = layers[l].t;
+        ggml_tensor * logits = ggml_mul_mat(c, t[LOOM_ROUTER], in); // [E, n]
+        if (cfg.gating == 1) {
+            ggml_tensor * probs = ggml_sigmoid(c, logits);
+            ggml_tensor * select = t[LOOM_EXPERT_BIAS] ? ggml_add(c, probs, t[LOOM_EXPERT_BIAS]) : probs;
+            return {select, probs};
+        }
+        ggml_tensor * probs = ggml_soft_max(c, logits);
+        return {probs, probs};
     }
 
     struct Routed {
@@ -1093,18 +1251,19 @@ struct Engine {
     Routed attend_route(ggml_context * c, ggml_cgraph * g, uint32_t l, ggml_tensor * x, int64_t n, ggml_tensor * pos,
                         ggml_tensor * mask, int64_t n_kv) {
         auto & t = layers[l].t;
-        ggml_tensor * h = norm(c, x, t[LOOM_ATTN_NORM]);
-        h = layers[l].linear ? linear_attention(c, g, l, h, n) : full_attention(c, g, l, h, n, pos, mask, n_kv);
+        ggml_tensor * h = mix(c, g, l, norm(c, x, t[LOOM_ATTN_NORM]), n, pos, mask, n_kv);
         ggml_tensor * x1 = ggml_add(c, h, x);
         ggml_tensor * in = norm(c, x1, t[LOOM_POST_NORM]);
 
         const int64_t E = cfg.experts, K = cfg.active;
-        ggml_tensor * probs = ggml_soft_max(c, ggml_mul_mat(c, t[LOOM_ROUTER], in)); // [E, n]
-        ggml_tensor * ids = ggml_argsort_top_k(c, probs, int(K));                     // [K, n]
-        ggml_tensor * w = ggml_get_rows(c, ggml_reshape_3d(c, probs, 1, E, n), ids);  // [1, K, n]
-        w = ggml_reshape_2d(c, w, K, n);
-        w = ggml_div(c, w, ggml_clamp(c, ggml_sum_rows(c, w), 6.103515625e-5f, INFINITY));
-        w = ggml_reshape_3d(c, w, 1, K, n);
+        auto [select, probs] = router(c, l, in);                                     // [E, n]
+        ggml_tensor * ids = ggml_argsort_top_k(c, select, int(K));                   // [K, n]
+        ggml_tensor * w = ggml_get_rows(c, ggml_reshape_3d(c, probs, 1, E, n), ids); // [1, K, n]
+        if (cfg.normalize_topk) {
+            w = ggml_reshape_2d(c, w, K, n);
+            w = ggml_div(c, w, ggml_clamp(c, ggml_sum_rows(c, w), 6.103515625e-5f, INFINITY));
+            w = ggml_reshape_3d(c, w, 1, K, n);
+        }
         // argsort_top_k is a strided view; keep a packed copy.
         return {x1, in, ggml_cont(c, ids), w};
     }
@@ -1122,7 +1281,7 @@ struct Engine {
         // The next layer's router on this layer's FFN input predicts the experts it will
         // pick; the residual stream changes little between adjacent layers.
         if (predicted) {
-            ggml_tensor * next = ggml_mul_mat(c, layers[l + 1].t[LOOM_ROUTER], in);
+            ggml_tensor * next = router(c, l + 1, in).first;
             *predicted = ggml_cont(c, ggml_argsort_top_k(c, next, int(std::min<uint32_t>(cfg.prefetch, cfg.experts))));
             ggml_set_output(*predicted);
             ggml_build_forward_expand(g, *predicted);
@@ -1159,6 +1318,7 @@ struct Engine {
             moe = moe ? ggml_add(c, moe, yi) : yi;
         }
 
+        if (!t[LOOM_SHARED_GATE]) return ggml_add(c, moe, x1);
         ggml_tensor * sg = ggml_mul_mat(c, t[LOOM_SHARED_GATE], in);
         ggml_tensor * su = ggml_mul_mat(c, t[LOOM_SHARED_UP], in);
         ggml_tensor * shared = ggml_mul_mat(c, t[LOOM_SHARED_DOWN], ggml_swiglu_split(c, sg, su));
@@ -1178,7 +1338,7 @@ struct Engine {
     };
 
     void begin(Graph & gr) {
-        constexpr size_t nodes = 8192;
+        constexpr size_t nodes = kNodes;
         meta.resize(ggml_tensor_overhead() * nodes + ggml_graph_overhead_custom(nodes, false));
         ggml_init_params ip{meta.size(), meta.data(), true};
         gr.ctx = ggml_init(ip);
@@ -1369,6 +1529,58 @@ struct Engine {
     // weights), so the missing experts are loaded and the pass resumes at that layer's FFN.
     // Recurrent state is double-buffered and committed only for verified layers; KV rows
     // past the verified layer are simply rewritten.
+    struct Whole {
+        ggml_tensor * embd = nullptr, * pos = nullptr, * mask = nullptr, * rows = nullptr, * out = nullptr;
+    };
+
+    // The whole-model graph for one token from layer `start` (after the FFN of start-1
+    // when resuming). With `reusable`, KV rows come from an input instead of the position.
+    Whole build_whole(ggml_context * c, ggml_cgraph * g, uint32_t start, bool resume, int64_t n_kv, bool reusable) {
+        const uint32_t L = cfg.layers, E = cfg.experts, K = cfg.active;
+        Whole in;
+        ggml_tensor * x;
+        if (!resume) {
+            in.embd = ggml_new_tensor_2d(c, GGML_TYPE_F32, cfg.hidden, 1);
+            ggml_set_input(in.embd);
+            x = in.embd;
+        } else {
+            const uint32_t m = start - 1;
+            x = ffn(c, m, 1, ggml_view_2d(c, spec_in, cfg.hidden, 1, spec_in->nb[1], m * spec_in->nb[1]),
+                    ggml_view_2d(c, spec_x1, cfg.hidden, 1, spec_x1->nb[1], m * spec_x1->nb[1]),
+                    ggml_view_3d(c, spec_w, 1, K, 1, sizeof(float), spec_w->nb[1], m * spec_w->nb[1]),
+                    ggml_view_2d(c, act_ids, K, 1, act_ids->nb[1], 0));
+        }
+        in.pos = ggml_new_tensor_1d(c, GGML_TYPE_I32, 4);
+        in.mask = ggml_new_tensor_2d(c, GGML_TYPE_F16, n_kv, 1);
+        ggml_set_input(in.pos);
+        ggml_set_input(in.mask);
+        if (reusable) {
+            in.rows = ggml_new_tensor_1d(c, GGML_TYPE_I64, 1);
+            ggml_set_input(in.rows);
+            kv_rows = in.rows;
+        }
+        for (uint32_t l = start; l < L; ++l) {
+            if (layers[l].dense) {
+                x = dense_layer(c, g, l, x, 1, in.pos, in.mask, n_kv);
+                continue;
+            }
+            auto r = attend_route(c, g, l, x, 1, in.pos, in.mask, n_kv);
+            auto col = [&](ggml_tensor * t) { return ggml_view_2d(c, t, t->ne[0], 1, t->nb[1], l * t->nb[1]); };
+            ggml_build_forward_expand(g, ggml_cpy(c, r.x1, col(spec_x1)));
+            ggml_build_forward_expand(g, ggml_cpy(c, r.in, col(spec_in)));
+            ggml_build_forward_expand(g, ggml_cpy(c, ggml_reshape_2d(c, r.w, K, 1), col(spec_w)));
+            ggml_build_forward_expand(g, ggml_cpy(c, r.ids, col(spec_ids)));
+            ggml_tensor * table = ggml_view_2d(c, spec_map, 1, E, sizeof(int32_t), l * spec_map->nb[1]);
+            ggml_tensor * slots = ggml_reshape_2d(c, ggml_get_rows(c, table, r.ids), K, 1);
+            x = ffn(c, l, 1, r.in, r.x1, r.w, slots);
+        }
+        kv_rows = nullptr;
+        in.out = ggml_mul_mat(c, output, norm(c, x, output_norm));
+        ggml_set_output(in.out);
+        ggml_build_forward_expand(g, in.out);
+        return in;
+    }
+
     void forward_whole(int32_t token, float * logits) {
         const uint32_t L = cfg.layers, E = cfg.experts, K = cfg.active;
         finish_prefetch();
@@ -1386,61 +1598,77 @@ struct Engine {
         ++spec_tokens;
         for (;;) {
             for (uint32_t l = 0; l < L; ++l) {
+                if (layers[l].dense) continue;
                 const auto & p = pools[layers[l].pool];
                 for (uint32_t e = 0; e < E; ++e) {
                     auto it = p.where.find(int64_t(l) * E + e);
                     map[size_t(l) * E + e] = it != p.where.end() && usable(p, it->second) ? int32_t(it->second) : 0;
                 }
             }
-            ggml_backend_tensor_set(spec_map, map.data(), 0, map.size() * sizeof(int32_t));
+            if (!map.empty()) ggml_backend_tensor_set(spec_map, map.data(), 0, map.size() * sizeof(int32_t));
 
+            auto t0 = std::chrono::steady_clock::now();
+            auto lap = [&t0] {
+                auto now = std::chrono::steady_clock::now();
+                double d = std::chrono::duration<double, std::micro>(now - t0).count();
+                t0 = now;
+                return d;
+            };
             Graph gr;
-            begin(gr);
-            ggml_context * c = gr.ctx;
-            ggml_tensor * in_embd = nullptr, * x;
-            if (!resume) {
-                in_embd = ggml_new_tensor_2d(c, GGML_TYPE_F32, cfg.hidden, 1);
-                ggml_set_input(in_embd);
-                x = in_embd;
+            Whole in;
+            Cached * cg = nullptr;
+            const uint8_t parity = layers[0].cur;
+            bool uniform = true;
+            for (auto & lay : layers) uniform = uniform && lay.cur == parity;
+            if (!resume && uniform) {
+                cg = &cached[parity];
+                if (cg->n_kv != n_kv) {
+                    if (cg->ctx) ggml_free(cg->ctx);
+                    cg->meta.resize(ggml_tensor_overhead() * kNodes + ggml_graph_overhead_custom(kNodes, false));
+                    ggml_init_params ip{cg->meta.size(), cg->meta.data(), true};
+                    cg->ctx = ggml_init(ip);
+                    cg->g = ggml_new_graph_custom(cg->ctx, kNodes, false);
+                    Whole w = build_whole(cg->ctx, cg->g, 0, false, n_kv, true);
+                    cg->embd = w.embd, cg->pos = w.pos, cg->mask = w.mask, cg->rows = w.rows, cg->out = w.out;
+                    if (!cg->sched) cg->sched = new_sched();
+                    ggml_backend_sched_reset(cg->sched);
+                    if (!ggml_backend_sched_alloc_graph(cg->sched, cg->g)) throw std::runtime_error("allocate graph");
+                    cg->n_kv = n_kv;
+                }
+                in = {cg->embd, cg->pos, cg->mask, cg->rows, cg->out};
+                prof[0] += lap();
             } else {
-                const uint32_t m = start - 1;
-                x = ffn(c, m, 1, ggml_view_2d(c, spec_in, cfg.hidden, 1, spec_in->nb[1], m * spec_in->nb[1]),
-                        ggml_view_2d(c, spec_x1, cfg.hidden, 1, spec_x1->nb[1], m * spec_x1->nb[1]),
-                        ggml_view_3d(c, spec_w, 1, K, 1, sizeof(float), spec_w->nb[1], m * spec_w->nb[1]),
-                        ggml_view_2d(c, act_ids, K, 1, act_ids->nb[1], 0));
+                begin(gr);
+                in = build_whole(gr.ctx, gr.g, start, resume, n_kv, false);
+                prof[0] += lap();
+                ggml_backend_sched_reset(sched);
+                if (!ggml_backend_sched_alloc_graph(sched, gr.g)) throw std::runtime_error("allocate graph");
             }
-            ggml_tensor * in_pos = ggml_new_tensor_1d(c, GGML_TYPE_I32, 4);
-            ggml_tensor * in_mask = ggml_new_tensor_2d(c, GGML_TYPE_F16, n_kv, 1);
-            ggml_set_input(in_pos);
-            ggml_set_input(in_mask);
-            for (uint32_t l = start; l < L; ++l) {
-                auto r = attend_route(c, gr.g, l, x, 1, in_pos, in_mask, n_kv);
-                auto col = [&](ggml_tensor * t) { return ggml_view_2d(c, t, t->ne[0], 1, t->nb[1], l * t->nb[1]); };
-                ggml_build_forward_expand(gr.g, ggml_cpy(c, r.x1, col(spec_x1)));
-                ggml_build_forward_expand(gr.g, ggml_cpy(c, r.in, col(spec_in)));
-                ggml_build_forward_expand(gr.g, ggml_cpy(c, ggml_reshape_2d(c, r.w, K, 1), col(spec_w)));
-                ggml_build_forward_expand(gr.g, ggml_cpy(c, r.ids, col(spec_ids)));
-                ggml_tensor * table = ggml_view_2d(c, spec_map, 1, E, sizeof(int32_t), l * spec_map->nb[1]);
-                ggml_tensor * slots = ggml_reshape_2d(c, ggml_get_rows(c, table, r.ids), K, 1);
-                x = ffn(c, l, 1, r.in, r.x1, r.w, slots);
-            }
-            ggml_tensor * out = ggml_mul_mat(c, output, norm(c, x, output_norm));
-            ggml_set_output(out);
-            ggml_build_forward_expand(gr.g, out);
-            ggml_backend_sched_reset(sched);
-            if (!ggml_backend_sched_alloc_graph(sched, gr.g)) throw std::runtime_error("allocate graph");
-            if (in_embd) ggml_backend_tensor_set(in_embd, embd.data(), 0, embd.size() * sizeof(float));
+            prof[1] += lap();
+            if (in.embd) ggml_backend_tensor_set(in.embd, embd.data(), 0, embd.size() * sizeof(float));
             // Unused when no full-attention layer follows the resume point.
-            if (in_pos->buffer) ggml_backend_tensor_set(in_pos, pos.data(), 0, pos.size() * sizeof(int32_t));
-            if (in_mask->buffer) ggml_backend_tensor_set(in_mask, mask.data(), 0, mask.size() * sizeof(ggml_fp16_t));
-            compute(gr);
-            if (start < L) ggml_backend_tensor_get(spec_ids, ids.data() + size_t(start) * K, size_t(start) * K * sizeof(int32_t),
+            if (in.pos->buffer) ggml_backend_tensor_set(in.pos, pos.data(), 0, pos.size() * sizeof(int32_t));
+            if (in.mask->buffer) ggml_backend_tensor_set(in.mask, mask.data(), 0, mask.size() * sizeof(ggml_fp16_t));
+            if (in.rows && in.rows->buffer) {
+                const int64_t row = position;
+                ggml_backend_tensor_set(in.rows, &row, 0, sizeof row);
+            }
+            if (cg) {
+                if (ggml_backend_sched_graph_compute(cg->sched, cg->g) != GGML_STATUS_SUCCESS)
+                    throw std::runtime_error("graph compute failed");
+            } else {
+                compute(gr);
+            }
+            prof[2] += lap();
+            ggml_tensor * out = in.out;
+            if (start < L && E) ggml_backend_tensor_get(spec_ids, ids.data() + size_t(start) * K, size_t(start) * K * sizeof(int32_t),
                                                    size_t(L - start) * K * sizeof(int32_t));
 
             // Verify layer by layer; commit what is valid.
             uint32_t missed = L;
             for (uint32_t l = start; l < L && missed == L; ++l) {
                 layers[l].cur ^= 1; // attention of l ran on valid input
+                if (layers[l].dense) continue;
                 bool all = true;
                 for (uint32_t k = 0; k < K; ++k) all = all && resident(l, ids[size_t(l) * K + k]);
                 if (!all) {
@@ -1507,7 +1735,7 @@ struct Engine {
         for (int64_t i = 0; i < n; ++i)
             for (int64_t j = 0; j < n_kv; ++j) mask[size_t(i) * n_kv + j] = j <= int64_t(position) + i ? zero : ninf;
 
-        std::vector<int32_t> ids(size_t(cfg.active) * n);
+        std::vector<int32_t> ids(size_t(std::max(cfg.active, 1u)) * n);
         using clock = std::chrono::steady_clock;
         auto lap = [](clock::time_point & t) {
             auto now = clock::now();
@@ -1515,29 +1743,36 @@ struct Engine {
             t = now;
             return d;
         };
-        for (uint32_t l = 0; l <= L; ++l) {
+        // One graph per routed layer: it finishes the previous routed layer's experts, runs
+        // the dense layers that follow, and ends with the next router, whose choice the CPU
+        // needs before the experts can be paged in. Dense models run in one graph.
+        uint32_t l = 0;
+        int64_t routed = -1; // routed layer whose experts open the next graph
+        for (;;) {
             auto t0 = clock::now();
             Graph gr;
             begin(gr);
             ggml_context * c = gr.ctx;
-            ggml_tensor * in_embd = nullptr, * in_pos = nullptr, * in_mask = nullptr;
+            ggml_tensor * in_embd = nullptr;
             ggml_tensor * x;
-            if (l == 0) {
+            if (routed < 0) {
                 in_embd = ggml_new_tensor_2d(c, GGML_TYPE_F32, cfg.hidden, n);
                 ggml_set_input(in_embd);
                 x = in_embd;
             } else {
-                x = experts_ffn(c, l - 1, n);
+                x = experts_ffn(c, uint32_t(routed), n);
             }
+            // Unused (and unallocated) when no attention layer is in this graph.
+            ggml_tensor * in_pos = ggml_new_tensor_1d(c, GGML_TYPE_I32, n * 4);
+            ggml_tensor * in_mask = ggml_new_tensor_2d(c, GGML_TYPE_F16, n_kv, n);
+            ggml_set_input(in_pos);
+            ggml_set_input(in_mask);
+            const uint32_t first = l;
             ggml_tensor * out = nullptr, * pred_t = nullptr;
-            if (l < L) {
-                if (!layers[l].linear) {
-                    in_pos = ggml_new_tensor_1d(c, GGML_TYPE_I32, n * 4);
-                    in_mask = ggml_new_tensor_2d(c, GGML_TYPE_F16, n_kv, n);
-                    ggml_set_input(in_pos);
-                    ggml_set_input(in_mask);
-                }
-                bool predict = n == 1 && cfg.prefetch > 0 && l + 1 < L;
+            for (; l < L && layers[l].dense; ++l) x = dense_layer(c, gr.g, l, x, n, in_pos, in_mask, n_kv);
+            const bool routes = l < L;
+            if (routes) {
+                bool predict = n == 1 && cfg.prefetch > 0 && l + 1 < L && !layers[l + 1].dense;
                 out = attention_and_router(c, gr.g, l, x, n, in_pos, in_mask, n_kv, predict ? &pred_t : nullptr);
             } else {
                 ggml_tensor * xl = ggml_view_2d(c, x, cfg.hidden, 1, x->nb[1], size_t(n - 1) * x->nb[1]);
@@ -1550,23 +1785,25 @@ struct Engine {
             if (!ggml_backend_sched_alloc_graph(sched, gr.g)) throw std::runtime_error("allocate graph");
             prof[1] += lap(t0);
             if (in_embd) ggml_backend_tensor_set(in_embd, embd.data(), 0, embd.size() * sizeof(float));
-            if (in_pos) ggml_backend_tensor_set(in_pos, pos.data(), 0, pos.size() * sizeof(int32_t));
-            if (in_mask) ggml_backend_tensor_set(in_mask, mask.data(), 0, mask.size() * sizeof(ggml_fp16_t));
+            if (in_pos->buffer) ggml_backend_tensor_set(in_pos, pos.data(), 0, pos.size() * sizeof(int32_t));
+            if (in_mask->buffer) ggml_backend_tensor_set(in_mask, mask.data(), 0, mask.size() * sizeof(ggml_fp16_t));
             compute(gr);
             prof[2] += lap(t0);
-            if (l < L) {
-                layers[l].cur ^= 1; // the pass is valid: commit layer l's recurrent state
-                ggml_backend_tensor_get(out, ids.data(), 0, ids.size() * sizeof(int32_t));
-                route(l, ids, n);
-                if (pred_t) {
-                    pred.resize(size_t(pred_t->ne[0]));
-                    ggml_backend_tensor_get(pred_t, pred.data(), 0, pred.size() * sizeof(int32_t));
-                    prefetch(l + 1, pred);
-                }
-                prof[3] += lap(t0);
-            } else if (logits) {
-                ggml_backend_tensor_get(out, logits, 0, size_t(cfg.vocab) * sizeof(float));
+            // The pass is valid: commit the recurrent state of the layers it ran.
+            for (uint32_t m = first; m < std::min(l + 1, L); ++m) layers[m].cur ^= 1;
+            if (!routes) {
+                if (logits) ggml_backend_tensor_get(out, logits, 0, size_t(cfg.vocab) * sizeof(float));
+                break;
             }
+            ggml_backend_tensor_get(out, ids.data(), 0, ids.size() * sizeof(int32_t));
+            route(l, ids, n);
+            if (pred_t) {
+                pred.resize(size_t(pred_t->ne[0]));
+                ggml_backend_tensor_get(pred_t, pred.data(), 0, pred.size() * sizeof(int32_t));
+                prefetch(l + 1, pred);
+            }
+            prof[3] += lap(t0);
+            routed = l++;
         }
         position += uint32_t(n);
     }
@@ -1686,6 +1923,7 @@ struct Engine {
         std::vector<ggml_tensor *> out;
         for (auto & lay : layers)
             if (lay.linear) out.push_back(lay.conv[lay.cur]), out.push_back(lay.ssm[lay.cur]);
+            else if (lay.recurrent) out.push_back(lay.conv[lay.cur]);
         return out;
     }
 
@@ -1759,9 +1997,9 @@ struct Engine {
             ok = ok && std::fwrite(buf.data(), 1, bytes, f) == bytes;
         };
         for (auto & lay : layers) {
-            if (lay.linear) {
+            if (lay.recurrent) {
                 put(lay.conv[lay.cur], ggml_nbytes(lay.conv[lay.cur]));
-                put(lay.ssm[lay.cur], ggml_nbytes(lay.ssm[lay.cur]));
+                if (lay.linear) put(lay.ssm[lay.cur], ggml_nbytes(lay.ssm[lay.cur]));
             } else {
                 put(lay.k_cache, lay.k_cache->nb[2] * position);
                 put(lay.v_cache, lay.v_cache->nb[2] * position);
@@ -1791,9 +2029,9 @@ struct Engine {
         if (ok) {
             reset();
             for (auto & lay : layers) {
-                if (lay.linear) {
+                if (lay.recurrent) {
                     get(lay.conv[lay.cur], ggml_nbytes(lay.conv[lay.cur]));
-                    get(lay.ssm[lay.cur], ggml_nbytes(lay.ssm[lay.cur]));
+                    if (lay.linear) get(lay.ssm[lay.cur], ggml_nbytes(lay.ssm[lay.cur]));
                 } else {
                     get(lay.k_cache, lay.k_cache->nb[2] * h.position);
                     get(lay.v_cache, lay.v_cache->nb[2] * h.position);
@@ -1854,12 +2092,13 @@ void * loom_lmx_open(const char * path, const LoomLmxConfig * cfg, const LoomLmx
         if (cfg->kv_type < 0 || cfg->kv_type >= GGML_TYPE_COUNT || ggml_blck_size(ggml_type(cfg->kv_type)) <= 0 ||
             cfg->head_dim % ggml_blck_size(ggml_type(cfg->kv_type)) != 0)
             throw std::runtime_error("unsupported KV cache type");
-        if (!cfg->linear || !cfg->layers || !cfg->experts || !cfg->active || cfg->active > cfg->experts)
+        if (!cfg->mixer || !cfg->dense || !cfg->layers || cfg->active > cfg->experts || (cfg->experts && !cfg->active))
             throw std::runtime_error("invalid engine config");
         auto * e = new Engine(path, *cfg);
         try {
-            e->linear.assign(cfg->linear, cfg->linear + cfg->layers);
-            e->cfg.linear = nullptr;
+            e->mixer.assign(cfg->mixer, cfg->mixer + cfg->layers);
+            e->dense.assign(cfg->dense, cfg->dense + cfg->layers);
+            e->cfg.mixer = e->cfg.dense = nullptr;
             e->init_backends();
             e->load(tensors, count);
             e->allocate_state();

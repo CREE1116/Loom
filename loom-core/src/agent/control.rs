@@ -184,6 +184,10 @@ impl Core {
             .clone()
             .map(Ok)
             .unwrap_or_else(|| {
+                if ensure_repository(&self.root)? {
+                    observe(Event::new("main", Stage::Direct, "preparation",
+                        json!({"phase":"repository","initialized":true})));
+                }
                 observe(Event::new("main", Stage::Direct, "preparation",
                     json!({"phase":"revision","started":true})));
                 Revision::capture_cancellable(&self.root, &cancel)
@@ -546,6 +550,32 @@ impl Core {
         Ok(file)
     }
 }
+/// Loom isolates and tracks work with Git. A folder that is not a repository becomes one
+/// (`git init`, no commit, files untouched); true when it was initialized now.
+fn ensure_repository(root: &Path) -> Result<bool> {
+    let probe = std::process::Command::new("git")
+        .current_dir(root)
+        .args(["rev-parse", "--git-dir"])
+        .output();
+    let probe = match probe {
+        Ok(output) => output,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            anyhow::bail!("Git is required: install it (https://git-scm.com) and restart Loom")
+        }
+        Err(error) => return Err(error.into()),
+    };
+    if probe.status.success() {
+        return Ok(false);
+    }
+    let init = std::process::Command::new("git").current_dir(root).args(["init", "-q"]).output()?;
+    ensure!(
+        init.status.success(),
+        "this folder is not a Git repository and `git init` failed: {}",
+        String::from_utf8_lossy(&init.stderr).trim()
+    );
+    Ok(true)
+}
+
 fn valid_id(id: &str) -> Result<()> {
     ensure!(
         !id.is_empty()

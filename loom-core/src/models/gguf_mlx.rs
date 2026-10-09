@@ -102,6 +102,8 @@ pub fn hf_name(gguf: &str) -> Option<String> {
         match part {
             "ssm_a" => return Some(format!("model.layers.{layer}.linear_attn.A_log")),
             "ssm_dt.bias" => return Some(format!("model.layers.{layer}.linear_attn.dt_bias")),
+            // LFM2-MoE: the expert selection bias.
+            "exp_probs_b.bias" => return Some(format!("model.layers.{layer}.mlp.expert_bias")),
             _ => {}
         }
     }
@@ -111,7 +113,8 @@ pub fn hf_name(gguf: &str) -> Option<String> {
     }
     let mapped = match base {
         "token_embd" => "model.embed_tokens".to_owned(),
-        "output_norm" => "model.norm".to_owned(),
+        // LFM2 names its final norm `token_embd_norm`.
+        "output_norm" | "token_embd_norm" => "model.norm".to_owned(),
         "output" => "lm_head".to_owned(),
         _ => {
             let (layer, part) = base.strip_prefix("blk.")?.split_once('.')?;
@@ -145,6 +148,10 @@ pub fn hf_name(gguf: &str) -> Option<String> {
                 "ffn_up_shexp" => "mlp.shared_expert.up_proj",
                 "ffn_down_shexp" => "mlp.shared_expert.down_proj",
                 "ffn_gate_inp_shexp" => "mlp.shared_expert_gate",
+                // LFM2: gated short convolution.
+                "shortconv.conv" => "conv.conv",
+                "shortconv.in_proj" => "conv.in_proj",
+                "shortconv.out_proj" => "conv.out_proj",
                 _ => return None,
             };
             format!("model.layers.{layer}.{part}")

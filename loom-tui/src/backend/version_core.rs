@@ -188,9 +188,9 @@ impl ObservedPort {
             calls: Mutex::new(vec![]),
             cancel,
             started: Instant::now(),
-            seconds: settings.seconds,
+            seconds: limit_seconds(settings.seconds),
             call_seconds: settings.call_seconds,
-            limit: settings.steps,
+            limit: limit_steps(settings.steps),
             reference: settings.reference.clone(),
             effort: settings.effort.clone(),
             review_model: settings.review_model.clone(),
@@ -486,8 +486,8 @@ pub fn execute_with_index(
             plan: settings.plan,
             read_only: settings.readonly,
             checks: settings.checks.clone(),
-            steps: settings.steps,
-            seconds: settings.seconds,
+            steps: limit_steps(settings.steps),
+            seconds: limit_seconds(settings.seconds),
             model: (settings.model != "auto").then(|| settings.model.clone()),
             reasoning_effort: settings.effort.clone(),
             policy: settings.policy,
@@ -735,4 +735,12 @@ fn from_v5(t: &loom_core::agent::Task) -> Outcome {
     }
     .into();
     o
+}
+
+/// A configured limit of 0 means none; the core takes a bound too large to reach.
+pub fn limit_steps(steps: usize) -> usize {
+    if steps == 0 { 1_000_000 } else { steps }
+}
+pub fn limit_seconds(seconds: u64) -> u64 {
+    if seconds == 0 { 30 * 24 * 3600 } else { seconds }
 }
