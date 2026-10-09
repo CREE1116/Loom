@@ -27,6 +27,10 @@ pub(super) const THINK_OPEN: &str = "<think>";
 const END_THINK: &str = "</think>";
 const TOOL_OPEN: &str = "<tool_call>";
 const TOOL_CLOSE: &str = "</tool_call>";
+/// LFM2 wraps calls in its own special tokens around a Python-style list:
+/// `<|tool_call_start|>[name(key='value', n=3)]<|tool_call_end|>`.
+const LFM_TOOL_OPEN: &str = "<|tool_call_start|>";
+const LFM_TOOL_CLOSE: &str = "<|tool_call_end|>";
 const ARG_KEY_OPEN: &str = "<arg_key>";
 const ARG_KEY_CLOSE: &str = "</arg_key>";
 const ARG_VALUE_OPEN: &str = "<arg_value>";
@@ -1142,6 +1146,9 @@ impl SparkOutput {
 
     pub(super) fn feed(&mut self, text: &str) -> Vec<String> {
         self.pending.push_str(text);
+        if self.pending.contains(LFM_TOOL_OPEN) || self.pending.contains(LFM_TOOL_CLOSE) {
+            self.pending = self.pending.replace(LFM_TOOL_OPEN, TOOL_OPEN).replace(LFM_TOOL_CLOSE, TOOL_CLOSE);
+        }
         let mut deltas = Vec::new();
         loop {
             match self.mode {
@@ -1185,7 +1192,12 @@ impl SparkOutput {
                         break;
                     }
                     let keep = self.xml_markers.iter().map(|marker| partial_marker_suffix(&self.pending, marker))
-                        .chain([partial_marker_suffix(&self.pending, TOOL_OPEN)]).max().unwrap_or(0);
+                        .chain([
+                            partial_marker_suffix(&self.pending, TOOL_OPEN),
+                            partial_marker_suffix(&self.pending, LFM_TOOL_OPEN),
+                        ])
+                        .max()
+                        .unwrap_or(0);
                     let emit = self.pending.len().saturating_sub(keep);
                     if emit == 0 {
                         break;
@@ -1261,6 +1273,14 @@ pub(super) fn parse_tool_calls_for_tools(text: &str, tools: &[ToolSpec]) -> Vec<
             });
             continue;
         }
+        if body.starts_with('[') {
+            if let Some(list) = parse_python_calls(body) {
+                for (name, arguments) in list {
+                    calls.push(Part::ToolCall { id: format!("loom-call-{}", calls.len() + 1), name, arguments });
+                }
+                continue;
+            }
+        }
         if let Some((name, arguments)) = parse_xml_function(body, tools) {
             calls.push(Part::ToolCall {
                 id: format!("loom-call-{}", calls.len() + 1),
@@ -1277,6 +1297,156 @@ pub(super) fn parse_tool_calls_for_tools(text: &str, tools: &[ToolSpec]) -> Vec<
         }
     }
     calls
+}
+
+/// LFM2 form: a Python list of calls with keyword arguments,
+/// `[find(query='x', kind="text"), open(target='a.rs', start=1)]`. Values are Python
+/// literals: strings, numbers, True/False/None, lists and dicts.
+fn parse_python_calls(body: &str) -> Option<Vec<(String, Value)>> {
+    struct P<'a> {
+        s: &'a [u8],
+        i: usize,
+    }
+    impl P<'_> {
+        fn ws(&mut self) {
+            while self.i < self.s.len() && self.s[self.i].is_ascii_whitespace() {
+                self.i += 1;
+            }
+        }
+        fn eat(&mut self, c: u8) -> bool {
+            self.ws();
+            if self.s.get(self.i) == Some(&c) {
+                self.i += 1;
+                true
+            } else {
+                false
+            }
+        }
+        fn ident(&mut self) -> Option<String> {
+            self.ws();
+            let start = self.i;
+            while self.i < self.s.len() && (self.s[self.i].is_ascii_alphanumeric() || matches!(self.s[self.i], b'_' | b'.' | b'-')) {
+                self.i += 1;
+            }
+            (self.i > start).then(|| String::from_utf8_lossy(&self.s[start..self.i]).into_owned())
+        }
+        fn string(&mut self, quote: u8) -> Option<String> {
+            let mut out = Vec::new();
+            while let Some(&c) = self.s.get(self.i) {
+                self.i += 1;
+                match c {
+                    b'\\' => {
+                        let e = *self.s.get(self.i)?;
+                        self.i += 1;
+                        out.extend_from_slice(match e {
+                            b'n' => b"\n",
+                            b't' => b"\t",
+                            b'r' => b"\r",
+                            _ => std::slice::from_ref(&e),
+                        });
+                    }
+                    c if c == quote => return String::from_utf8(out).ok(),
+                    c => out.push(c),
+                }
+            }
+            None
+        }
+        fn value(&mut self) -> Option<Value> {
+            self.ws();
+            let c = *self.s.get(self.i)?;
+            match c {
+                b'\'' | b'"' => {
+                    self.i += 1;
+                    self.string(c).map(Value::String)
+                }
+                b'[' | b'(' => {
+                    self.i += 1;
+                    let close = if c == b'[' { b']' } else { b')' };
+                    let mut items = Vec::new();
+                    loop {
+                        if self.eat(close) {
+                            return Some(Value::Array(items));
+                        }
+                        items.push(self.value()?);
+                        if !self.eat(b',') {
+                            return self.eat(close).then_some(Value::Array(items));
+                        }
+                    }
+                }
+                b'{' => {
+                    self.i += 1;
+                    let mut map = Map::new();
+                    loop {
+                        if self.eat(b'}') {
+                            return Some(Value::Object(map));
+                        }
+                        let key = match self.value()? {
+                            Value::String(k) => k,
+                            other => other.to_string(),
+                        };
+                        if !self.eat(b':') {
+                            return None;
+                        }
+                        map.insert(key, self.value()?);
+                        if !self.eat(b',') {
+                            return self.eat(b'}').then_some(Value::Object(map));
+                        }
+                    }
+                }
+                _ => {
+                    let start = self.i;
+                    while self.i < self.s.len() && !matches!(self.s[self.i], b',' | b')' | b']' | b'}') && !self.s[self.i].is_ascii_whitespace() {
+                        self.i += 1;
+                    }
+                    let word = std::str::from_utf8(&self.s[start..self.i]).ok()?;
+                    Some(match word {
+                        "True" | "true" => Value::Bool(true),
+                        "False" | "false" => Value::Bool(false),
+                        "None" | "null" => Value::Null,
+                        _ => serde_json::from_str::<Value>(word).ok().filter(Value::is_number)?,
+                    })
+                }
+            }
+        }
+        fn call(&mut self) -> Option<(String, Value)> {
+            let name = self.ident()?;
+            if !self.eat(b'(') {
+                return None;
+            }
+            let mut arguments = Map::new();
+            loop {
+                if self.eat(b')') {
+                    return Some((name, Value::Object(arguments)));
+                }
+                let key = self.ident()?;
+                if !self.eat(b'=') {
+                    return None;
+                }
+                arguments.insert(key, self.value()?);
+                if !self.eat(b',') {
+                    return self.eat(b')').then(|| (name, Value::Object(arguments)));
+                }
+            }
+        }
+    }
+    let mut p = P { s: body.as_bytes(), i: 0 };
+    if !p.eat(b'[') {
+        return None;
+    }
+    let mut calls = Vec::new();
+    loop {
+        if p.eat(b']') {
+            break;
+        }
+        calls.push(p.call()?);
+        if !p.eat(b',') {
+            if !p.eat(b']') {
+                return None;
+            }
+            break;
+        }
+    }
+    (!calls.is_empty()).then_some(calls)
 }
 
 /// Qwen3-Coder form: `<function=name><parameter=key>value</parameter>...</function>`.
@@ -1536,6 +1706,29 @@ mod tests {
         let template = "{%- for m in messages[::-1] %}{{ m.content }}{% endfor %}|{{ (messages[::-1])[0].content }}";
         let request = Request { messages: vec![Message::user("a"), Message::user("b")], ..Request::default() };
         assert_eq!(render_template_prompt(template, &request, false, "", "").unwrap(), "ba|b");
+    }
+
+    #[test]
+    fn lfm_python_style_tool_calls_are_understood() {
+        let mut output = SparkOutput::new(false);
+        let mut shown = String::new();
+        for piece in ["Looking.", "<|tool_call_start|>[find(query='README Cargo.toml', kind=\"text\", ", "scope='.', limit=5, exact=False), open(target='a.rs', lines=[1, 20])]<|tool_call_end|>"] {
+            shown.extend(output.feed(piece));
+        }
+        shown.extend(output.finish());
+        assert_eq!(shown, "Looking.");
+        let calls = parse_tool_calls(&output.tools);
+        let names: Vec<_> = calls
+            .iter()
+            .filter_map(|c| match c {
+                Part::ToolCall { name, arguments, .. } => Some((name.as_str(), arguments.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(names.len(), 2, "{calls:?}");
+        assert_eq!(names[0].0, "find");
+        assert_eq!(names[0].1, json!({"query":"README Cargo.toml","kind":"text","scope":".","limit":5,"exact":false}));
+        assert_eq!(names[1].1, json!({"target":"a.rs","lines":[1,20]}));
     }
 
     #[test]

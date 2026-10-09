@@ -420,11 +420,7 @@ fn one_line(text: &str, width: usize) -> String {
         result.push_str(part);
         used += needed;
     }
-    if result.is_empty() {
-        "제목 없는 대화".into()
-    } else {
-        result
-    }
+    result
 }
 
 // Numbered commands always use 1 for the first item shown to the user.
@@ -5366,8 +5362,9 @@ fn paint_rows(
             } else {
                 0
             };
-            let text_width = unicode_width::UnicodeWidthStr::width(text.as_str())
-                .min(usize::from(line.width)) as u16;
+            // Rows drawn as buttons are padded by a leading space, so the selectable span
+            // reaches to the row's end; copying trims the trailing blanks.
+            let text_width = if text.is_empty() { 0 } else { line.width };
             if text_width > inset {
                 line.hits.push(crate::engine::Hit {
                     x: inset,

@@ -112,9 +112,8 @@ impl App {
                 },
                 None,
             ));
-        } else {
-            rows.push(("  Quota —".into(), Tone::Muted, None));
         }
+        // No quota row without a known quota: local models have none.
         rows.push((
             format!(
                 "  Queue {} · Agent {}",
@@ -696,6 +695,9 @@ impl App {
         let available = canvas.width.saturating_sub(4);
         let right_width = unicode_width::UnicodeWidthStr::width(right.as_str()) as u16;
         let left_width = available.saturating_sub(right_width + 2);
+        if left.is_empty() && right.is_empty() {
+            return; // nothing measured yet: no row and no click target
+        }
         canvas.text(
             2,
             y,

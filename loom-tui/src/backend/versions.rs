@@ -1209,8 +1209,8 @@ impl VersionBackend {
         for entry in self.v5_projection.entries(&turn, true) {
             self.emit(AgentUpdate::EntryUpdated(entry));
         }
-        self.input = self.input.zip(o.input).map(|(a, b)| a.saturating_add(b));
-        self.output = self.output.zip(o.output).map(|(a, b)| a.saturating_add(b));
+        self.input = add_known(self.input, o.input);
+        self.output = add_known(self.output, o.output);
         self.emit(AgentUpdate::TokenUsageUpdated(TokenUsage {
             input: self.input,
             output: self.output,
@@ -1664,14 +1664,8 @@ impl AgentBackend for VersionBackend {
                                 stored.task_ids.push(task.id.clone());
                                 self.save_stored_session(&stored);
                             }
-                            self.input = self
-                                .input
-                                .zip(task.usage.input)
-                                .map(|(a, b)| a.saturating_add(b));
-                            self.output = self
-                                .output
-                                .zip(task.usage.output)
-                                .map(|(a, b)| a.saturating_add(b));
+                            self.input = add_known(self.input, task.usage.input);
+                            self.output = add_known(self.output, task.usage.output);
                             self.emit(AgentUpdate::TokenUsageUpdated(TokenUsage {
                                 input: self.input,
                                 output: self.output,
@@ -2246,5 +2240,13 @@ mod provider_reload_tests {
         assert!(Arc::ptr_eq(&backend.model, &after));
         assert!(backend.pending_model.is_none());
         Ok(())
+    }
+}
+
+/// Adds a count when it is known; one call without usage does not erase the total.
+fn add_known(total: Option<u64>, more: Option<u64>) -> Option<u64> {
+    match (total, more) {
+        (Some(a), Some(b)) => Some(a.saturating_add(b)),
+        (a, b) => a.or(b),
     }
 }

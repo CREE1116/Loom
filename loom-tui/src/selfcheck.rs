@@ -2431,6 +2431,110 @@ fn accent_settings(report: &mut Report) {
     }
 }
 
+fn tool_targets_are_whole(report: &mut Report) {
+    const S: &str = "tool_targets_are_whole";
+    let event = |kind, column, row| MouseEvent { kind, column, row, modifiers: KeyModifiers::NONE };
+    let titles = ["open · README.md", "find · MoE", "expand · S12"];
+    for width in [60u16, 100, 140] {
+        let mut app = app_with([AgentEvent::scoped("main", AgentUpdate::TurnStarted { id: Some("t".into()) })]);
+        for (i, title) in titles.iter().enumerate() {
+            for status in ["inProgress", "completed"] {
+                app.apply_event(AgentEvent::scoped(
+                    "main",
+                    AgentUpdate::EntryUpdated(Entry {
+                        id: format!("tool-{i}"),
+                        kind: Kind::Tool,
+                        title: (*title).into(),
+                        body: format!("대상 · {}", title.split(" · ").nth(1).unwrap_or("")),
+                        status: status.into(),
+                        expanded: false,
+                    }),
+                ));
+            }
+        }
+        let canvas = app.render(width, 30);
+        let text = screen_text(&canvas);
+        report.check(
+            S,
+            format!("{width}: 도구 대상 마지막 글자까지 표시"),
+            titles.iter().all(|t| text.contains(t)),
+            "",
+        );
+        // Copying a row (triple click selects the line) keeps every character.
+        for title in titles {
+            let Some((x, y)) = (0..canvas.height).find_map(|y| {
+                let line = canvas.plain_line(y);
+                line.find(title).map(|byte| (unicode_width::UnicodeWidthStr::width(&line[..byte]) as u16, y))
+            }) else {
+                report.check(S, format!("{width}: {title} 행 찾기"), false, &text);
+                continue;
+            };
+            // A fresh window per row, so earlier clicks do not count toward this one.
+            let mut app = app_with([AgentEvent::scoped("main", AgentUpdate::TurnStarted { id: Some("t".into()) })]);
+            for (i, title) in titles.iter().enumerate() {
+                app.apply_event(AgentEvent::scoped(
+                    "main",
+                    AgentUpdate::EntryUpdated(Entry {
+                        id: format!("tool-{i}"),
+                        kind: Kind::Tool,
+                        title: (*title).into(),
+                        body: String::new(),
+                        status: "completed".into(),
+                        expanded: false,
+                    }),
+                ));
+            }
+            let mut copied = None;
+            let mut frame = app.render(width, 30);
+            for _ in 0..3 {
+                app.mouse(event(MouseEventKind::Down(MouseButton::Left), x + 1, y), &frame);
+                frame = app.render(width, 30);
+                copied = app.mouse(event(MouseEventKind::Up(MouseButton::Left), x + 1, y), &frame);
+            }
+            report.check(
+                S,
+                format!("{width}: 줄 복사에 '{title}' 전체 포함"),
+                matches!(&copied, Some(Intent::Copy(t)) if t.contains(title)),
+                format!("{copied:?}"),
+            );
+        }
+        if width == 140 {
+            report.check(S, "할당량 정보가 없으면 Quota 줄 숨김", !text.contains("Quota"), &text);
+        }
+        if width == 100 {
+            report.dump(S, &canvas);
+        }
+    }
+}
+
+fn token_footer(report: &mut Report) {
+    const S: &str = "token_footer";
+    let mut app = app_with([AgentEvent::scoped("main", AgentUpdate::TurnStarted { id: Some("t".into()) })]);
+    app.preferences.show_tokens = true;
+    let canvas = app.render(100, 24);
+    let text = screen_text(&canvas);
+    report.check(
+        S,
+        "토큰 정보가 없으면 하단 줄과 클릭 영역 없음",
+        !text.contains("제목 없는 대화")
+            && !canvas.hits.iter().any(|h| h.action == Action::Command("/usage".into())),
+        &text,
+    );
+    app.apply_event(AgentEvent::scoped(
+        "main",
+        AgentUpdate::TokenUsageUpdated(crate::agent::TokenUsage {
+            input: Some(1200),
+            output: Some(300),
+            total: Some(1500),
+            ..Default::default()
+        }),
+    ));
+    let canvas = app.render(100, 24);
+    let text = screen_text(&canvas);
+    report.check(S, "토큰 사용량이 있으면 하단에 표시", text.contains("tokens 1.5k"), &text);
+    report.dump(S, &canvas);
+}
+
 fn settings_categories(report: &mut Report) {
     const S: &str = "settings_categories";
     let mut app = App::new(false);
@@ -2796,6 +2900,8 @@ pub fn run() -> Report {
     compact_diff_boundaries(&mut report);
     accent_settings(&mut report);
     settings_categories(&mut report);
+    tool_targets_are_whole(&mut report);
+    token_footer(&mut report);
     composer_and_navigation(&mut report);
     input_images_and_model_hierarchy(&mut report);
     tour(&mut report);

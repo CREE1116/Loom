@@ -457,6 +457,9 @@ impl App {
                 }
                 for mut session in sessions {
                     session.title = one_line(&session.title, 55);
+                    if session.title.is_empty() {
+                        session.title = "제목 없는 대화".into();
+                    }
                     if self.thread.as_deref() == Some(&session.id)
                         && self.session_title == "새 대화"
                     {

@@ -666,6 +666,42 @@ mod tests {
             .expect("an installed native LMX")
     }
 
+    /// The model calls a tool and then answers from its result.
+    /// `LOOM_LMX_NATIVE_CHAT=1 LOOM_LMX_NATIVE_MODEL=<name> cargo test --release --lib
+    /// native_tool_call_round_trip -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn native_tool_call_round_trip() {
+        std::env::var("LOOM_LMX_NATIVE_CHAT").expect("set LOOM_LMX_NATIVE_CHAT=1");
+        let model = test_model();
+        let mut request = Request {
+            model: model.id(),
+            system: Some("You are a coding agent. Use the tools to inspect the repository.".into()),
+            tools: vec![ToolSpec {
+                name: "find".into(),
+                description: "Find files whose path matches a query.".into(),
+                parameters: serde_json::json!({"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}),
+            }],
+            messages: vec![Message::user("Find the README file of this repository.")],
+            max_output_tokens: Some(400),
+            temperature: Some(0.0),
+            ..Request::default()
+        };
+        let first = infer(&model, &request, &mut |_| {}).unwrap();
+        eprintln!("first {:?}", first.parts);
+        let Some(Part::ToolCall { id, .. }) = first.parts.iter().find(|p| matches!(p, Part::ToolCall { .. })).cloned() else {
+            panic!("no tool call: {:?}", first.parts);
+        };
+        request.messages.push(Message { role: Role::Assistant, parts: first.parts.clone() });
+        request.messages.push(Message {
+            role: Role::User,
+            parts: vec![Part::ToolResult { call_id: id, output: "[\"README.md\", \"docs/README.ko.md\"]".into(), is_error: false }],
+        });
+        let second = infer(&model, &request, &mut |_| {}).unwrap();
+        eprintln!("second {:?}", second.parts);
+        assert!(second.parts.iter().any(|p| matches!(p, Part::Text(t) if t.contains("README"))));
+    }
+
     /// A follow-up request reuses the previous prompt through its checkpoint even though
     /// the template rewrote the previous answer. `LOOM_LMX_NATIVE_CHAT=1 cargo test
     /// --release --lib native_chat_reuses_prompt_prefix -- --ignored --nocapture`
