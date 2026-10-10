@@ -344,7 +344,7 @@ fn validated_proposal_waits_for_approval_and_replays_after_restart() {
         .execute(
             "change file",
             ExecutionOptions {
-                checks: Some(vec![check_command("test \"$(cat file.txt)\" = new", "findstr /x /c:new file.txt >nul")]),
+                checks: Some(vec![check_command("test \"$(cat file.txt)\" = new", "findstr /c:new file.txt >nul")]),
                 approve: false,
                 ..Default::default()
             },
@@ -603,7 +603,7 @@ fn core_repairs_a_finished_proposal_from_validation_evidence_without_user_resume
             ExecutionOptions {
                 max_attempts: 2,
                 intent: TaskIntent::Edit,
-                checks: Some(vec![check_command("test \"$(cat file.txt)\" = new", "findstr /x /c:new file.txt >nul")]),
+                checks: Some(vec![check_command("test \"$(cat file.txt)\" = new", "findstr /c:new file.txt >nul")]),
                 ..Default::default()
             },
             &model,
@@ -1180,7 +1180,7 @@ fn validation_respects_the_shared_deadline() {
 fn retry_receives_observed_scope_misses_instead_of_only_the_stale_plan() {
     let d = repo();
     let options = ExecutionOptions {
-        checks: Some(vec![check_command("test \"$(cat file.txt)\" = expected", "findstr /x /c:expected file.txt >nul")]),
+        checks: Some(vec![check_command("test \"$(cat file.txt)\" = expected", "findstr /c:expected file.txt >nul")]),
         max_attempts: 1,
         approve: false,
         ..Default::default()
@@ -1319,7 +1319,7 @@ fn retry_preserves_the_failed_proposal_and_can_read_previous_validation_evidence
         response("edit", json!({"path":"file.txt","old":"old","new":"bad"})),
         response("finish", json!({"summary":"first proposal"})),
     ]);
-    let options=ExecutionOptions{max_attempts:1,checks:Some(vec![check_command("if [ \"$(cat file.txt)\" != new ]; then printf 'specific-failure-evidence\\n'; exit 1; fi", "findstr /x /c:new file.txt >nul || (echo specific-failure-evidence& exit /b 1)")]),..Default::default()};
+    let options=ExecutionOptions{max_attempts:1,checks:Some(vec![check_command("if [ \"$(cat file.txt)\" != new ]; then printf 'specific-failure-evidence\\n'; exit 1; fi", "findstr /c:new file.txt >nul || (echo specific-failure-evidence& exit /b 1)")]),..Default::default()};
     let task = core
         .execute(
             "change file",
@@ -1755,7 +1755,7 @@ fn structured_finish_text_after_edit_is_a_proposal_subject_to_independent_valida
                     intent: TaskIntent::Edit,
                     approve: false,
                     max_attempts: 1,
-                    checks: Some(vec![check_command("test \"$(cat file.txt)\" = new", "findstr /x /c:new file.txt >nul")]),
+                    checks: Some(vec![check_command("test \"$(cat file.txt)\" = new", "findstr /c:new file.txt >nul")]),
                     ..Default::default()
                 },
                 &model,

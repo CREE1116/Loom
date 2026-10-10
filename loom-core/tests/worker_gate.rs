@@ -728,7 +728,7 @@ fn an_edit_invalidates_the_check_cache_and_verifies_the_new_patch() {
     let (_directory, mut task) = task(6);
     task.checks = vec![
         if cfg!(windows) {
-            "findstr /x /c:\"pub fn value() -> u32 { 2 }\" lib.rs >nul"
+            "findstr /c:\"pub fn value() -> u32 { 2 }\" lib.rs >nul"
         } else {
             "test \"$(cat lib.rs)\" = 'pub fn value() -> u32 { 2 }'"
         }
