@@ -12,6 +12,24 @@ Loom은 터미널 코딩 에이전트입니다. 저장소의 격리된 사본에
 
 ## 설치
 
+명령 한 줄로 설치합니다. Apple silicon 맥은 릴리즈 바이너리를 받고, 다른 시스템은 아래
+준비물로 소스에서 빌드합니다.
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/CREE1116/Loom/main/scripts/get.sh | sh
+```
+
+저장소가 비공개인 동안은 GitHub CLI로 받습니다:
+
+```sh
+gh api repos/CREE1116/Loom/contents/scripts/get.sh -H "Accept: application/vnd.github.raw" | sh
+```
+
+옵션: `LOOM_PREFIX`(기본 `~/.local`), `LOOM_VERSION`, `LOOM_FROM_SOURCE=1`, `LOOM_CUDA=1`.
+다시 실행하면 업데이트됩니다.
+
+### 소스에서
+
 필요한 것: [Rust](https://rustup.rs), git, CMake, C/C++ 컴파일러(macOS는 Xcode Command
 Line Tools, Linux는 `build-essential`, Windows는 Visual Studio Build Tools). Apple
 silicon에서는 MLX 런타임을 받기 위해 `python3`를 사용합니다.

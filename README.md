@@ -12,6 +12,24 @@ and pass the test suite in CI; CUDA builds are not yet verified on hardware.
 
 ## Install
 
+One command (Apple silicon Macs get the prebuilt release; other systems build from
+source with the requirements below):
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/CREE1116/Loom/main/scripts/get.sh | sh
+```
+
+While the repository is private, fetch the script with the GitHub CLI instead:
+
+```sh
+gh api repos/CREE1116/Loom/contents/scripts/get.sh -H "Accept: application/vnd.github.raw" | sh
+```
+
+Options: `LOOM_PREFIX` (default `~/.local`), `LOOM_VERSION`, `LOOM_FROM_SOURCE=1`,
+`LOOM_CUDA=1`. Run it again to update.
+
+### From a checkout
+
 Requirements: [Rust](https://rustup.rs), git, CMake and a C/C++ compiler
 (Xcode Command Line Tools on macOS, `build-essential` on Linux, Visual Studio Build
 Tools on Windows). On Apple silicon, `python3` is used to download the MLX runtime.
