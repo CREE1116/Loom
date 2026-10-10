@@ -21,6 +21,12 @@ jobs:
         run: |
           if command -v rg >/dev/null; then exit 0; fi
           if [ "$RUNNER_OS" = Linux ]; then sudo apt-get update && sudo apt-get install -y ripgrep; else brew install ripgrep; fi
+      - name: Install the Linux command sandbox
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get install -y bubblewrap
+          # Ubuntu 24.04 restricts unprivileged user namespaces, which bwrap needs.
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
       - name: Install ripgrep (Windows)
         if: runner.os == 'Windows'
         shell: pwsh

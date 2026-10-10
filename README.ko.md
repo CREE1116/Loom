@@ -26,7 +26,8 @@ curl -fsSL https://raw.githubusercontent.com/CREE1116/Loom/main/scripts/get.sh |
 
 필요한 것: [Rust](https://rustup.rs), git, CMake, C/C++ 컴파일러(macOS는 Xcode Command
 Line Tools, Linux는 `build-essential`, Windows는 Visual Studio Build Tools). Apple
-silicon에서는 MLX 런타임을 받기 위해 `python3`를 사용합니다.
+silicon에서는 MLX 런타임을 받기 위해 `python3`를 사용합니다. Linux에서는 명령을
+[bubblewrap](https://github.com/containers/bubblewrap) 안에서 실행하므로 설치가 필요합니다(`apt install bubblewrap`).
 
 ```sh
 git clone https://github.com/CREE1116/Loom.git

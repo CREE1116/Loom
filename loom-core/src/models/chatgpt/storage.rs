@@ -402,7 +402,7 @@ impl Store {
 }
 
 #[cfg(not(unix))]
-struct Store;
+pub(super) struct Store;
 #[cfg(not(unix))]
 impl Store {
     pub(super) fn open(_: &Path, _: bool) -> Result<Self> {

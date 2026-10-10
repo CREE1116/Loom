@@ -27,6 +27,8 @@ Options: `LOOM_PREFIX` (default `~/.local`), `LOOM_VERSION`, `LOOM_FROM_SOURCE=1
 Requirements: [Rust](https://rustup.rs), git, CMake and a C/C++ compiler
 (Xcode Command Line Tools on macOS, `build-essential` on Linux, Visual Studio Build
 Tools on Windows). On Apple silicon, `python3` is used to download the MLX runtime.
+On Linux, Loom runs commands inside [bubblewrap](https://github.com/containers/bubblewrap)
+(`apt install bubblewrap`).
 
 ```sh
 git clone https://github.com/CREE1116/Loom.git
