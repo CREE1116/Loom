@@ -80,6 +80,7 @@ impl Default for Need {
 
 #[derive(Clone, Debug, Default)]
 struct Health {
+    last_error: Option<ProviderError>,
     disabled: Option<String>,
     cooldown_until: Option<SystemTime>,
     strikes: u32,
@@ -358,6 +359,7 @@ impl Router {
         request.check_cancelled()?;
         let request_started = std::time::Instant::now();
         let mut skipped = Vec::new();
+        let mut last = None;
         // Explicit user selection supersedes heuristic tier ranking. Tool, cost,
         // context, and route constraints still apply.
         let selection_need = if request.model.is_empty() {
@@ -386,13 +388,34 @@ impl Router {
             })
             .filter_map(|(c, reason)| match reason {
                 Some(reason) => {
+                    // A cooldown is not necessarily quota exhaustion. Keep the
+                    // provider cause across turns, including its remaining wait.
+                    let health = self.health.lock().unwrap();
+                    let state = if reason.starts_with("endpoint disabled:") {
+                        health.get(&(c.endpoint.clone(), String::new()))
+                    } else if reason.starts_with("cooling down") || reason == "no tool support" {
+                        health.get(&(c.endpoint.clone(), c.model.clone()))
+                    } else {
+                        None
+                    };
+                    let mut error = state.and_then(|h| h.last_error.clone()).unwrap_or_else(|| {
+                        ProviderError::new(
+                            if reason == "free tier used up today" { ErrorKind::Quota }
+                            else { ErrorKind::BadRequest },
+                            &reason,
+                        )
+                    });
+                    if reason.starts_with("cooling down") {
+                        error.retry_after = state.and_then(|h| h.cooldown_until)
+                            .and_then(|until| until.duration_since(SystemTime::now()).ok());
+                    }
+                    last = Some(error);
                     skipped.push((format!("{}/{}", c.endpoint, c.model), reason));
                     None
                 }
                 None => Some(c.clone()),
             })
             .collect();
-        let mut last = None;
         let size = estimate_tokens(request);
         for candidate in plan {
             request.check_cancelled()?;
@@ -406,9 +429,11 @@ impl Router {
                 .get(&(candidate.endpoint.clone(), candidate.model.clone()))
                 .and_then(|h| h.context_limit);
             if let Some(limit) = learned.or(candidate.context).filter(|l| *l < size) {
+                let reason = format!("context {limit} < request ≈{size} tokens");
+                last = Some(ProviderError::new(ErrorKind::BadRequest, &reason));
                 skipped.push((
                     format!("{}/{}", candidate.endpoint, candidate.model),
-                    format!("context {limit} < request ≈{size} tokens"),
+                    reason,
                 ));
                 continue;
             }
@@ -516,7 +541,7 @@ impl Router {
                     skipped.iter().map(|(c, r)| format!("{c}: {r}")).collect::<Vec<_>>().join("; ")
                 )
             };
-            ProviderError::new(ErrorKind::Quota, detail)
+            ProviderError::new(ErrorKind::BadRequest, detail)
         }))
     }
 
@@ -529,6 +554,7 @@ impl Router {
         {
             h.strikes = 0;
             h.cooldown_until = None;
+            h.last_error = None;
         }
     }
 
@@ -538,16 +564,16 @@ impl Router {
         }
         let mut health = self.health.lock().unwrap();
         if error.kind == ErrorKind::Auth {
-            health
-                .entry((c.endpoint.clone(), String::new()))
-                .or_default()
-                .disabled = Some(error.message.clone());
+            let endpoint = health.entry((c.endpoint.clone(), String::new())).or_default();
+            endpoint.disabled = Some(error.message.clone());
+            endpoint.last_error = Some(error.clone());
             return None;
         }
         let h = health
             .entry((c.endpoint.clone(), c.model.clone()))
             .or_default();
         h.strikes += 1;
+        h.last_error = Some(error.clone());
         let wait = match error.kind {
             ErrorKind::Quota => error.retry_after.unwrap_or(Duration::from_secs(3600)),
             ErrorKind::RateLimited => error
@@ -870,6 +896,22 @@ mod tests {
             vec![candidate("local", "tiny", Tier::Small, CostClass::Local)],
         );
         r
+    }
+
+    #[test]
+    fn unavailable_models_preserve_the_cause_instead_of_reporting_quota() {
+        let empty = Router::new(None);
+        assert_eq!(empty.complete(Need::default(), &Request::default()).unwrap_err().kind,
+            ErrorKind::BadRequest);
+        for kind in [ErrorKind::Transient, ErrorKind::RateLimited, ErrorKind::Quota, ErrorKind::Auth] {
+            let mut r = Router::new(None);
+            r.add(scripted("only", vec![Err(ProviderError::new(kind, "provider cause"))]),
+                vec![candidate("only", "small", Tier::Small, CostClass::Free)]);
+            assert_eq!(r.complete(Need::default(), &Request::default()).unwrap_err().kind, kind);
+            let error = r.complete(Need::default(), &Request::default()).unwrap_err();
+            assert_eq!(error.kind, kind, "cooldown must retain the provider error");
+            assert!(error.message.contains("provider cause"));
+        }
     }
 
     #[test]

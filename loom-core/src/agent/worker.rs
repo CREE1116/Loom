@@ -515,6 +515,7 @@ pub fn run(
             parts: response.parts,
         });
         let mut results = Vec::new();
+        let mut evidence = Vec::new();
         let mut failed = false;
         for (cid, name, args) in calls {
             if shared.stopped() {
@@ -627,6 +628,7 @@ pub fn run(
             );
             event.failed = error;
             shared.emit(event);
+            evidence.push(repetition_output(&name, &value));
             results.push(Part::ToolResult {
                 call_id: cid,
                 output: tools::clip(&value.to_string(), 20000),
@@ -636,14 +638,7 @@ pub fn run(
                 break;
             }
         }
-        let outputs: Vec<&str> = results
-            .iter()
-            .filter_map(|part| match part {
-                Part::ToolResult { output, .. } => Some(output.as_str()),
-                _ => None,
-            })
-            .collect();
-        let fingerprint = (revision, call_key, outputs.join("\u{0}"));
+        let fingerprint = (revision, call_key, evidence.join("\u{0}"));
         if last_calls.as_ref() == Some(&fingerprint) {
             repeated += 1;
         } else {
@@ -735,6 +730,21 @@ pub fn run(
     })
 }
 
+// Only execution metadata may be ignored; source and command output are evidence.
+fn repetition_output(name: &str, value: &Value) -> String {
+    let mut evidence = value.clone();
+    if name == "run" {
+        if let Some(results) = evidence.as_array_mut() {
+            for result in results {
+                if let Some(object) = result.as_object_mut() {
+                    object.remove("ms");
+                }
+            }
+        }
+    }
+    evidence.to_string()
+}
+
 #[cfg(test)]
 mod startup_tests {
     use super::*;
@@ -805,7 +815,7 @@ mod startup_tests {
 
     /// Small local models often repeat a lookup; they get told so and may recover, and
     /// only a long unbroken run of the same call on an unchanged repository stops them.
-    fn repeat_run(repeats: usize) -> (Proposal, Vec<String>) {
+    fn repeat_tool(repeats: usize, name: &str, arguments: Value) -> (Proposal, Vec<String>) {
         let root = tempfile::tempdir().unwrap();
         assert!(Command::new("git").args(["init", "-q"]).arg(root.path())
             .status().unwrap().success());
@@ -824,7 +834,7 @@ mod startup_tests {
         };
         let model = ScriptedModel::new(
             (0..repeats)
-                .map(|_| reply("find", json!({"query":"initial","kind":"symbol"})))
+                .map(|_| reply(name, arguments.clone()))
                 .chain([reply("finish", json!({"summary":"found initial"}))]),
         );
         let options = Options::default();
@@ -841,13 +851,42 @@ mod startup_tests {
 
     #[test]
     fn repeated_lookups_are_flagged_before_the_worker_gives_up() {
-        let (proposal, outputs) = repeat_run(4);
+        let (proposal, outputs) = repeat_tool(4, "find", json!({"query":"initial","kind":"symbol"}));
         assert!(proposal.complete, "{}", proposal.summary);
         assert_eq!(proposal.summary, "found initial");
         assert!(!outputs[0].contains("same call"));
         assert!(outputs[1..].iter().all(|output| output.contains("same call")), "{outputs:?}");
-        let (stuck, _) = repeat_run(8);
+        let (stuck, _) = repeat_tool(8, "find", json!({"query":"initial","kind":"symbol"}));
         assert_eq!(stuck.summary, "repeated identical operations on unchanged revision");
+    }
+
+    #[test]
+    fn repeated_shell_queries_stop_before_consuming_the_call_budget() {
+        let (proposal, outputs) = repeat_tool(10, "run",
+            json!({"kind":"command", "command":"git status --short"}));
+        assert!(!proposal.complete);
+        assert_eq!(proposal.summary, "repeated identical operations on unchanged revision");
+        assert_eq!(outputs.len(), 4, "the fifth repeated response stops the loop");
+        assert!(outputs[1..].iter().all(|output| output.contains("same call")));
+    }
+
+    #[test]
+    fn command_timing_is_not_new_evidence() {
+        let first = json!([{"status":"Passed", "ms":10,
+            "artifact_target":"artifact:same", "output":"abc commit"}]);
+        let mut next = first.clone();
+        next[0]["ms"] = json!(91);
+        assert_eq!(repetition_output("run", &first), repetition_output("run", &next));
+        next[0]["output"] = json!("def new commit");
+        assert_ne!(repetition_output("run", &first), repetition_output("run", &next));
+        next = first.clone();
+        next[0]["status"] = json!("Failed");
+        assert_ne!(repetition_output("run", &first), repetition_output("run", &next));
+        next = first.clone();
+        next[0]["artifact_target"] = json!("artifact:changed");
+        assert_ne!(repetition_output("run", &first), repetition_output("run", &next));
+        let source = json!({"ms":10});
+        assert_ne!(repetition_output("open", &source), repetition_output("open", &json!({"ms":91})));
     }
 
     #[test]

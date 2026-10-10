@@ -728,13 +728,10 @@ mod tests {
                 .filter(|c| c.model != "vendor/free-tools")
                 .collect(),
         );
-        assert_eq!(
-            unavailable
-                .complete(need, &Request::default())
-                .unwrap_err()
-                .kind,
-            ErrorKind::Quota
-        );
+        // No candidate meets the free/tool constraint; no provider reported quota.
+        let error = unavailable.complete(need, &Request::default()).unwrap_err();
+        assert_eq!(error.kind, ErrorKind::BadRequest);
+        assert!(error.message.contains("no tool support"), "{error}");
         Ok(())
     }
 
