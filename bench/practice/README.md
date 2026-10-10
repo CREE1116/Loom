@@ -23,7 +23,7 @@ Git을 준비한 뒤 Loom V3를 연다. 숨은 테스트와 정답은 복사하�
 3 실패 복구이며 생략하면 첫 문제다.
 
 ```sh
-~/code/Custom_cli/scripts/loom-practice 1
+scripts/loom-practice 1
 ```
 
 Loom이 열리면 다음 한 줄을 채팅에 입력한다.
@@ -71,7 +71,7 @@ scripts/loom-v3 --cwd "$practice_dir/repo"
 폴더를 `--cwd`로 지정한다. 이 컴퓨터의 저장소 위치에서는 다음 명령이다.
 
 ```sh
-~/code/Custom_cli/scripts/loom-v3 --cwd "$PWD" --new
+scripts/loom-v3 --cwd "$PWD" --new
 ```
 
 다른 위치에 Loom을 받았다면 앞부분을 해당 저장소의 절대 경로로 바꾼다.

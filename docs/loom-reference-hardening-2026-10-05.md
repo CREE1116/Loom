@@ -5,7 +5,7 @@
 
 | 참고 구현 | 확인한 설계 | Loom 반영 |
 | --- | --- | --- |
-| [Codex 도구 실행](~/code/Custom_cli/codex-rs/core/src/tools/parallel.rs), [문맥 관리](~/code/Custom_cli/codex-rs/core/src/context_manager/history.rs) | 복구 가능한 도구 오류를 모델 응답으로 돌려주고, 모델 문맥과 보존 상태를 구분 | 최신 호출·결과 묶음을 지키고 실패 피드백을 다음 요청에 전달 |
+| [Codex 도구 실행](https://github.com/openai/codex/blob/main/codex-rs/core/src/tools/parallel.rs), [문맥 관리](https://github.com/openai/codex/blob/main/codex-rs/core/src/context_manager/history.rs) | 복구 가능한 도구 오류를 모델 응답으로 돌려주고, 모델 문맥과 보존 상태를 구분 | 최신 호출·결과 묶음을 지키고 실패 피드백을 다음 요청에 전달 |
 | [OpenCode processor](https://github.com/anomalyco/opencode/blob/907b3bc518fa48e90e8ec24dd327d13eee71c36c/packages/opencode/src/session/processor.ts), [compaction](https://github.com/anomalyco/opencode/blob/907b3bc518fa48e90e8ec24dd327d13eee71c36c/packages/opencode/src/session/compaction.ts) | 도구의 실행·성공·오류 상태를 보존하고 최근 도구 결과를 먼저 보호 | 큰 결과 때문에 최신 교환 전체가 사라지는 결함 수정. 반복 호출도 모델에 피드백 후 다른 행동으로 복구할 기회 제공 |
 | [Grok Build 출력 제한](https://github.com/xai-org/grok-build/blob/2bdd1d6a6369de0e8c68132ea4539e9abd9e14a8/crates/codegen/xai-grok-tools/src/util/truncate.rs), [완료 규율](https://github.com/xai-org/grok-build/blob/2bdd1d6a6369de0e8c68132ea4539e9abd9e14a8/crates/codegen/xai-grok-agent/src/system_reminder.rs) | UTF-8 안전한 출력 미리보기·전체 크기·복구 힌트, 제한된 완료 재확인 정책 | 출력 미리보기와 원문 artifact 조회 분리. 수정 없는 완료를 같은 사본에서 두 번까지 교정 |
 | [Antigravity subagents](https://www.antigravity.google/docs/subagents/) | 격리 문맥, 워크스페이스 선택, 부모의 권한 상속과 비동기 수명주기 | 격리 워커에 빠져 있던 프로젝트 지침 전달. Root 및 쓰기 범위의 AGENTS.md를 제공하고 새 하위 폴더의 지침을 수정 전에 전달 |
