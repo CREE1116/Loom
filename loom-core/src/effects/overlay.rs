@@ -186,7 +186,9 @@ impl Overlay {
             let path = overlay.dir.join(std::str::from_utf8(name)?);
             let meta = fs::symlink_metadata(&path)?;
             if meta.is_file() {
-                fs::File::open(path)?
+                // Windows SetFileTime needs FILE_WRITE_ATTRIBUTES; a read-only
+                // File::open handle lacks it. Open without creating or truncating.
+                fs::File::options().read(true).write(cfg!(windows)).open(path)?
                     .set_times(fs::FileTimes::new().set_modified(base_mtime()))?;
             }
         }

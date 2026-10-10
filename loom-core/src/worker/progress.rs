@@ -28,7 +28,7 @@ pub(super) fn describe(tool: &str, args: &Value) -> String {
                 _ => path.to_owned(),
             }
         }
-        "find" | "ast_search" => format!(
+        "find" | "glob" | "ast_search" => format!(
             "{} · {}",
             args["pattern"].as_str().unwrap_or(""),
             path.unwrap_or("repository")

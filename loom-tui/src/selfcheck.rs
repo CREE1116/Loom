@@ -2555,9 +2555,9 @@ fn auto_compaction_status(report: &mut Report) {
 
 fn remote_control(report: &mut Report) {
     const S: &str = "remote_control";
-    let url = "http://192.168.0.2:8787/?t=00112233445566778899aabbccddeeff";
+    let url = "http://192.168.0.2:8787/t/ABCDEFGHIJKLMNOPQRSTUVWXYZ";
     let mut app = app_with([AgentEvent::scoped("main", AgentUpdate::TurnStarted { id: None })]);
-    app.remote_started(url.into(), crate::remote::qr_modules(url));
+    app.remote_started(url.into(), crate::remote::qr_modules(url), false);
     let canvas = app.render(100, 40);
     let text = screen_text(&canvas);
     let qr_cells = canvas.cells.iter().filter(|c| c.tone == Tone::QrDark || c.tone == Tone::QrLight).count();
@@ -2577,16 +2577,24 @@ fn remote_control(report: &mut Report) {
         "",
     );
     report.dump(S, &canvas);
-    let small = screen_text(&app.render(60, 20));
-    report.check(S, "60x20: QR 대신 넓히라는 안내와 주소", small.contains("넓히면") && small.contains("8787"), &small);
+    for (width, height) in [(60u16, 24u16), (40, 20)] {
+        let canvas = app.render(width, height);
+        let qr = canvas.cells.iter().filter(|c| c.tone == Tone::QrDark || c.tone == Tone::QrLight).count();
+        let text = screen_text(&canvas);
+        report.check(S, format!("{width}x{height}: 좁은 터미널에서도 QR과 주소"), qr > 200 && text.contains("8787"), &text);
+        report.dump(S, &canvas);
+    }
+    let tiny = screen_text(&app.render(40, 12));
+    report.check(S, "40x12: QR이 안 들어가면 키우라는 안내와 주소", tiny.contains("키우면") && tiny.contains("8787"), &tiny);
     app.key(crossterm::event::KeyEvent::new(crossterm::event::KeyCode::Esc, KeyModifiers::NONE), &canvas);
     report.check(S, "Esc로 창만 닫고 원격은 유지", app.remote.as_ref().is_some_and(|v| !v.shown), "");
     report.check(S, "/remote로 다시 열기", { app.activate(Action::Command("/remote".into())); app.remote.as_ref().is_some_and(|v| v.shown) }, "");
-    report.check(S, "/remote off는 끄기 요청", app.activate(Action::Command("/remote off".into())) == Some(Intent::Remote(false)), "");
+    report.check(S, "/remote off는 끄기 요청", app.activate(Action::Command("/remote off".into())) == Some(Intent::Remote(None)), "");
 
     // A message from the browser is sent without touching the draft typed here.
     let mut app = app_with([]);
     app.editor.insert("my draft");
+    app.selected_skills.push(crate::agent::Skill { name: "local-only".into(), path: "local/SKILL.md".into(), description: String::new() });
     let intent = app.remote_command(crate::remote::Command::Send("run the tests".into()));
     report.check(
         S,
@@ -2594,8 +2602,17 @@ fn remote_control(report: &mut Report) {
         matches!(&intent, Some(Intent::Submit(text)) if text == "run the tests") && app.editor.text == "my draft",
         format!("{intent:?} draft={:?}", app.editor.text),
     );
+    report.check(S, "원격 메시지에 로컬 초안의 스킬을 붙이지 않음",
+        app.selected_skills.len() == 1 && app.submitted_skills.is_empty(), "");
+    app.apply_event(AgentEvent::scoped("main", AgentUpdate::InputRequested(crate::agent::InputRequest {
+        id: "remote-question".into(), blocking: true,
+        questions: vec![crate::agent::Question { id: "q".into(), header: "확인".into(), prompt: "대상을 골라주세요".into(),
+            options: vec![], allow_custom: true, secret: true }],
+    })));
     let snapshot = app.remote_snapshot();
     report.check(S, "브라우저용 상태에 대화와 상태 포함", snapshot["entries"].is_array() && snapshot["status"].is_string(), &snapshot.to_string());
+    report.check(S, "원격 질문에 요청 식별자와 비밀 입력 표시",
+        snapshot["questions"][0]["id"] == "remote-question" && snapshot["questions"][0]["questions"][0]["secret"] == true, &snapshot.to_string());
 }
 
 fn settings_categories(report: &mut Report) {
@@ -2920,6 +2937,7 @@ fn native_projection(report: &mut Report) {
 
 pub fn run() -> Report {
     let mut report = Report::default();
+    searchable_commands(&mut report);
     session_exit_notice(&mut report);
     v5_plan_command(&mut report);
     v5_disclosure(&mut report);
@@ -2990,12 +3008,22 @@ fn searchable_commands(report: &mut Report) {
         report.check(S, format!("{width}: 설명으로 명령 검색, 초안 보존"),
             text.contains("/compact") && !text.contains("/quit")
                 && app.editor.text == "작성 중인 요청", &text);
+        report.check(S, format!("{width}: 커서는 검색 입력에 표시"),
+            canvas.cursor.is_some_and(|(_, y)| text.lines().nth(usize::from(y)).is_some_and(|line| line.contains("컨텍스트"))), &text);
         report.dump(S, &canvas);
         app.key(crossterm::event::KeyEvent::new(crossterm::event::KeyCode::Esc, KeyModifiers::NONE), &canvas);
         let canvas = app.render(width, 30);
         report.check(S, format!("{width}: 검색 취소 후 초안 복원"),
             app.editor.text == "작성 중인 요청" && !screen_text(&canvas).contains("/compact"),
             screen_text(&canvas));
+        app.activate(Action::Menu);
+        app.paste("존재하지않는명령");
+        let canvas = app.render(width, 30);
+        let intent = app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &canvas);
+        report.check(S, format!("{width}: 빈 결과를 전송하지 않음"),
+            screen_text(&canvas).contains("일치하는 명령이 없습니다") && intent.is_none()
+                && app.editor.text == "작성 중인 요청", screen_text(&canvas));
+        report.dump(S, &canvas);
     }
 }
 
@@ -4756,7 +4784,7 @@ mod provider_checks {
         let canvas = app.render(80, 40);
         app.key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE), &canvas);
         let canvas = app.render(80, 40);
-        app.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &canvas);
+        app.key(crossterm::event::KeyEvent::new(crossterm::event::KeyCode::Esc, KeyModifiers::NONE), &canvas);
         assert_eq!(app.editor.text, "unsent draft");
         app.paste("/runtime");
         assert_eq!(app.editor.text, "/runtime");
@@ -4927,7 +4955,6 @@ fn lmx_models_are_shown_as_loom_engine(report: &mut Report) {
 
 fn searchable_model_catalog(report: &mut Report) {
     use crate::agent::ModelCatalogEntry;
-    use crossterm::event::{KeyCode, KeyEvent};
     const S: &str = "model catalog search and prices";
     let mut app = App::new(false);
     app.models = vec!["auto".into()];
@@ -4966,7 +4993,7 @@ fn searchable_model_catalog(report: &mut Report) {
             && !canvas.hits.iter().any(|h| h.action == Action::Model("work/high".into()))
             && app.editor.text == "작성 중인 대화 초안", &text);
     report.dump(S, &canvas);
-    app.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &canvas);
+    app.key(crossterm::event::KeyEvent::new(crossterm::event::KeyCode::Esc, KeyModifiers::NONE), &canvas);
     app.activate(Action::ModelFreeOnly);
     app.activate(Action::ToggleModelGroup("가격\u{1}1무료 API".into()));
     let canvas = app.render(80, 48);

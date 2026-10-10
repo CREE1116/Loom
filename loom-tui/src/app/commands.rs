@@ -57,7 +57,7 @@ impl App {
                 }
             }
             "/remote" => match arg {
-                "" | "on" => match self.remote.as_mut() {
+                "" | "on" | "local" => match self.remote.as_mut() {
                     // Already on: show the address and QR code again.
                     Some(view) => {
                         view.shown = true;
@@ -67,9 +67,9 @@ impl App {
                         self.error("열람 전용 창입니다. 메인 창에서 실행하세요.");
                         None
                     }
-                    None => Some(Intent::Remote(true)),
+                    None => Some(Intent::Remote(Some(arg != "local"))),
                 },
-                "off" | "stop" => self.remote.is_some().then_some(Intent::Remote(false)),
+                "off" | "stop" => self.remote.is_some().then_some(Intent::Remote(None)),
                 "hide" => {
                     if let Some(view) = self.remote.as_mut() {
                         view.shown = false;
@@ -78,7 +78,7 @@ impl App {
                 }
                 "copy" => self.remote.as_ref().map(|view| Intent::Copy(view.url.clone())),
                 _ => {
-                    self.error("사용법: /remote [off]");
+                    self.error("사용법: /remote [local|off] · local은 같은 네트워크에서만 접속");
                     None
                 }
             },

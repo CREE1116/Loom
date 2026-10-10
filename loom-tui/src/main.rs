@@ -559,15 +559,32 @@ fn main() -> Result<()> {
             send_intent(&mut app, backend.as_mut(), &intent);
             dirty = true;
         }
-        if let Some(server) = &remote {
-            for command in server.take_commands() {
-                if let Some(intent) = app.remote_command(command) {
-                    send_intent(&mut app, backend.as_mut(), &intent);
-                }
+        if let Some(server) = &mut remote {
+            for pending in server.take_commands() {
+                let result = if pending.expired() {
+                    Err("요청 시간이 초과됐습니다. 상태를 확인한 뒤 다시 시도해주세요.".into())
+                } else {
+                    app.checked_remote_command(pending.command.clone()).and_then(|intent| {
+                        if let Some(intent) = intent { send_intent_checked(&mut app, backend.as_mut(), &intent) } else { Ok(()) }
+                    })
+                };
+                pending.complete(result);
                 dirty = true;
             }
             // Browsers wait on a long poll; publishing an unchanged state wakes none.
             if last_publish.elapsed() >= Duration::from_millis(250) {
+                match server.tunnel_status() {
+                    Ok(Some(url)) if app.remote.as_ref().is_some_and(|view| view.url != url) => {
+                        app.remote_public(url.clone(), loom_tui::remote::qr_modules(&url));
+                        dirty = true;
+                    }
+                    Err(error) => {
+                        let url = server.url().to_owned();
+                        app.remote_tunnel_failed(url.clone(), loom_tui::remote::qr_modules(&url), &error);
+                        dirty = true;
+                    }
+                    _ => {}
+                }
                 server.publish(&app.remote_snapshot());
                 dirty |= app.remote_clients(server.clients());
                 last_publish = Instant::now();
@@ -760,21 +777,24 @@ fn main() -> Result<()> {
                         }
                     }
                 }
-                Intent::Remote(on) => {
-                    if *on {
-                        match loom_tui::remote::Remote::start(None) {
-                            Ok(server) => {
-                                let url = server.url().to_owned();
-                                app.remote_started(url.clone(), loom_tui::remote::qr_modules(&url));
-                                server.publish(&app.remote_snapshot());
-                                remote = Some(server);
-                            }
-                            Err(error) => app.error(format!("원격 조작을 켜지 못했습니다: {error}")),
+                Intent::Remote(Some(public)) => match loom_tui::remote::Remote::start(None) {
+                    Ok(mut server) => {
+                        // An internet address needs cloudflared; without it the local
+                        // network address stays and the window says how to get one.
+                        let tunnel = *public && server.open_tunnel();
+                        let url = server.url().to_owned();
+                        app.remote_started(url.clone(), loom_tui::remote::qr_modules(&url), tunnel);
+                        if *public && !tunnel {
+                            app.notify("인터넷 접속 주소는 cloudflared가 필요합니다 (brew install cloudflared). 지금은 같은 네트워크에서만 접속됩니다.");
                         }
-                    } else {
-                        remote = None;
-                        app.remote_stopped();
+                        server.publish(&app.remote_snapshot());
+                        remote = Some(server);
                     }
+                    Err(error) => app.error(format!("원격 조작을 켜지 못했습니다: {error}")),
+                },
+                Intent::Remote(None) => {
+                    remote = None;
+                    app.remote_stopped();
                 }
                 Intent::ExportDiagnostics => {
                     let path = runtime::state_dir(&args.cwd).join("diagnostics.json");
@@ -836,6 +856,10 @@ fn main() -> Result<()> {
 }
 
 fn send_intent(app: &mut App, backend: &mut dyn AgentBackend, intent: &Intent) {
+    let _ = send_intent_checked(app, backend, intent);
+}
+
+fn send_intent_checked(app: &mut App, backend: &mut dyn AgentBackend, intent: &Intent) -> Result<(), String> {
     if let Some(command) = app.agent_command(intent)
         && let Err(error) = backend.command(command)
     {
@@ -849,7 +873,9 @@ fn send_intent(app: &mut App, backend: &mut dyn AgentBackend, intent: &Intent) {
             Intent::Fork(_) | Intent::Rewind(_) => app.branch_failed(&error.to_string()),
             _ => app.error(error.to_string()),
         }
+        return Err(error.to_string());
     }
+    Ok(())
 }
 
 /// Notices when this program's own binary was rebuilt after it started.

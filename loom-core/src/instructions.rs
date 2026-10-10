@@ -100,10 +100,13 @@ impl Instructions {
 /// plugin caches when `LOOM_PLUGIN_SKILLS` is set). Project skills come first and win a name clash; a skill that
 /// cannot be read is skipped rather than hiding every other one.
 /// Skills that ship with Loom, installed into `~/.loom/skills` on first use.
-const BUNDLED: [(&str, &str); 3] = [
+const BUNDLED: [(&str, &str); 6] = [
     ("loom-guide", include_str!("../skills/loom-guide/SKILL.md")),
     ("skill-builder", include_str!("../skills/skill-builder/SKILL.md")),
     ("loom-extension", include_str!("../skills/loom-extension/SKILL.md")),
+    ("loom-plan", include_str!("../skills/loom-plan/SKILL.md")),
+    ("loom-debug", include_str!("../skills/loom-debug/SKILL.md")),
+    ("loom-review", include_str!("../skills/loom-review/SKILL.md")),
 ];
 
 /// Writes the bundled skills under `home/.loom/skills`. A copy is replaced only while it
@@ -318,6 +321,28 @@ fn frontmatter(text: &str) -> (Option<String>, Option<String>) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn bundled_skills_install_update_and_preserve_user_edits() {
+        let home = tempfile::tempdir().unwrap();
+        super::install_bundled(home.path());
+        for (name, text) in super::BUNDLED {
+            let dir = home.path().join(".loom/skills").join(name);
+            let path = dir.join("SKILL.md");
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
+            let (parsed, description) = super::frontmatter(text);
+            assert_eq!(parsed.as_deref(), Some(name));
+            assert!(description.is_some_and(|text| !text.is_empty()));
+            use sha2::{Digest, Sha256};
+            std::fs::write(&path, "older bundled version").unwrap();
+            std::fs::write(dir.join(".bundled"), format!("{:x}", Sha256::digest(b"older bundled version"))).unwrap();
+            super::install_bundled(home.path());
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
+            std::fs::write(&path, "user's customized skill").unwrap();
+            super::install_bundled(home.path());
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), "user's customized skill");
+        }
+    }
+
     #[test]
     fn skills_of_other_agents_and_nested_groups_are_found() {
         let root = tempfile::tempdir().unwrap();

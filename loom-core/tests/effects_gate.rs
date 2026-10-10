@@ -78,6 +78,39 @@ fn overlay_materialization_uses_pinned_content_when_source_changed() {
 }
 
 #[test]
+fn overlay_creation_sets_stable_mtimes_without_changing_content_or_source() {
+    let directory = repository();
+    let root = directory.path();
+    fs::create_dir(root.join("nested")).unwrap();
+    fs::write(root.join("nested/data.bin"), [0, 255, 1, 128]).unwrap();
+    fs::write(root.join("empty.txt"), []).unwrap();
+    let base = Revision::capture(root).unwrap();
+    let sources: Vec<_> = ["lib.rs", "nested/data.bin", "empty.txt"]
+        .into_iter()
+        .map(|name| {
+            (name, fs::read(root.join(name)).unwrap(),
+                fs::metadata(root.join(name)).unwrap().modified().unwrap())
+        })
+        .collect();
+    let expected_mtime = std::time::UNIX_EPOCH + Duration::from_secs(1);
+    for cancellable in [false, true] {
+        let overlay = if cancellable {
+            Overlay::create_cancellable(root, &base, &AtomicBool::new(false))
+        } else {
+            Overlay::create(root, &base)
+        }.unwrap();
+        for (name, content, source_mtime) in &sources {
+            let copied = overlay.dir().join(name);
+            assert_eq!(&fs::read(&copied).unwrap(), content);
+            assert_eq!(fs::metadata(&copied).unwrap().modified().unwrap(), expected_mtime);
+            assert_eq!(&fs::read(root.join(name)).unwrap(), content);
+            assert_eq!(fs::metadata(root.join(name)).unwrap().modified().unwrap(), *source_mtime);
+        }
+        assert_eq!(Revision::capture(overlay.dir()).unwrap(), base);
+    }
+}
+
+#[test]
 fn initial_overlay_cancelled_creation_does_not_touch_the_workspace() {
     let directory = repository();
     let base = Revision::capture(directory.path()).unwrap();

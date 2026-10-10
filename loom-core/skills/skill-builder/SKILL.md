@@ -34,9 +34,9 @@ description: Write release notes from merged changes since the last tag. Use whe
 ```
 
 - `name`: lowercase words joined by hyphens, unique. The user calls it as `$name`.
-- `description`: what the skill does, then when to use it. Project skills show the
-  first 160 characters to the model; skills from the home directory are listed by name
-  only, so the name must say what it does.
+- `description`: what the skill does, then when to use it. Loom ranks installed
+  skills by request relevance and shows the first 150 characters within its skill
+  list budget; remaining skills are listed by name. Make those first words useful.
 - Body: numbered steps in the imperative, what to read first, what to produce, and how
   to check the result. State inputs the skill needs from the user.
 - At most 64 KB. Put long references, templates and scripts next to `SKILL.md`

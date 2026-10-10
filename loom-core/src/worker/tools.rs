@@ -24,6 +24,7 @@ use std::{
 const READ_MAX_LINES: usize = 400;
 const OUTPUT_MAX: usize = 12_000;
 const FIND_MAX_LINES: usize = 80;
+const SEARCH_CAPTURE_MAX_BYTES: usize = 128 * 1024;
 
 #[derive(Clone)]
 pub(super) struct SourceFile {
@@ -80,6 +81,16 @@ impl ToolOutput {
 
 fn clip(text: String) -> String {
     clip_limit(&text, OUTPUT_MAX)
+}
+
+// Ripgrep exempts explicit file arguments from its glob filters. Apply the same
+// globset syntax ourselves before handing it a file, including negated filters.
+fn file_glob_matches(pattern: &str, relative: &str) -> anyhow::Result<bool> {
+    let (negated, pattern) = pattern.strip_prefix('!').map_or((false, pattern), |pattern| (true, pattern));
+    let matcher = globset::GlobBuilder::new(pattern).literal_separator(true).build()?.compile_matcher();
+    let matched = matcher.is_match(relative)
+        || (!pattern.contains('/') && Path::new(relative).file_name().is_some_and(|name| matcher.is_match(Path::new(name))));
+    Ok(if negated { !matched } else { matched })
 }
 
 fn clip_limit(text: &str, limit: usize) -> String {
@@ -385,9 +396,21 @@ impl<'a> Workspace<'a> {
                         "pattern": {"type": "string", "description": "text regex for content search; substring of file/directory name for kind=path"},
                         "kind": {"type": "string", "enum": ["content", "path"], "description": "path searches filenames and directory names; content searches text"},
                         "path": {"type": "string", "description": "file or directory to search in (default: whole workspace)"},
-                        "literal": {"type": "boolean"}
+                        "literal": {"type": "boolean"},
+                        "include": {"type": "string", "description": "content search file glob, e.g. *.rs or **/tests/**"},
+                        "case_sensitive": {"type": "boolean", "description": "content search: default true; false ignores case"},
+                        "limit": {"type": "integer", "minimum": 1, "maximum": 80, "description": "maximum matching content lines; default 80. A truncated result is a preview, not an exhaustive search."}
                     }
                 }),
+            ),
+            spec(
+                "glob",
+                "Find files by glob (e.g. **/*.rs or **/tests/**) without a shell. Applies ripgrep ignore/glob precedence, returns sorted workspace-relative paths, and marks incomplete previews. Use read_many for known results; use find for their content.",
+                json!({"type":"object", "required":["pattern"], "properties":{
+                    "pattern":{"type":"string"},
+                    "path":{"type":"string", "description":"optional workspace-relative file or directory scope"},
+                    "limit":{"type":"integer", "minimum":1, "maximum":80}
+                }}),
             ),
             spec(
                 "symbols",
@@ -812,7 +835,9 @@ impl<'a> Workspace<'a> {
                 args["path"].as_str(),
                 args["literal"].as_bool().unwrap_or(false),
                 s("kind"),
+                args,
             ),
+            "glob" => self.glob(s("pattern"), args["path"].as_str(), args["limit"].as_u64()),
             "outline" => self.outline(s("path")),
             "read" => self.read_tool(s("path"), args["start"].as_u64(), args["end"].as_u64()),
             "read_many" => self.read_many(&args["items"]),
@@ -1055,7 +1080,7 @@ impl<'a> Workspace<'a> {
 
     // ------------------------------------------------------------------ read side
 
-    fn find(&self, pattern: &str, path: Option<&str>, literal: bool, kind: &str) -> ToolOutput {
+    fn find(&self, pattern: &str, path: Option<&str>, literal: bool, kind: &str, options: &Value) -> ToolOutput {
         if pattern.trim().len() < 2 {
             return ToolOutput::err(Phase::Orient, "pattern too short");
         }
@@ -1075,25 +1100,33 @@ impl<'a> Workspace<'a> {
             }
         };
         let mut cmd = Command::new("rg");
+        if target.is_file() && let Some(include) = options["include"].as_str() {
+            match file_glob_matches(include, &self.rel(target.to_string_lossy().as_ref())) {
+                Ok(false) => return ToolOutput::ok(Phase::Orient, "No text matches within the file include filter."),
+                Ok(true) => {},
+                Err(error) => return ToolOutput::err(Phase::Orient, format!("invalid include glob: {error}")),
+            }
+        }
+        let limit = options["limit"].as_u64().unwrap_or(FIND_MAX_LINES as u64).clamp(1, FIND_MAX_LINES as u64) as usize;
         cmd.args([
+            "--no-config",
             "-n",
+            "--with-filename",
             "--no-heading",
             "--color=never",
             "--max-columns=200",
-            "--max-count=30",
+            "--max-columns-preview",
         ]);
+        cmd.arg(format!("--max-count={}", limit + 1));
         if literal {
             cmd.arg("-F");
         }
-        let out = match cmd
-            .arg("--")
-            .arg(pattern)
-            .arg(&target)
-            .current_dir(&self.root)
-            .output()
-        {
+        if let Some(include) = options["include"].as_str() { cmd.args(["-g", include]); }
+        cmd.arg(if options["case_sensitive"] == false { "-i" } else { "--case-sensitive" });
+        cmd.arg("--").arg(pattern).arg(&target).current_dir(&self.root);
+        let (out, capture_truncated) = match crate::base::cancellable_output_bounded(&mut cmd, self.cancel, SEARCH_CAPTURE_MAX_BYTES, self.remaining_time()) {
             Ok(out) => out,
-            Err(e) => return ToolOutput::err(Phase::Orient, format!("ripgrep unavailable: {e}")),
+            Err(e) => return ToolOutput::err(Phase::Orient, format!("search failed: {e}")),
         };
         if !out.status.success() && out.status.code() != Some(1) {
             return ToolOutput::err(
@@ -1105,7 +1138,10 @@ impl<'a> Workspace<'a> {
                 )),
             );
         }
-        let text = String::from_utf8_lossy(&out.stdout);
+        let mut text = String::from_utf8_lossy(&out.stdout);
+        if capture_truncated && !text.ends_with('\n') {
+            text = std::borrow::Cow::Owned(text.rsplit_once('\n').map_or(String::new(), |(prefix, _)| prefix.to_owned()));
+        }
         let lines: Vec<&str> = text.lines().collect();
         if lines.is_empty() {
             // A phrase with no exact hit can still identify a useful group of
@@ -1119,13 +1155,14 @@ impl<'a> Workspace<'a> {
             {
                 let mut common: Option<BTreeSet<String>> = None;
                 for word in words {
-                    let files = Command::new("rg")
-                        .args(["-l", "-i", "-F", "--"])
-                        .arg(word)
-                        .arg(&target)
-                        .current_dir(&self.root)
-                        .output();
-                    let Ok(files) = files else {
+                    let mut command = Command::new("rg");
+                    command.args(["-l", "-i", "-F"]);
+                    if let Some(include) = options["include"].as_str() { command.args(["-g", include]); }
+                    command.arg("--").arg(word).arg(&target).current_dir(&self.root);
+                    let files = crate::base::cancellable_output_bounded(&mut command, self.cancel, SEARCH_CAPTURE_MAX_BYTES, self.remaining_time());
+                    let Ok((files, false)) = files else {
+                        // A partial intersection could falsely suggest exhaustive candidates.
+                        common = None;
                         break;
                     };
                     if !files.status.success() && files.status.code() != Some(1) {
@@ -1158,22 +1195,12 @@ impl<'a> Workspace<'a> {
                  use find {{\"pattern\":\"{pattern}\",\"kind\":\"path\"}}."
             ));
         }
-        let files: std::collections::BTreeSet<&str> =
-            lines.iter().filter_map(|l| l.split(':').next()).collect();
-        if lines.len() > FIND_MAX_LINES {
-            let mut msg = format!(
-                "{} matches in {} files — too broad; narrow the pattern or path. Files:\n",
-                lines.len(),
-                files.len()
-            );
-            for f in files.iter().take(40) {
-                msg.push_str(&format!("  {}\n", self.rel(f)));
-            }
-            return ToolOutput::ok(Phase::Orient, msg);
-        }
+        let truncated = capture_truncated || lines.len() > limit;
         let graph = self.graph();
-        let mut out = String::new();
-        for line in lines {
+        let mut out = if truncated {
+            format!("truncated search preview: first {limit} matching lines or fewer; narrow path/include/pattern for complete results.\n")
+        } else { String::new() };
+        for line in lines.into_iter().take(limit) {
             let mut parts = line.splitn(3, ':');
             let (Some(file), Some(no), Some(body)) = (parts.next(), parts.next(), parts.next())
             else {
@@ -1192,6 +1219,46 @@ impl<'a> Workspace<'a> {
             }
         }
         ToolOutput::ok(Phase::Orient, out)
+    }
+
+    fn glob(&self, pattern: &str, path: Option<&str>, limit: Option<u64>) -> ToolOutput {
+        if pattern.trim().is_empty() {
+            return ToolOutput::err(Phase::Orient, "glob needs a file pattern, e.g. **/*.rs");
+        }
+        let target = match path {
+            None | Some(".") => self.root.clone(),
+            Some(path) => match self.resolve(path) {
+                Ok((absolute, _)) => absolute,
+                Err(error) => return ToolOutput::err(Phase::Orient, error),
+            },
+        };
+        let mut command = Command::new("rg");
+        if target.is_file() {
+            match file_glob_matches(pattern, &self.rel(target.to_string_lossy().as_ref())) {
+                Ok(false) => return ToolOutput::ok(Phase::Orient, "No files match this glob within the scope."),
+                Ok(true) => {},
+                Err(error) => return ToolOutput::err(Phase::Orient, format!("invalid file glob: {error}")),
+            }
+        }
+        command.args(["--no-config", "--files", "--sort=path", "-g", pattern, "--"]).arg(target).current_dir(&self.root);
+        let (output, capture_truncated) = match crate::base::cancellable_output_bounded(&mut command, self.cancel, SEARCH_CAPTURE_MAX_BYTES, self.remaining_time()) {
+            Ok(output) => output,
+            Err(error) => return ToolOutput::err(Phase::Orient, error.to_string()),
+        };
+        if !output.status.success() && output.status.code() != Some(1) {
+            return ToolOutput::err(Phase::Orient, format!("glob failed: {}", String::from_utf8_lossy(&output.stderr)));
+        }
+        let text = String::from_utf8_lossy(&output.stdout);
+        let mut paths = text.lines().map(|path| self.rel(path)).collect::<Vec<_>>();
+        if capture_truncated && !text.ends_with('\n') { paths.pop(); }
+        let limit = limit.unwrap_or(40).clamp(1, 80) as usize;
+        let truncated = capture_truncated || paths.len() > limit;
+        paths.truncate(limit);
+        ToolOutput::ok(Phase::Orient, if paths.is_empty() {
+            "No files match this glob within the scope and ignore rules.".into()
+        } else {
+            format!("{}{}\n{}", if truncated { "truncated file preview · " } else { "files · " }, paths.len(), paths.join("\n"))
+        })
     }
 
     fn find_paths(&self, pattern: &str, path: Option<&str>) -> ToolOutput {
@@ -2506,6 +2573,24 @@ mod map_tests {
         )
         .unwrap();
         assert!(worker.specs().iter().any(|s| s.name == "map"));
+        assert!(worker.specs().iter().any(|s| s.name == "glob"));
+        let files = worker.call("glob", &json!({"pattern":"**/*.py"}));
+        assert!(!files.is_error && files.text.contains("src/lib.py"), "{}", files.text);
+        let scoped = worker.call("glob", &json!({"pattern":"*.py", "path":"src"}));
+        assert!(!scoped.is_error && scoped.text.contains("src/lib.py"), "{}", scoped.text);
+        assert!(worker.call("glob", &json!({"pattern":"*.py", "path":"../"})).is_error);
+        assert!(worker.call("glob", &json!({"pattern":"["})).is_error);
+        assert!(worker.call("glob", &json!({"pattern":""})).is_error);
+        let excluded = worker.call("find", &json!({"pattern":"helper", "include":"*.rs"}));
+        assert!(!excluded.is_error && !excluded.text.contains("src/lib.py:1"), "{}", excluded.text);
+        let folded = worker.call("find", &json!({"pattern":"HELPER", "case_sensitive":false, "limit":1}));
+        assert!(!folded.is_error && folded.text.contains("src/lib.py:1") && folded.text.contains("truncated"), "{}", folded.text);
+        let single = worker.call("find", &json!({"pattern":"entry", "path":"src/lib.py"}));
+        assert!(!single.is_error && single.text.contains("src/lib.py:3"), "{}", single.text);
+        let excluded_file = worker.call("find", &json!({"pattern":"entry", "path":"src/lib.py", "include":"*.rs"}));
+        assert!(!excluded_file.is_error && !excluded_file.text.contains("src/lib.py:3"), "{}", excluded_file.text);
+        let excluded_glob = worker.call("glob", &json!({"pattern":"*.rs", "path":"src/lib.py"}));
+        assert!(!excluded_glob.is_error && !excluded_glob.text.contains("src/lib.py"), "{}", excluded_glob.text);
         let split = worker.call(
             "plan_split",
             &json!({"ids":["src/lib.py::helper","src/lib.py::entry"]}),
@@ -2728,6 +2813,22 @@ mod map_tests {
 
     #[test]
     fn v4_indexes_survive_workers_and_reparse_only_changed_files() {
+        fn wait_for_cleanup(slot: &Path) {
+            use fs2::FileExt;
+            let lease = fs::OpenOptions::new().read(true).write(true)
+                .open(slot.with_extension("lock")).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                match lease.try_lock_exclusive() {
+                    Ok(()) => break,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(Instant::now() < deadline, "overlay cleanup did not release {}", slot.display());
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("overlay lease check failed: {error}"),
+                }
+            }
+        }
         let directory = tempfile::tempdir().unwrap();
         assert!(
             Command::new("git")
@@ -2749,7 +2850,7 @@ mod map_tests {
         )
         .unwrap();
         let cancel = AtomicBool::new(false);
-        let (first_graph, first_cache, first_revision) = {
+        let (first_graph, first_cache, first_revision, first_slot) = {
             let revision = Revision::capture(directory.path()).unwrap();
             let mut overlay = Overlay::create(directory.path(), &revision).unwrap();
             let mut worker = Workspace::new(
@@ -2773,8 +2874,12 @@ mod map_tests {
                 Arc::clone(&worker.graph),
                 Arc::clone(&worker.structural_cache),
                 revision,
+                worker.root.clone(),
             )
         };
+        // Drop removes the overlay asynchronously while keeping the lane leased.
+        // This test checks sequential reuse, so wait for that actual precondition.
+        wait_for_cleanup(&first_slot);
 
         {
             let mut overlay = Overlay::create(directory.path(), &first_revision).unwrap();
@@ -2796,6 +2901,7 @@ mod map_tests {
             assert!(!worker.call("map", &json!({"path":"src"})).is_error);
             assert!(!worker.structural_cache.lock().unwrap().entries.is_empty());
         }
+        wait_for_cleanup(&first_slot);
 
         fs::write(
             directory.path().join("src/a.rs"),

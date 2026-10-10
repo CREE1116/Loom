@@ -13,4 +13,4 @@ pub use events::{EventLog, RecordedEvent};
 pub use ids::{AttemptId, SymbolId, TaskId, WorkerId};
 pub use revision::Revision;
 pub(crate) use revision::{KnownBlobs, remember_blobs};
-pub use process::{cancellable_output, cancellable_status};
+pub use process::{cancellable_output, cancellable_output_bounded, cancellable_status};

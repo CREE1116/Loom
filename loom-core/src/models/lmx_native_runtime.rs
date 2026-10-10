@@ -13,7 +13,7 @@ use super::native_runtime::{SparkOutput, THINK_OPEN, check_limits, parse_tool_ca
 use super::*;
 use std::{
     path::{Path, PathBuf},
-    sync::{Mutex, MutexGuard},
+    sync::{Mutex, MutexGuard, TryLockError},
     time::Instant,
 };
 
@@ -260,15 +260,50 @@ static LIVE: Mutex<Option<Live>> = Mutex::new(None);
 
 fn live() -> MutexGuard<'static, Option<Live>> {
     LIVE.lock().unwrap_or_else(|poisoned| {
-        // A panic mid-request may leave the sequence in any state; start it over.
         let mut slot = poisoned.into_inner();
-        if let Some(live) = slot.as_mut() {
-            live.engine.reset();
-            live.tokens.clear();
-            live.checkpoints.clear();
-        }
+        reset_poisoned(&mut slot);
         slot
     })
+}
+
+fn reset_poisoned(slot: &mut Option<Live>) {
+    // A panic mid-request may leave the sequence in any state; start it over.
+    if let Some(live) = slot.as_mut() {
+        live.engine.reset();
+        live.tokens.clear();
+        live.checkpoints.clear();
+    }
+}
+
+/// Check both while queued and after acquisition, before the caller can load a model.
+fn request_slot<T>(
+    mutex: &Mutex<T>,
+    mut check: impl FnMut() -> Result<(), ProviderError>,
+) -> Result<MutexGuard<'_, T>, ProviderError> {
+    loop {
+        check()?;
+        let slot = match mutex.try_lock() {
+            Ok(slot) => slot,
+            Err(TryLockError::Poisoned(error)) => error.into_inner(),
+            Err(TryLockError::WouldBlock) => {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                continue;
+            }
+        };
+        check()?;
+        return Ok(slot);
+    }
+}
+
+fn observe_checked(
+    request: &Request,
+    progress: Instant,
+    observe: &mut dyn FnMut(StreamEvent),
+    event: StreamEvent,
+) -> Result<(), ProviderError> {
+    check_limits(request, progress)?;
+    observe(event);
+    check_limits(request, progress)
 }
 
 /// Frees the engine unless a request is using it (another runtime is loading).
@@ -498,8 +533,14 @@ pub fn infer(
 ) -> Result<Response, ProviderError> {
     request.check_cancelled()?;
     let started = Instant::now();
-    let mut slot = live();
-    let live = load(&mut slot, model)?;
+    let mut slot = request_slot(&LIVE, || check_limits(request, started))?;
+    if LIVE.is_poisoned() {
+        reset_poisoned(&mut slot);
+    }
+    check_limits(request, started)?;
+    let loaded = load(&mut slot, model);
+    check_limits(request, started)?;
+    let live = loaded?;
     let loaded_at = started.elapsed();
 
     let thinking = request.reasoning_effort.as_deref().is_some_and(|effort| effort != "none");
@@ -620,7 +661,7 @@ pub fn infer(
     while generated < max_output {
         if last_speed.elapsed().as_millis() >= 500 {
             last_speed = Instant::now();
-            observe(StreamEvent::Speed { tokens: generated as u64, seconds: decode_started.elapsed().as_secs_f64() });
+            observe_checked(request, progress, observe, StreamEvent::Speed { tokens: generated as u64, seconds: decode_started.elapsed().as_secs_f64() })?;
         }
         check_limits(request, progress)?;
         let token = sampler.sample(&logits);
@@ -631,7 +672,7 @@ pub fn infer(
         let text = detok.push(&live.tokenizer, token);
         for delta in output.feed(&text) {
             if !delta.is_empty() {
-                observe(StreamEvent::TextDelta(delta));
+                observe_checked(request, progress, observe, StreamEvent::TextDelta(delta))?;
             }
         }
         generated += 1;
@@ -639,11 +680,11 @@ pub fn infer(
         progress = Instant::now();
     }
     if generated > 0 {
-        observe(StreamEvent::Speed { tokens: generated as u64, seconds: decode_started.elapsed().as_secs_f64() });
+        observe_checked(request, progress, observe, StreamEvent::Speed { tokens: generated as u64, seconds: decode_started.elapsed().as_secs_f64() })?;
     }
     for delta in output.finish() {
         if !delta.is_empty() {
-            observe(StreamEvent::TextDelta(delta));
+            observe_checked(request, progress, observe, StreamEvent::TextDelta(delta))?;
         }
     }
     let mut parts = Vec::new();
@@ -659,7 +700,7 @@ pub fn infer(
         Stop::MaxTokens
     };
     let usage = Usage { input: Some(tokens.len() as u64), cached_input: Some(reused as u64), output: Some(generated as u64) };
-    observe(StreamEvent::Usage(usage.clone()));
+    observe_checked(request, progress, observe, StreamEvent::Usage(usage.clone()))?;
     Ok(Response {
         parts,
         usage,
@@ -675,6 +716,103 @@ pub fn infer(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn request_slot_acquires_immediately() {
+        let mutex = Mutex::new(7);
+        let request = Request::default();
+        let started = Instant::now();
+        let mut checks = 0;
+        let slot = request_slot(&mutex, || {
+            checks += 1;
+            check_limits(&request, started)
+        }).unwrap();
+        assert_eq!(*slot, 7);
+        assert_eq!(checks, 2, "check before and after acquiring");
+    }
+
+    #[test]
+    fn request_slot_cancelled_while_queued_never_loads() {
+        let mutex = Mutex::new(0);
+        let held = mutex.lock().unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let request = Request { cancel: Some(Arc::clone(&cancel)), ..Request::default() };
+        let started = Instant::now();
+        let mut checks = 0;
+        let result = request_slot(&mutex, || {
+            checks += 1;
+            if checks == 2 {
+                cancel.store(true, Ordering::Release);
+            }
+            check_limits(&request, started)
+        }).map(|mut slot| *slot += 1); // stand-in for loading after acquisition
+        assert_eq!(result.unwrap_err().kind, ErrorKind::Cancelled);
+        assert_eq!(checks, 2, "cancellation is checked again while the owner holds the lock");
+        drop(held);
+        assert_eq!(*mutex.try_lock().unwrap(), 0);
+    }
+
+    #[test]
+    fn request_slot_times_out_while_queued() {
+        let mutex = Mutex::new(());
+        let held = mutex.lock().unwrap();
+        let request = Request { timeout: Some(std::time::Duration::from_secs(1)), ..Request::default() };
+        let mut checks = 0;
+        let result = request_slot(&mutex, || {
+            checks += 1;
+            // Advance the checked elapsed time after the first blocked attempt, without
+            // depending on thread scheduling or waiting for a real one-second deadline.
+            let elapsed = if checks == 1 { 0 } else { 2 };
+            check_limits(&request, Instant::now() - std::time::Duration::from_secs(elapsed))
+        });
+        assert_eq!(result.unwrap_err().kind, ErrorKind::TimedOut);
+        assert_eq!(checks, 2);
+        drop(held);
+        assert!(mutex.try_lock().is_ok());
+    }
+
+    #[test]
+    fn request_slot_cancelled_on_acquisition_releases_guard() {
+        let mutex = Mutex::new(());
+        let cancel = Arc::new(AtomicBool::new(false));
+        let request = Request { cancel: Some(Arc::clone(&cancel)), ..Request::default() };
+        let started = Instant::now();
+        let mut checks = 0;
+        let result = request_slot(&mutex, || {
+            checks += 1;
+            if checks == 2 {
+                cancel.store(true, Ordering::Release);
+            }
+            check_limits(&request, started)
+        });
+        assert_eq!(result.unwrap_err().kind, ErrorKind::Cancelled);
+        assert!(mutex.try_lock().is_ok(), "a cancelled acquisition releases its guard");
+    }
+
+    #[test]
+    fn streaming_callback_cancellation_is_checked_before_returning() {
+        for event in [
+            StreamEvent::TextDelta("last token".into()),
+            StreamEvent::Speed { tokens: 1, seconds: 0.1 },
+            StreamEvent::Usage(Usage::default()),
+        ] {
+            let cancel = Arc::new(AtomicBool::new(false));
+            let request = Request { cancel: Some(Arc::clone(&cancel)), ..Request::default() };
+            let mut called = false;
+            let result = observe_checked(&request, Instant::now(), &mut |_| {
+                called = true;
+                cancel.store(true, Ordering::Release);
+            }, event);
+            assert!(called);
+            assert_eq!(result.unwrap_err().kind, ErrorKind::Cancelled);
+
+            // No subsequent callback is delivered once cancellation is visible.
+            let result = observe_checked(&request, Instant::now(), &mut |_| {
+                panic!("callback after cancellation");
+            }, StreamEvent::Usage(Usage::default()));
+            assert_eq!(result.unwrap_err().kind, ErrorKind::Cancelled);
+        }
+    }
 
     #[test]
     fn nucleus_sampling_is_greedy_at_zero_and_stays_in_the_nucleus() {

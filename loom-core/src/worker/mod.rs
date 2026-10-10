@@ -176,6 +176,7 @@ const TOOL_GROUPS: &[(&str, &str)] = &[
 ];
 const CORE_TOOLS: &[&str] = &[
     "find",
+    "glob",
     "outline",
     "read",
     "read_artifact",
@@ -917,6 +918,7 @@ fn run_scoped<'scope, 'env>(
                     | "symbol_impact"
                     | "read_many"
                     | "find"
+                    | "glob"
                     | "ast_search"
                     | "outline"
                     | "read"

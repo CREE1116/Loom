@@ -94,11 +94,23 @@ loom model bench <id> --prompt 512 --gen 64
 
 ## Remote control
 
-Type `/remote` to open a small web server and show its address as a QR code; scan it
-with a phone on the same network to read the conversation, send messages, stop a task
-and answer approvals from the browser. `/remote off` stops it. Each session gets a new
-random token in the address and nothing is reachable without it, but traffic is plain
-HTTP: use it on networks you trust (or over a VPN such as Tailscale).
+Type `/remote` and scan the QR code to control the open Loom conversation in a phone
+browser. With `cloudflared` installed, Loom prepares a public HTTPS address; until it
+is ready, or if it fails, the local network address remains available. Use
+`/remote local` for local-only HTTP and `/remote off` to close the server and tunnel.
+Closing the QR window keeps remote control on; `/remote` opens it again.
+
+The page shows recent conversation entries, grouped tool activity, approvals and
+questions. Send or queue messages, stop work, answer choices or custom questions,
+choose a model and reasoning level, compact, or start a new conversation. Failed
+sends stay recoverable; they are never retried automatically. Local drafts, images
+and selected skills stay on the computer. The page can be added to a phone's home
+screen; it requires a live connection to Loom.
+
+Conversation and control APIs require the random token in the QR address. Anyone
+with that address can control the session. Local HTTP is unencrypted: use a trusted
+network or VPN. Restarting remote control changes the token (and the quick-tunnel
+address); scan the new QR code. See [remote verification](docs/loom-remote-release-2026-10-10.md).
 
 ## Long conversations
 
@@ -115,7 +127,10 @@ and Codex plugin caches. Mention one as `$name` in a request or pick it with `/s
 the model can also load one when it needs it.
 
 Three skills ship with Loom: `loom-guide` (how Loom itself works and how to fix common
-problems), `skill-builder` (writing skills) and `loom-extension` (adding tools).
+problems), `skill-builder` (writing skills), `loom-extension` (adding tools),
+`loom-plan` (implementation planning), `loom-debug` (reproduction and diagnosis),
+and `loom-review` (evidence-based code review). Press `Ctrl+P` to search commands
+by name or description while keeping your message draft.
 
 ## Extensions
 

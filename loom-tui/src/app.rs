@@ -8,6 +8,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 mod activity;
 mod commands;
+mod command_palette;
 mod doctor;
 mod events;
 mod images;
@@ -491,7 +492,7 @@ const COMMANDS: &[(&str, &str)] = &[
     ("/clear", "기록을 보존하고 새 대화로 초기화"),
     ("/compression", "현재 대화의 실제 컨텍스트 압축"),
     ("/compact", "/compression과 동일: 컨텍스트 압축"),
-    ("/remote", "폰·브라우저에서 원격 조작: /remote [off]"),
+    ("/remote", "폰·브라우저에서 원격 조작: /remote [local|off]"),
     ("/stop", "현재 응답 중단 (/cancel도 가능)"),
     ("/status", "현재 실행·목표·대기열·작업 상태"),
     ("/doctor", "환경·도구체인·로컬모델 진단: /doctor"),
@@ -578,8 +579,8 @@ pub enum Intent {
     PreviewRewind(String),
     SaveSettings,
     ExportDiagnostics,
-    /// Turn remote control on (true) or off.
-    Remote(bool),
+    /// Turn remote control on (Some: whether to open an internet tunnel too) or off.
+    Remote(Option<bool>),
     UpdatePermission(String, String),
     TrustWorkspace(bool),
     RefreshUsage,
@@ -747,6 +748,7 @@ pub struct App {
     runtime_remove: Option<String>,
     runtime_reload: bool,
     menu_open: bool,
+    command_search: Editor,
     menu_dismissed: bool,
     menu_index: usize,
 }
@@ -895,6 +897,7 @@ impl App {
             runtime_remove: None,
             runtime_reload: false,
             menu_open: false,
+            command_search: Editor::default(),
             menu_dismissed: false,
             menu_index: 0,
         }
@@ -1046,6 +1049,11 @@ impl App {
             return;
         }
         if self.question_paste(text) {
+            return;
+        }
+        if self.menu_open {
+            self.command_search.insert(&text.replace(['\n', '\r'], " "));
+            self.menu_index = 0;
             return;
         }
         if self.view == View::Models && !self.composer_active {
@@ -1553,9 +1561,14 @@ impl App {
             }
             Action::Menu => {
                 self.menu_open = !self.menu_open;
+                self.command_search = Editor::default();
+                self.composer_active = true;
                 self.menu_dismissed = false;
                 self.menu_index = 0;
                 self.focus = None;
+            }
+            Action::Command(command) if self.menu_open => {
+                return self.select_palette_command(command, false);
             }
             Action::Command(command) => return self.command(&command),
             Action::Skill(path) if !self.readonly => {
@@ -2488,7 +2501,7 @@ impl App {
             return Vec::new();
         }
         let text = self.editor.text.trim();
-        if text.starts_with('$') && !text.contains(char::is_whitespace) {
+        if !self.menu_open && text.starts_with('$') && !text.contains(char::is_whitespace) {
             let filter = text.trim_start_matches('$').to_lowercase();
             return self
                 .skills
@@ -2506,7 +2519,14 @@ impl App {
         if self.menu_open || (text.starts_with('/') && !text.contains(char::is_whitespace)) {
             return COMMANDS
                 .iter()
-                .filter(|(name, _)| self.menu_open || name.starts_with(text))
+                .filter(|(name, description)| {
+                    if self.menu_open {
+                        let searchable = format!("{name} {description} {}", self.label(description)).to_lowercase();
+                        self.command_search.text.split_whitespace().all(|word| searchable.contains(&word.to_lowercase()))
+                    } else {
+                        name.starts_with(text)
+                    }
+                })
                 .map(|(name, desc)| {
                     (
                         name.to_string(),
@@ -2803,6 +2823,12 @@ impl App {
         }
         if self.question_visible() && self.approvals.is_empty() {
             return self.question_key(key);
+        }
+        if ctrl_char(key, 'p') && !self.readonly {
+            return self.activate(Action::Menu);
+        }
+        if self.menu_open {
+            return self.command_palette_key(key);
         }
         if key.code == KeyCode::Esc && self.model_command_draft.is_some() {
             self.editor = self.model_command_draft.take().unwrap();
@@ -3135,6 +3161,7 @@ impl App {
     }
     pub fn render(&mut self, width: u16, height: u16) -> Canvas {
         let mut c = Canvas::new(width, height);
+        let mut palette_cursor = None;
         c.accent = self.preferences.accent;
         // Settings owns its side pane independently of the activity panel preference.
         self.wide_layout = width >= 110
@@ -3602,25 +3629,38 @@ impl App {
         } else if width >= 110 {
             c.button(width - 14, 1, self.label("패널 열기"), Action::Panel, false);
         }
-        if !menu.is_empty() {
+        if !menu.is_empty() || self.menu_open {
+            let header_rows = if self.menu_open { 2 } else { 1 };
             let count = menu
                 .len()
-                .min(usize::from(body_height.saturating_sub(1)))
+                .min(usize::from(body_height.saturating_sub(header_rows)))
                 .min(5);
-            let index = self.menu_index.min(menu.len() - 1);
+            let index = self.menu_index.min(menu.len().saturating_sub(1));
             let start = index.saturating_sub(count.saturating_sub(1));
-            let mut popup = Canvas::new(left_width, count as u16 + 1);
+            let mut popup = Canvas::new(left_width, (count.max(1) as u16 + header_rows).min(body_height));
             popup.rule(
                 0,
-                if self.editor.text.starts_with('$') {
+                if self.menu_open {
+                    if self.view == View::Chat && (self.turn.is_some() || self.submitted.is_some() || (self.busy && self.status == "inProgress")) {
+                        if self.preferences.language == Language::English { "Commands · type to search · Esc stop" } else { "명령 검색 · 입력해서 찾기 · Esc 중단" }
+                    } else if self.preferences.language == Language::English { "Commands · type to search · Esc close" } else { "명령 검색 · 입력해서 찾기 · Esc 닫기" }
+                } else if self.editor.text.starts_with('$') {
                     "스킬 · ↑↓ 선택 · Enter 추가"
                 } else {
                     "명령 · ↑↓ 선택 · Enter 입력"
                 },
             );
+            if self.menu_open {
+                let (query, column) = self.command_search_field(usize::from(left_width));
+                popup.text(2, 1, &format!("> {query}"), Tone::Accent);
+                palette_cursor = Some((4 + column as u16, body_end - popup.height + 1));
+                if menu.is_empty() {
+                    popup.text(2, 2, if self.preferences.language == Language::English { "No matching commands" } else { "일치하는 명령이 없습니다" }, Tone::Muted);
+                }
+            }
             for (row, (label, desc, action)) in menu.iter().skip(start).take(count).enumerate() {
-                let x = popup.button(2, row as u16 + 1, label, action.clone(), false);
-                popup.text(x, row as u16 + 1, self.label(desc), Tone::Muted);
+                let x = popup.button(2, row as u16 + header_rows, label, action.clone(), false);
+                popup.text(x, row as u16 + header_rows, self.label(desc), Tone::Muted);
                 if start + row == index {
                     popup.highlight(action, Tone::Selected);
                 }
@@ -3896,6 +3936,9 @@ impl App {
             c.highlight(action, Tone::Selected);
         }
         self.paint_mouse_selection(&mut c);
+        if self.menu_open && self.trust_prompt.is_none() && !self.approval_visible() && !self.question_visible() {
+            c.cursor = palette_cursor;
+        }
         self.paint_remote(&mut c);
         c
     }
@@ -4394,7 +4437,7 @@ impl App {
                     }
                 }
                 for line in wrap(
-                    "/ 명령 메뉴 · $ 스킬 검색\nTab/Shift+Tab 버튼 이동 · Enter 선택\nEsc 응답 중단 · 메뉴/질문에서는 닫기\nAlt+Enter 줄바꿈 · Ctrl+C 중단\nPageUp/PageDown 기록 · Ctrl+Q 종료\n마우스 오버 강조 · 클릭 실행 · 휠 스크롤",
+                    "Ctrl+P 명령 검색 · / 자동완성 · $ 스킬 검색\nTab/Shift+Tab 버튼 이동 · Enter 선택\nEsc 응답 중단 · 메뉴/질문에서는 닫기\nAlt+Enter 줄바꿈 · Ctrl+C 중단\nPageUp/PageDown 기록 · Ctrl+Q 종료\n마우스 오버 강조 · 클릭 실행 · 휠 스크롤",
                     width,
                 ) {
                     rows.push((line, Tone::Normal, None));

@@ -33,8 +33,26 @@ jobs:
         run: |
           if (-not (Get-Command rg -ErrorAction SilentlyContinue)) { choco install ripgrep -y --no-progress }
       - name: Core tests
-        run: cargo test --locked --manifest-path loom-core/Cargo.toml
+        run: cargo test --locked --manifest-path loom-core/Cargo.toml -- --test-threads=1
       - name: TUI tests
-        run: cargo test --locked --manifest-path loom-tui/Cargo.toml
+        run: cargo test --locked --manifest-path loom-tui/Cargo.toml -- --test-threads=1
       - name: Self-check (headless UI scenarios)
         run: cargo run --locked --quiet --manifest-path loom-tui/Cargo.toml -- --self-check
+      - name: Remote control through the real TUI (demo, no model)
+        if: runner.os != 'Windows'
+        run: python3 loom-tui/tests/remote_smoke.py
+  remote-browser:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Install isolated browser test dependencies
+        run: |
+          npm install --prefix "$RUNNER_TEMP/loom-browser" playwright@1.62.1
+          "$RUNNER_TEMP/loom-browser/node_modules/.bin/playwright" install --with-deps chromium
+      - name: Phone browser interaction tests
+        env:
+          PLAYWRIGHT_MODULE_PATH: ${{ runner.temp }}/loom-browser/node_modules/playwright
+        run: node --test loom-tui/tests/remote_browser.mjs

@@ -51,6 +51,17 @@ another instance of one of these states.
   when space allows; narrow panes put metadata beneath the row and preserve its
   click target. Color execution status even when the row is focused.
 - **Navigation:** keep Chat, Work, Sessions, Environment and Settings as roots. Work and Environment own their child actions. Chat overview shows compact status and links; menu details replace it in the same side pane. Do not repeat command output in both transcript and overview. A waiting indicator opens the operational trace without interrupting execution.
+- **Command search:** Ctrl+P searches command names and descriptions independently
+  of the message draft. Closing, immediate execution and cancelling argument entry
+  preserve the original draft, cursor and selection, including when the picker is
+  reopened during argument entry. Empty results never submit a message. Show the
+  search cursor in its own field and advertise Esc as stop while a turn is active.
+- **Remote control:** browser sends preserve the local draft, cursor, selection,
+  attachments, skills and paste state. Questions require explicit validated answers;
+  stale approvals and unsupported settings report a rejection. A failed tunnel clears
+  the preparing state and leaves the local address usable. Failed browser sends and
+  replies remain recoverable, reconnection restores status even at the same version,
+  and retries reuse the action ID rather than submitting the same operation twice.
 - **Layouts:** the composer and conversation retain priority as the terminal
   narrows. Do not force the right pane into an unreadable width. Use lines for
   main partitions and whitespace inside sections; avoid adding card containers.

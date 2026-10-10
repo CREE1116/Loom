@@ -102,6 +102,22 @@ impl App {
             form.error = reason.into();
         }
     }
+    pub(super) fn remote_answers(&mut self, id: &str, answers: Option<Vec<QuestionAnswer>>) -> Result<Option<Intent>, String> {
+        let form = self.input_forms.iter_mut().find(|f| f.request.id == id)
+            .ok_or_else(|| "이미 처리된 질문입니다. 최신 질문을 확인해주세요.".to_owned())?;
+        if form.answering { return Err("이 질문의 답변을 처리 중입니다.".into()); }
+        if let Some(answers) = answers {
+            form.request.validate_answers(&answers).map_err(|e| e.to_string())?;
+            form.answering = true;
+            form.error.clear();
+            Ok(Some(Intent::Answer(id.to_owned(), answers)))
+        } else {
+            form.answering = true;
+            form.cancelling = true;
+            form.error.clear();
+            Ok(Some(Intent::CancelQuestions(id.to_owned())))
+        }
+    }
     fn visible_form(&self) -> Option<&InputForm> {
         self.input_forms.first().filter(|f| !f.dismissed)
     }

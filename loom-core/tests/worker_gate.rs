@@ -86,6 +86,30 @@ fn call(name: &str, args: serde_json::Value) -> Response {
 }
 
 #[test]
+fn file_patterns_and_filtered_search_are_available_to_read_only_workers_without_enabling_tools() {
+    let (_directory, mut task) = task(4);
+    task.tools = ToolSet::ReadOnly;
+    task.goal = "Find Rust files and the VALUE symbol without editing".into();
+    let model = ScriptedModel::new([
+        call("glob", json!({"pattern":"**/*.rs"})),
+        call("find", json!({"pattern":"VALUE", "include":"*.rs", "case_sensitive":false})),
+        call("finish", json!({"summary":"Found value in lib.rs", "answer":true})),
+    ]);
+    let mut results = Vec::new();
+    let report = run(&mut task, &model, &AtomicBool::new(false), |event| {
+        if matches!(event["tool"].as_str(), Some("glob" | "find")) && event["result"].is_string() {
+            results.push(event["result"].as_str().unwrap().to_owned());
+        }
+    }).unwrap();
+    assert_eq!(results.len(), 2);
+    assert!(results[0].contains("lib.rs"), "{}", results[0]);
+    assert!(results[1].contains("lib.rs:1") && results[1].contains("value"), "{}", results[1]);
+    assert!(report.patch.files.is_empty());
+    let requests = model.requests();
+    assert!(requests[0].tools.iter().any(|tool| tool.name == "glob"));
+}
+
+#[test]
 fn graph_child_check_is_deferred_and_never_reported_as_passed() {
     let (_directory, mut task) = task(2);
     task.defer_validation_to_core = true;

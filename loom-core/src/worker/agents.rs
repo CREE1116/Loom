@@ -199,6 +199,7 @@ impl<'scope, 'env> Agents<'scope, 'env> {
             "map"
                 | "plan_split"
                 | "find"
+                | "glob"
                 | "ast_search"
                 | "outline"
                 | "read"
