@@ -399,7 +399,8 @@ pub fn run(
     let mut failed_delegation = false;
     let mut finished = false;
     let mut summary = "worker did not finish".to_owned();
-    let mut last_calls: Option<(String, String, String)> = None;
+    let mut recent_calls = std::collections::VecDeque::new();
+    let mut recent_revision = String::new();
     let mut repeated = 0;
     let mut unusable = 0;
     let mut connection = None;
@@ -639,11 +640,18 @@ pub fn run(
             }
         }
         let fingerprint = (revision, call_key, evidence.join("\u{0}"));
-        if last_calls.as_ref() == Some(&fingerprint) {
+        if recent_revision != fingerprint.0 {
+            recent_calls.clear();
+            recent_revision.clone_from(&fingerprint.0);
+        }
+        if recent_calls.contains(&fingerprint) {
             repeated += 1;
         } else {
             repeated = 0;
-            last_calls = Some(fingerprint);
+        }
+        recent_calls.push_back(fingerprint);
+        while recent_calls.len() > 8 {
+            recent_calls.pop_front();
         }
         let navigation_only = calls_names
             .iter()
@@ -662,7 +670,7 @@ pub fn run(
             for part in &mut results {
                 if let Part::ToolResult { output, .. } = part {
                     *output = format!(
-                        "[same call as your previous step on an unchanged repository; the result is identical. Use it, try a different query or range, or finish.]\n{output}"
+                        "[same call as a recent step on an unchanged repository; the result is identical. Use it, try a different query or range, or finish.]\n{output}"
                     );
                 }
             }
@@ -816,6 +824,10 @@ mod startup_tests {
     /// Small local models often repeat a lookup; they get told so and may recover, and
     /// only a long unbroken run of the same call on an unchanged repository stops them.
     fn repeat_tool(repeats: usize, name: &str, arguments: Value) -> (Proposal, Vec<String>) {
+        repeat_arguments(name, vec![arguments; repeats])
+    }
+
+    fn repeat_arguments(name: &str, arguments: Vec<Value>) -> (Proposal, Vec<String>) {
         let root = tempfile::tempdir().unwrap();
         assert!(Command::new("git").args(["init", "-q"]).arg(root.path())
             .status().unwrap().success());
@@ -833,8 +845,8 @@ mod startup_tests {
             gateway_upstream_ms: None,
         };
         let model = ScriptedModel::new(
-            (0..repeats)
-                .map(|_| reply(name, arguments.clone()))
+            arguments.into_iter()
+                .map(|args| reply(name, args))
                 .chain([reply("finish", json!({"summary":"found initial"}))]),
         );
         let options = Options::default();
@@ -868,6 +880,24 @@ mod startup_tests {
         assert_eq!(proposal.summary, "repeated identical operations on unchanged revision");
         assert_eq!(outputs.len(), 4, "the fifth repeated response stops the loop");
         assert!(outputs[1..].iter().all(|output| output.contains("same call")));
+    }
+
+    #[test]
+    fn alternating_success_and_invalid_calls_cannot_reset_stagnation() {
+        let arguments = (0..12).map(|n| json!({"command":"git status --short",
+            "kind":if n % 2 == 0 { "command" } else { "invalid" }})).collect();
+        let (proposal, outputs) = repeat_arguments("run", arguments);
+        assert!(!proposal.complete);
+        assert_eq!(proposal.summary, "repeated identical operations on unchanged revision");
+        assert!(outputs.len() <= 6, "alternating repeats must stop early");
+    }
+
+    #[test]
+    fn shell_command_without_kind_is_executed_and_returns_its_output() {
+        let (proposal, outputs) = repeat_tool(1, "run", json!({"command":"git status --short"}));
+        assert!(proposal.complete, "{}", proposal.summary);
+        assert!(outputs[0].contains("Passed"), "{outputs:?}");
+        assert!(!outputs[0].contains("missing kind"));
     }
 
     #[test]

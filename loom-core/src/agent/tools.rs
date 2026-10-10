@@ -78,7 +78,7 @@ pub fn specs(delegate: bool, readonly: bool) -> Vec<ToolSpec> {
     ];
     if !readonly {
         tools.push(spec("change", "Change one current target: edit exact old/new text; replace a whole symbol with content; create a new file; delete or move a previously opened file. Read before modifying. Writes remain inside your assigned scope.",json!({"op":{"type":"string","enum":["edit","replace","create","delete","move"]},"target":{"type":"string"},"old":{"type":"string"},"new":{"type":"string"},"content":{"type":"string"},"destination":{"type":"string"}}), &["op","target"]));
-        tools.push(spec("run", "Run a bounded shell command. kind=check runs the supplied command, or configured validation when command is omitted. Commands run in an isolated copy of the repository with the repository root as working directory: use relative paths. Create or edit files with change (op=create/edit), not shell redirection; file changes are proposed for approval. Do not use shell ls/find/grep for repository navigation or code search; use find/open/expand/project instead. Command output is stored and returned as artifact_target for open. Full validation of child proposals belongs to Core after merge.",json!({"kind":{"type":"string","enum":["command","check"]},"command":{"type":"string","minLength":1}}), &["kind"]));
+        tools.push(spec("run", "Run a bounded shell command. When command is supplied, omitted kind defaults to command. kind=check runs the supplied command, or configured validation when command is omitted. Commands run in an isolated copy of the repository with the repository root as working directory: use relative paths. Create or edit files with change (op=create/edit), not shell redirection; file changes are proposed for approval. Do not use shell ls/find/grep for repository navigation or code search; use find/open/expand/project instead. Successful output includes its first 8000 bytes; failures include the last 1500 bytes. When output_truncated is true, use open on artifact_target to read more instead of rerunning the command. Full validation of child proposals belongs to Core after merge.",json!({"kind":{"type":"string","enum":["command","check"]},"command":{"type":"string","minLength":1}}), &[]));
     }
     if delegate {
         tools.push(spec("agent", "Delegate a DAG of concrete goals. Calling this switches the main worker to orchestration. Each unit requires id, goal, write_files and depends_on. Children share the World parse index, use isolated revision branches, and cannot delegate. Core schedules, merges and validates. Dependencies start from merged predecessor code.",json!({"units":{"type":"array","minItems":1,"maxItems":16,"items":{"type":"object","additionalProperties":false,"required":["id","goal","write_files","depends_on"],"properties":{"id":{"type":"string"},"goal":{"type":"string"},"write_files":{"type":"array","items":{"type":"string"}},"depends_on":{"type":"array","items":{"type":"string"}}}}}}), &["units"]));
@@ -102,22 +102,21 @@ fn is_artifact_id(value: &str) -> bool {
 
 fn run_result_value(result: TestResult, store: &dyn ArtifactStore) -> Result<Value> {
     let artifact_target = format!("artifact:{}", result.artifact.id);
-    // A failure without its message leaves the model guessing, and a short output is
-    // cheaper inline than a second tool call: include the (tail of the) output.
-    let short = result.artifact.bytes <= 1500;
-    let tail = (short || result.status != crate::effects::RunStatus::Passed).then(|| {
-        let length = result.artifact.bytes as usize;
-        let start = length.saturating_sub(1500);
-        store
-            .get(&result.artifact, Some(start..length))
-            .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
-            .unwrap_or_default()
-    });
+    // Return enough successful output to make progress without a second call.
+    // For failures preserve the diagnostic tail; full output stays in the artifact.
+    let length = result.artifact.bytes as usize;
+    let success = result.status == crate::effects::RunStatus::Passed;
+    let (start, end) = if success { (0, length.min(8000)) }
+        else { (length.saturating_sub(1500), length) };
+    let output = store.get(&result.artifact, Some(start..end))
+        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+        .unwrap_or_default();
     let mut value = serde_json::to_value(result)?;
     if let Some(object) = value.as_object_mut() {
         object.insert("artifact_target".into(), json!(artifact_target));
-        if let Some(tail) = tail.filter(|tail| !tail.trim().is_empty()) {
-            object.insert("output".into(), json!(tail));
+        object.insert("output_truncated".into(), json!(start > 0 || end < length));
+        if !output.trim().is_empty() {
+            object.insert("output".into(), json!(output));
         }
     }
     Ok(value)
@@ -253,7 +252,11 @@ impl Host<'_> {
             "change" => self.change(args, cancel),
             "run" => {
                 ensure!(!self.readonly, "read-only task cannot execute commands");
-                let kind = string("kind")?;
+                let kind = match args.get("kind") {
+                    Some(value) => value.as_str().context("kind must be a string")?,
+                    None if args["command"].as_str().is_some() => "command",
+                    None => bail!("supply command, or kind=check for configured validation"),
+                };
                 if self.scope.is_some() {
                     ensure!(
                         kind == "check",
@@ -568,6 +571,24 @@ mod tests {
             "mkdir -p /private/var/w/repo/.loom/overlays/r/0/a && cat '/private/var/w/repo/.loom/overlays/r/0/b' /private/var/w/repo2/c"
         );
         assert_eq!(in_copy("ls src", workspace, copy), "ls src");
+    }
+
+    #[test]
+    fn successful_readme_output_is_inline_and_large_output_is_bounded() {
+        let root = tempfile::tempdir().unwrap();
+        let store = crate::base::FileArtifactStore::open(root.path()).unwrap();
+        for size in [7526, 20000] {
+            let text = "R".repeat(size);
+            let artifact = store.put(text.as_bytes()).unwrap();
+            let value = run_result_value(TestResult {
+                status: crate::effects::RunStatus::Passed, passed:0, failed:0,
+                failing:vec![], first_error:None, artifact, ms:1,
+            }, &store).unwrap();
+            let output = value["output"].as_str().expect("successful commands need visible output");
+            assert_eq!(output.len(), size.min(8000));
+            assert_eq!(value["output_truncated"], size > 8000);
+            assert!(value["artifact_target"].as_str().unwrap().starts_with("artifact:"));
+        }
     }
 
     #[test]
