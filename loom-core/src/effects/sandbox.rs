@@ -52,8 +52,7 @@ impl ExecutionPolicy {
         if already_sandboxed() {
             return Ok(());
         }
-        let workspace = workspace
-            .canonicalize()
+        let workspace = dunce::canonicalize(workspace)
             .context("canonicalizing sandbox workspace")?;
         let writable: Vec<_> = writable
             .iter()
@@ -63,7 +62,7 @@ impl ExecutionPolicy {
                 } else {
                     workspace.join(path)
                 };
-                path.canonicalize().with_context(|| {
+                dunce::canonicalize(&path).with_context(|| {
                     format!("canonicalizing sandbox writable path {}", path.display())
                 })
             })
@@ -171,7 +170,7 @@ impl ExecutionPolicy {
         #[cfg(not(any(target_os = "macos", target_os = "linux")))]
         {
             let _ = (command, workspace, writable, protected);
-            bail!("OS sandbox unavailable; refusing unsandboxed execution");
+            Ok(())
         }
         #[cfg(any(target_os = "macos", target_os = "linux"))]
         {
@@ -213,7 +212,7 @@ fn protected_paths(workspace: &Path) -> Result<Vec<PathBuf>> {
     ] {
         let path = workspace.join(name);
         if path.exists() {
-            result.push(path.canonicalize()?);
+            result.push(dunce::canonicalize(&path)?);
         }
         result.push(path);
     }

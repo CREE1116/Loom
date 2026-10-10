@@ -7,6 +7,7 @@ Uses the existing Unix PTY driver from terminal_smoke.py.
 import json
 import re
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -30,8 +31,23 @@ def run():
                 data = json.dumps(body).encode() if body is not None else None
                 headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
                 req = urllib.request.Request(origin + path, data=data, headers=headers)
-                with urllib.request.urlopen(req, timeout=8) as response:
-                    return json.load(response)
+                outcome = {}
+
+                def fetch():
+                    try:
+                        with urllib.request.urlopen(req, timeout=8) as response:
+                            outcome["value"] = json.load(response)
+                    except BaseException as error:
+                        outcome["error"] = error
+
+                worker = threading.Thread(target=fetch, daemon=True)
+                worker.start()
+                while worker.is_alive():
+                    session.pump(0.02)
+                worker.join()
+                if "error" in outcome:
+                    raise outcome["error"]
+                return outcome["value"]
 
             def state():
                 return request("/api/state?since=0&client=smoke")['state']
