@@ -332,12 +332,16 @@ fn finish(
             bytes.len() as u64 <= METADATA_LIMIT,
             "manifest exceeds metadata limit"
         );
-        let mut file = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(stage.join(MANIFEST))?;
-        file.write_all(&bytes)?;
-        file.sync_all()?;
+        {
+            // Closed before the rename: Windows refuses to move a directory holding an
+            // open file.
+            let mut file = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(stage.join(MANIFEST))?;
+            file.write_all(&bytes)?;
+            file.sync_all()?;
+        }
         check(progress, 0, 0)?;
         fs::remove_dir(destination).context("publication destination is not empty")?;
         fs::rename(stage, destination)?;

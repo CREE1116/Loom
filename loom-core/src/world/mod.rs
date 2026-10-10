@@ -38,7 +38,7 @@ impl World {
     }
     /// Branch snapshots share digest-keyed parses, while retaining their own revision.
     pub fn open_with_graph(root: &Path, graph_index: Arc<GraphIndex>) -> Result<Self> {
-        let root = root.canonicalize()?;
+        let root = dunce::canonicalize(root)?;
         let index = Arc::new(RepoIndex::new(&root)?);
         Self::capture(root, index, graph_index)
     }
@@ -49,7 +49,7 @@ impl World {
     }
     pub fn open_at_cancellable(root: &Path, revision: &Revision, graph_index: Arc<GraphIndex>, cancel: &std::sync::atomic::AtomicBool) -> Result<Self> {
         anyhow::ensure!(!cancel.load(std::sync::atomic::Ordering::Acquire), "indexing cancelled");
-        let root = root.canonicalize()?;
+        let root = dunce::canonicalize(root)?;
         let index = Arc::new(RepoIndex::new(&root)?);
         let files = index.snapshot_at_cancellable(revision, cancel)?;
         let graph = graph_index.graph_cancellable(&files, cancel)?;
@@ -58,7 +58,7 @@ impl World {
     /// A checkout of `snapshot`'s revision at `root`: its files are reused, not re-read.
     pub fn open_with_snapshot(root: &Path, revision: &Revision, snapshot: &FileTable, graph_index: Arc<GraphIndex>, cancel: &std::sync::atomic::AtomicBool) -> Result<Self> {
         anyhow::ensure!(snapshot.revision == revision.as_str(), "snapshot of another revision");
-        let root = root.canonicalize()?;
+        let root = dunce::canonicalize(root)?;
         let index = Arc::new(RepoIndex::new(&root)?);
         let files = snapshot.rebased(&root)?;
         let graph = graph_index.graph_cancellable(&files, cancel)?;

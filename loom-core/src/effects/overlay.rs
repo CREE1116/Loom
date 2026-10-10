@@ -48,7 +48,7 @@ impl Overlay {
 
     fn create_inner(workspace: &Path, base: &Revision, cancel: Option<&AtomicBool>) -> Result<Self> {
         check_preparation(cancel)?;
-        let root = workspace.canonicalize()?;
+        let root = dunce::canonicalize(workspace)?;
         let artifacts = FileArtifactStore::open(&root)?;
         // Allocation and sweeping share one registry lock. Otherwise a sweeper
         // could remove a revision while a new worker is creating its first slot.
@@ -355,7 +355,7 @@ impl Overlay {
         loop {
             match fs::symlink_metadata(ancestor) {
                 Ok(_) => {
-                    if !ancestor.canonicalize()?.starts_with(&self.dir) {
+                    if !dunce::canonicalize(ancestor)?.starts_with(&self.dir) {
                         bail!("path escapes overlay through a symlink");
                     }
                     break;

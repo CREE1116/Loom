@@ -107,7 +107,7 @@ impl RepositorySnapshot {
     /// the next turn's overlay of the same revision.
     pub fn rebased(&self, root: &Path) -> Result<Arc<Self>> {
         Ok(Arc::new(Self {
-            root: root.canonicalize().context("Repository root does not exist")?,
+            root: dunce::canonicalize(root).context("Repository root does not exist")?,
             revision: self.revision.clone(),
             files: self.files.clone(),
             skipped: self.skipped,
@@ -274,9 +274,7 @@ impl RepositoryExplorer {
 
     pub fn new(root: &Path) -> Result<Self> {
         Ok(Self {
-            root: root
-                .canonicalize()
-                .context("Repository root does not exist")?,
+            root: dunce::canonicalize(root).context("Repository root does not exist")?,
             state: Mutex::new(State::default()),
             queries: Mutex::new(HashMap::new()),
             builds: AtomicUsize::new(0),
