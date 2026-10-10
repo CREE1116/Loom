@@ -119,12 +119,13 @@ impl Runner {
         };
         #[cfg(not(unix))]
         let mut process = {
+            use std::os::windows::process::CommandExt;
             let mut c = Command::new("cmd");
-            c.args(["/C", command]);
+            c.args(["/D", "/S", "/C"]).raw_arg(format!("\"{command}\""));
             c
         };
         process.current_dir(directory);
-        let temporary = directory.join(".loom/tmp");
+        let temporary = directory.join(".loom").join("tmp");
         fs::create_dir_all(&temporary)?;
         process
             .env("TMPDIR", &temporary)

@@ -155,9 +155,10 @@ fn core_automatically_dispatches_independent_graph_groups_and_validates_the_merg
                 approve: false,
                 model: Some("pinned-model".into()),
                 max_attempts: 1,
-                checks: Some(vec![
-                    "rg -F '{ 2 }' left.rs && rg -F '{ 2 }' right.rs".into(),
-                ]),
+                checks: Some(vec![check_command(
+                    "rg -F '{ 2 }' left.rs && rg -F '{ 2 }' right.rs",
+                    "findstr /c:\"{ 2 }\" left.rs >nul && findstr /c:\"{ 2 }\" right.rs >nul",
+                )]),
                 ..Default::default()
             },
             &port,

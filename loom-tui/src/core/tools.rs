@@ -758,10 +758,14 @@ impl Workspace {
                 .current_dir(&self.root)
                 .output();
             #[cfg(windows)]
-            let child = Command::new("cmd")
-                .args(["/C", command])
-                .current_dir(&self.root)
-                .output();
+            let child = {
+                use std::os::windows::process::CommandExt;
+                Command::new("cmd")
+                    .args(["/D", "/S", "/C"])
+                    .raw_arg(format!("\"{command}\""))
+                    .current_dir(&self.root)
+                    .output()
+            };
             raw.extend_from_slice(format!("$ {command}\n").as_bytes());
             let out = match child {
                 Ok(out) => out,

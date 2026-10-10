@@ -53,7 +53,7 @@ impl Overlay {
         // Allocation and sweeping share one registry lock. Otherwise a sweeper
         // could remove a revision while a new worker is creating its first slot.
         let registry = fs::OpenOptions::new().create(true).truncate(false)
-            .read(true).write(true).open(root.join(".loom/overlays.lock"))?;
+            .read(true).write(true).open(root.join(".loom").join("overlays.lock"))?;
         if cancel.is_some() {
             loop {
                 check_preparation(cancel)?;
@@ -68,7 +68,7 @@ impl Overlay {
             registry.lock_exclusive()?;
         }
         sweep_abandoned(&root, base, cancel)?;
-        let overlays = root.join(".loom/overlays").join(base.as_str());
+        let overlays = root.join(".loom").join("overlays").join(base.as_str());
         fs::create_dir_all(&overlays)?;
         // Stable slots make Cargo dep-info reusable across sequential overlays. A lock
         // gives concurrent workers independent slots and is released after a crash.
@@ -333,7 +333,7 @@ impl Overlay {
     }
     /// Runner passes this explicitly to Cargo; it is never a writable symlink in the overlay.
     pub fn target_dir(&self) -> PathBuf {
-        self.root.join(".loom/target")
+        self.root.join(".loom").join("target")
     }
 
     pub fn resolve(&self, path: &Path) -> Result<PathBuf> {
@@ -545,7 +545,7 @@ fn preparation_output(command: &mut Command, cancel: Option<&AtomicBool>) -> Res
 /// without dropping its overlay (crash, closed window, kill) left a full worktree behind,
 /// and slots are only reused for the same revision, so they piled up (gigabytes).
 fn sweep_abandoned(root: &Path, keep: &Revision, cancel: Option<&AtomicBool>) -> Result<()> {
-    let Ok(revisions) = fs::read_dir(root.join(".loom/overlays")) else { return Ok(()) };
+    let Ok(revisions) = fs::read_dir(root.join(".loom").join("overlays")) else { return Ok(()) };
     let mut removed = false;
     for revision in revisions.flatten() {
         check_preparation(cancel)?;
