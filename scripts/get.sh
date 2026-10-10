@@ -2,8 +2,6 @@
 # Install Loom with one command.
 #
 #   curl -fsSL https://raw.githubusercontent.com/CREE1116/Loom/main/scripts/get.sh | sh
-#   (private repository: gh api repos/CREE1116/Loom/contents/scripts/get.sh \
-#        -H "Accept: application/vnd.github.raw" | sh)
 #
 # Apple silicon Macs get the prebuilt release; other systems build from source with
 # scripts/install.sh (needs Rust, git, CMake and a C/C++ compiler).

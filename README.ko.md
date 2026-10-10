@@ -19,12 +19,6 @@ Loom은 터미널 코딩 에이전트입니다. 저장소의 격리된 사본에
 curl -fsSL https://raw.githubusercontent.com/CREE1116/Loom/main/scripts/get.sh | sh
 ```
 
-저장소가 비공개인 동안은 GitHub CLI로 받습니다:
-
-```sh
-gh api repos/CREE1116/Loom/contents/scripts/get.sh -H "Accept: application/vnd.github.raw" | sh
-```
-
 옵션: `LOOM_PREFIX`(기본 `~/.local`), `LOOM_VERSION`, `LOOM_FROM_SOURCE=1`, `LOOM_CUDA=1`.
 다시 실행하면 업데이트됩니다.
 
