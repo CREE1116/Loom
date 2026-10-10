@@ -13,6 +13,22 @@ import tempfile
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def bundle_mlx(binary, lib):
+    """Ship the MLX library a macOS build links, next to the executable."""
+    if platform.system() != "Darwin":
+        return
+    linked = [line.split()[0] for line in subprocess.run(["otool", "-L", str(binary)], check=True,
+              capture_output=True, text=True).stdout.splitlines()[1:] if "libmlx.dylib" in line]
+    if not linked:
+        return
+    shutil.copytree(Path(linked[0]).parent, lib)
+    subprocess.run(["install_name_tool", "-id", "@rpath/libmlx.dylib", str(lib / "libmlx.dylib")], check=True)
+    subprocess.run(["install_name_tool", "-change", linked[0], "@executable_path/../lib/loom/libmlx.dylib",
+                    str(binary)], check=True)
+    for path in (lib / "libmlx.dylib", binary):
+        subprocess.run(["codesign", "--force", "--sign", "-", str(path)], check=True, capture_output=True)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--install", action="store_true", help="also install loom in --bin-dir")
@@ -36,17 +52,19 @@ def main():
     archive = output / (package_name + ".tar.gz")
     with tempfile.TemporaryDirectory(prefix="loom-package-") as directory:
         package = Path(directory) / package_name
-        package.mkdir()
-        shutil.copy2(binary, package / name)
+        (package / "bin").mkdir(parents=True)
+        packaged_binary = package / "bin" / name
+        shutil.copy2(binary, packaged_binary)
+        bundle_mlx(packaged_binary, package / "lib" / "loom")
         (package / "README.txt").write_text(
-            "Loom\n\nCopy the loom executable into a directory on PATH.\n"
+            "Loom\n\nCopy bin/ and lib/ into one prefix (for example ~/.local) and put its bin\n"
+            "directory on PATH; on macOS bin/loom finds lib/loom next to it.\n"
             "Start: loom --cwd /path/to/project\n"
             "Try without inference: loom --demo\n"
             "Register providers: loom provider --help (or /provider inside Loom)\n"
+            "Local models: loom model pull hf:owner/repo/file.gguf, then pick it in /model.\n"
             "Settings, credentials and installed models remain in ~/.loom.\n"
-            "The coding Core and local inference runtime are in this executable.\n"
-            "Native inference: loom model pull hf:owner/repo/file.gguf; choose loom/MODEL in /model.\n"
-            "Uninstall: remove the executable; user data is preserved.\n", encoding="utf-8")
+            "Uninstall: remove bin/loom and lib/loom; user data is preserved.\n", encoding="utf-8")
         with tarfile.open(archive, "w:gz") as tar:
             tar.add(package, arcname=package_name)
     digest = hashlib.sha256(archive.read_bytes()).hexdigest()
@@ -56,11 +74,13 @@ def main():
     with tempfile.TemporaryDirectory(prefix="loom-package-check-") as directory:
         with tarfile.open(archive) as tar:
             tar.extractall(directory, filter="data")
-        packaged = Path(directory) / package_name / name
+        packaged = Path(directory) / package_name / "bin" / name
         subprocess.run([str(packaged), "--version"], check=True)
         subprocess.run([str(packaged), "provider", "--help"], check=True, stdout=subprocess.DEVNULL)
         subprocess.run([str(packaged), "--self-check"], check=True, stdout=subprocess.DEVNULL)
-    if args.install:
+    if args.install and platform.system() == "Darwin":
+        print("On macOS install with scripts/install.sh, which places the MLX library beside loom.")
+    elif args.install:
         args.bin_dir.mkdir(parents=True, exist_ok=True)
         destination = args.bin_dir / name
         with tempfile.NamedTemporaryFile(dir=args.bin_dir, delete=False) as staged:

@@ -102,10 +102,14 @@ enum Message {
         id: String,
         result: Result<loom_core::agent::Task, String>,
     },
+    /// A summary of the conversation is being written (`/compact` or automatic).
+    Compacting,
     Compacted {
         session: String,
         through: usize,
         result: Result<String, String>,
+        /// Folded before a request because the history no longer fit.
+        auto: bool,
     },
     /// The repository revision after a task finished or its change was applied.
     Checkpoint {
@@ -137,6 +141,46 @@ fn compacted_history(summary: &str) -> Vec<models::Message> {
         },
     ]
 }
+
+/// A model-written summary of `history` (which may open with an earlier summary).
+fn summarize(
+    model: &dyn ModelPort,
+    requested: &str,
+    mut history: Vec<models::Message>,
+    cancel: Option<Arc<AtomicBool>>,
+) -> Result<String> {
+    history.push(models::Message::user(COMPACT_REQUEST));
+    let request = models::Request {
+        model: if requested == "auto" { String::new() } else { requested.to_owned() },
+        system: Some("You write concise, faithful conversation summaries for continuing work.".into()),
+        messages: history,
+        max_output_tokens: Some(1500),
+        reasoning_effort: Some("none".into()),
+        cancel,
+        ..Default::default()
+    };
+    let served = model.complete(models::Need::default(), &request)?;
+    let summary = served.response.text();
+    ensure!(!summary.trim().is_empty(), "모델이 빈 요약을 반환했습니다");
+    Ok(summary)
+}
+
+/// Context window (tokens) of the model a request names, when known.
+fn context_of(model: &dyn ModelPort, requested: &str) -> Option<u64> {
+    if requested == "auto" {
+        return None;
+    }
+    model
+        .limits()
+        .into_iter()
+        .find(|l| l.model == requested || format!("{}/{}", l.endpoint, l.model) == requested)
+        .and_then(|l| l.context)
+}
+
+/// Fold the history into a summary once it fills this share of its budget, or once
+/// more turns have piled up than a request carries.
+const AUTO_COMPACT_SHARE: f64 = 0.7;
+const AUTO_COMPACT_TURNS: usize = 12;
 
 pub(crate) fn display_progress_summary(operation: &str, summary: &str) -> String {
     let prefix = format!("{operation} · ");
@@ -1065,6 +1109,8 @@ impl VersionBackend {
         let stored = self.get_stored_session(&self.session).unwrap_or_default();
         let compact = stored.compact_summary.clone();
         let ids: Vec<String> = stored.task_ids.iter().skip(stored.compacted).cloned().collect();
+        let through = stored.task_ids.len();
+        let budgets = super::version_core::budgets(context_of(self.model.as_ref(), &model));
         if let Some(handle) = self.thread.take() {
             handle
                 .join()
@@ -1123,6 +1169,8 @@ impl VersionBackend {
         let root = self.root.clone();
         let mut settings = self.settings.clone();
         settings.readonly |= !self.trusted;
+        settings.context_bytes = budgets.worker;
+        let requested = settings.model.clone();
         let version = self.version;
         let model = self.model.clone();
         let cancel = self.cancel.clone();
@@ -1134,10 +1182,45 @@ impl VersionBackend {
                 let _ = progress.send(Message::Progress(event));
             });
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                settings.history = loom_core::agent::Core::open(&root)?.context(&ids, 40000)?;
-                // Turns folded by /compact arrive as their summary, before the newer turns.
-                if let Some(summary) = &compact {
-                    settings.history.splice(0..0, compacted_history(summary));
+                let core_history = loom_core::agent::Core::open(&root)?;
+                let full = core_history.context(&ids, usize::MAX)?;
+                let size: usize = full.iter().map(|m| m.text().len()).sum::<usize>()
+                    + compact.as_ref().map_or(0, String::len);
+                let overflowing = !ids.is_empty()
+                    && (size as f64 > budgets.history as f64 * AUTO_COMPACT_SHARE
+                        || ids.len() > AUTO_COMPACT_TURNS);
+                let mut folded = None;
+                if overflowing && !cancel.load(Ordering::Acquire) {
+                    // Fold every earlier turn into a summary rather than drop the oldest.
+                    let _ = tx.send(Message::Compacting);
+                    let mut history = compact.as_deref().map(compacted_history).unwrap_or_default();
+                    history.extend(full.iter().cloned());
+                    let result = summarize(model.as_ref(), &requested, history, Some(cancel.clone()));
+                    if let Ok(summary) = &result {
+                        folded = Some(summary.clone());
+                    }
+                    let _ = tx.send(Message::Compacted {
+                        session: session.clone(),
+                        through,
+                        result: result.map_err(|error| error.to_string()),
+                        auto: true,
+                    });
+                }
+                if let Some(summary) = &folded {
+                    settings.history = compacted_history(summary);
+                } else {
+                    // The newest turns that fit the budget, as Core::context trims them.
+                    let mut kept = full;
+                    while kept.len() > 2
+                        && kept.iter().map(|m| m.text().len()).sum::<usize>() > budgets.history
+                    {
+                        kept.drain(0..2);
+                    }
+                    settings.history = kept;
+                    // Turns folded by /compact arrive as their summary, before the newer turns.
+                    if let Some(summary) = &compact {
+                        settings.history.splice(0..0, compacted_history(summary));
+                    }
                 }
                 ensure!(!cancel.load(Ordering::Acquire), "execution cancelled");
                 core::execute_with_index(
@@ -1410,33 +1493,18 @@ impl AgentBackend for VersionBackend {
                     self.emit(AgentUpdate::Notice("압축할 새 대화가 없습니다.".into()));
                     return Ok(());
                 }
-                self.emit(AgentUpdate::Notice("대화를 요약하는 중…".into()));
+                self.emit(AgentUpdate::CompressionState { running: true, error: None });
                 let (root, model, tx, session) = (self.root.clone(), self.model.clone(), self.tx.clone(), self.session.clone());
                 let previous = stored.compact_summary.clone();
                 let requested = self.settings.model.clone();
                 let through = stored.task_ids.len();
                 thread::spawn(move || {
                     let result = (|| -> Result<String> {
-                        let mut history = compacted_history(previous.as_deref().unwrap_or_default());
-                        if previous.is_none() {
-                            history.clear();
-                        }
+                        let mut history = previous.as_deref().map(compacted_history).unwrap_or_default();
                         history.extend(loom_core::agent::Core::open(&root)?.context(&ids, 120_000)?);
-                        history.push(models::Message::user(COMPACT_REQUEST));
-                        let request = models::Request {
-                            model: if requested == "auto" { String::new() } else { requested },
-                            system: Some("You write concise, faithful conversation summaries for continuing work.".into()),
-                            messages: history,
-                            max_output_tokens: Some(1500),
-                            reasoning_effort: Some("none".into()),
-                            ..Default::default()
-                        };
-                        let served = model.complete(models::Need::default(), &request)?;
-                        let summary = served.response.text();
-                        ensure!(!summary.trim().is_empty(), "모델이 빈 요약을 반환했습니다");
-                        Ok(summary)
+                        summarize(model.as_ref(), &requested, history, None)
                     })();
-                    let _ = tx.send(Message::Compacted { session, through, result: result.map_err(|error| error.to_string()) });
+                    let _ = tx.send(Message::Compacted { session, through, result: result.map_err(|error| error.to_string()), auto: false });
                 });
             }
             AgentCommand::Fork { turn_id, .. } => {
@@ -1617,20 +1685,30 @@ impl AgentBackend for VersionBackend {
                         self.save_stored_session(&stored);
                     }
                 }
-                Message::Compacted { session, through, result } => match result {
-                    Ok(summary) => {
-                        if let Some(mut stored) = self.get_stored_session(&session) {
-                            let before = stored.task_ids.len();
-                            stored.compact_summary = Some(summary);
-                            stored.compacted = through.min(before);
-                            self.save_stored_session(&stored);
-                            self.emit(AgentUpdate::Notice(format!(
-                                "대화 {through}턴을 요약했습니다. 다음 요청부터 요약과 이후 대화만 보냅니다."
-                            )));
+                Message::Compacting => {
+                    self.emit(AgentUpdate::CompressionState { running: true, error: None });
+                }
+                Message::Compacted { session, through, result, auto } => {
+                    self.emit(AgentUpdate::CompressionState { running: false, error: None });
+                    match result {
+                        Ok(summary) => {
+                            if let Some(mut stored) = self.get_stored_session(&session) {
+                                let before = stored.task_ids.len();
+                                stored.compact_summary = Some(summary);
+                                stored.compacted = through.min(before);
+                                self.save_stored_session(&stored);
+                                self.emit(AgentUpdate::Notice(if auto {
+                                    format!("이전 대화가 길어져 {through}턴을 자동으로 요약했습니다.")
+                                } else {
+                                    format!("대화 {through}턴을 요약했습니다. 다음 요청부터 요약과 이후 대화만 보냅니다.")
+                                }));
+                            }
                         }
+                        // A failed automatic summary leaves the history as it was; the request
+                        // goes on with the newest turns that fit.
+                        Err(error) => self.emit(AgentUpdate::Notice(format!("대화 압축 실패: {error}"))),
                     }
-                    Err(error) => self.emit(AgentUpdate::Notice(format!("대화 압축 실패: {error}"))),
-                },
+                }
                 Message::ModelSources { generation, sources } => {
                     if generation != self.reload_generation { continue; }
                     self.events.push_back(AgentEvent::global(AgentUpdate::ModelCatalogSources(

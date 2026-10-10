@@ -78,6 +78,12 @@ loom model inspect lmx/<id> --verify
 loom model bench <id> --prompt 512 --gen 64
 ```
 
+## Long conversations
+
+When earlier turns no longer fit the model's context (local models report theirs), Loom
+summarizes them before the next request and shows "compacting" while it does; `/compact`
+does the same on demand.
+
 ## Skills
 
 A skill is a folder with a `SKILL.md` (frontmatter `name` and `description`, then

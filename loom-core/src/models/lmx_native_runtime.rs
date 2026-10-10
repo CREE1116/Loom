@@ -380,6 +380,36 @@ fn ensure_same(file: &NativeFile, model: &NativeModel) -> Result<(), ProviderErr
 }
 
 /// Stats of the loaded engine, if the model is loaded.
+/// Tokens of context the engine gives `model`: the live engine's, else what it would
+/// choose (`LOOM_LMX_CONTEXT`, or the engine's automatic rule: the KV cache may take
+/// 1/32 of RAM, 256 MiB to 4 GiB, as a power of two from 8K up to the trained length).
+pub fn context_tokens(model: &NativeModel) -> u64 {
+    if let Some(stats) = stats(model) {
+        return u64::from(stats.context);
+    }
+    let m = &model.manifest.model;
+    let train = u64::from(m.context).max(256);
+    let options = EngineOptions::default();
+    if options.context > 0 {
+        return u64::from(options.context).min(train);
+    }
+    let recurrent = m.hybrid.as_ref().map_or(0, |h| h.linear_layers.len())
+        + m.shortconv.as_ref().map_or(0, |c| c.conv_layers.len());
+    let attention = (m.layers as usize).saturating_sub(recurrent) as u64;
+    let row = u64::from(m.attention.head_dim) * u64::from(m.attention.kv_heads);
+    // q8_0: 34 bytes per 32 values; f16 and others are close enough at 2 bytes.
+    let row_bytes = if options.kv == "q8_0" { row / 32 * 34 } else { row * 2 };
+    let per_position = 2 * attention * row_bytes;
+    let ram = crate::base::resources::physical_memory_bytes().unwrap_or(16 << 30);
+    let budget = (ram / 32).clamp(256 << 20, 4 << 30);
+    let positions = if per_position == 0 { train } else { budget / per_position };
+    let mut context = 8192u64;
+    while context * 2 <= positions && context * 2 <= train {
+        context *= 2;
+    }
+    context.min(train)
+}
+
 pub fn stats(model: &NativeModel) -> Option<EngineStats> {
     live().as_ref().filter(|l| l.identity == model.identity).map(|l| l.engine.stats())
 }

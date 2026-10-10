@@ -47,6 +47,9 @@ pub struct Settings {
     pub history: Vec<m::Message>,
     /// SKILL.md files attached to the request.
     pub skills: Vec<PathBuf>,
+    /// Bytes of conversation the worker keeps before dropping its oldest exchanges;
+    /// None keeps the core default.
+    pub context_bytes: Option<usize>,
 }
 impl Default for Settings {
     fn default() -> Self {
@@ -70,6 +73,7 @@ impl Default for Settings {
             input_control: Default::default(),
             history: vec![],
             skills: vec![],
+            context_bytes: None,
         }
     }
 }
@@ -495,6 +499,9 @@ pub fn execute_with_index(
             model_attempts: settings.attempts,
             control: settings.input_control.clone(),
             skills: settings.skills.clone(),
+            context_bytes: settings
+                .context_bytes
+                .unwrap_or(loom_core::agent::Options::default().context_bytes),
             ..Default::default()
         },
         &port,
@@ -743,4 +750,41 @@ pub fn limit_steps(steps: usize) -> usize {
 }
 pub fn limit_seconds(seconds: u64) -> u64 {
     if seconds == 0 { 30 * 24 * 3600 } else { seconds }
+}
+
+/// Conversation budgets from a model's context window (tokens), at about three bytes
+/// per token: what one request may carry of earlier turns, and of the current task's
+/// own exchanges. Unknown windows keep the defaults.
+pub struct Budgets {
+    pub history: usize,
+    pub worker: Option<usize>,
+}
+
+pub const DEFAULT_HISTORY_BYTES: usize = 40_000;
+
+pub fn budgets(context_tokens: Option<u64>) -> Budgets {
+    let Some(tokens) = context_tokens.filter(|t| *t > 0) else {
+        return Budgets { history: DEFAULT_HISTORY_BYTES, worker: None };
+    };
+    // Room left after the system prompt and tool definitions (~4K tokens) and an answer.
+    let room = (tokens.saturating_sub(6_000) as usize).saturating_mul(3).max(6_000);
+    let worker_default = loom_core::agent::Options::default().context_bytes;
+    Budgets {
+        history: (room / 4).min(DEFAULT_HISTORY_BYTES),
+        worker: Some((room / 2).min(worker_default)),
+    }
+}
+
+#[cfg(test)]
+mod budget_tests {
+    use super::*;
+
+    #[test]
+    fn small_windows_shrink_budgets_and_large_ones_keep_defaults() {
+        let large = budgets(Some(200_000));
+        assert_eq!(large.history, DEFAULT_HISTORY_BYTES);
+        let small = budgets(Some(16_384));
+        assert!(small.history < 10_000 && small.worker.unwrap() < 20_000, "{} {:?}", small.history, small.worker);
+        assert_eq!(budgets(None).history, DEFAULT_HISTORY_BYTES);
+    }
 }

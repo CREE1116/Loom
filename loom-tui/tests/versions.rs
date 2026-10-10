@@ -938,6 +938,63 @@ fn compact_replaces_earlier_turns_with_a_model_summary() -> Result<()> {
 }
 
 #[test]
+fn long_history_is_compacted_automatically_before_the_next_request() -> Result<()> {
+    let root = fixture()?;
+    let state = tempfile::tempdir()?;
+    let response = |parts, stop| m::Response {
+        parts,
+        usage: Default::default(),
+        stop,
+        model: "fixture-model".into(),
+        latency: Duration::ZERO,
+        route: None,
+        gateway_connection: None,
+        gateway_upstream_ms: None,
+    };
+    // An answer far larger than the history a request may carry.
+    let long = format!("FIRST_TURN_RECEIPT {}", "detail ".repeat(6000));
+    // A small window: the first turn alone is more history than the next request may carry.
+    let model = Arc::new(m::ScriptedModel::with_context("fixture-model", 12_000, [
+        response(vec![m::Part::ToolCall {
+            id: "finish-first".into(),
+            name: "finish".into(),
+            arguments: json!({"summary": long}),
+        }], m::Stop::ToolUse),
+        response(vec![m::Part::Text("AUTO_SUMMARY: the value is one".into())], m::Stop::EndTurn),
+        response(vec![m::Part::ToolCall {
+            id: "finish-next".into(),
+            name: "finish".into(),
+            arguments: json!({"summary":"continued"}),
+        }], m::Stop::ToolUse),
+    ]));
+    let mut backend =
+        VersionBackend::with_model(Version::Loom, root.path(), model.clone(), settings(&state))?;
+    let submit = |text: &str| AgentCommand::Submit {
+        text: text.into(),
+        model: "fixture-model".into(),
+        effort: None,
+        images: vec![],
+        skills: vec![],
+    };
+    backend.command(submit(":inspect FIRST_GOAL inspect value"))?;
+    wait(&mut backend, |u| matches!(u, AgentUpdate::TurnCompleted { .. }))?;
+    backend.command(submit(":inspect SECOND_GOAL 계속해봐"))?;
+    wait(&mut backend, |u| matches!(u, AgentUpdate::CompressionState { running: true, .. }))?;
+    wait(&mut backend, |u| matches!(u, AgentUpdate::Notice(text) if text.contains("자동으로 요약")))?;
+    wait(&mut backend, |u| matches!(u, AgentUpdate::TurnCompleted { .. }))?;
+    let requests = model.requests();
+    assert_eq!(requests.len(), 3, "{requests:?}");
+    let summary_request = serde_json::to_string(&requests[1].messages)?;
+    assert!(summary_request.contains("FIRST_TURN_RECEIPT"), "the summary reads the earlier turn");
+    let next = serde_json::to_string(&requests[2].messages)?;
+    assert!(next.contains("AUTO_SUMMARY"), "summary must open the history: {next}");
+    assert!(!next.contains("FIRST_TURN_RECEIPT"), "folded turns are not resent");
+    assert!(next.contains("SECOND_GOAL"));
+    backend.shutdown()?;
+    Ok(())
+}
+
+#[test]
 fn rewind_restores_code_and_conversation_to_an_earlier_reply() -> Result<()> {
     let root = fixture()?;
     let state = tempfile::tempdir()?;

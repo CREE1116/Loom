@@ -398,16 +398,16 @@ pub fn discover(log: Option<std::path::PathBuf>) -> (Router, Vec<Source>) {
             let candidates = provider
                 .available_models()
                 .into_iter()
-                .map(|model| model.display_name())
-                .chain(provider.native_names())
-                .map(|model| Candidate {
+                .map(|model| (model.display_name(), None))
+                .chain(provider.native_contexts().into_iter().map(|(name, context)| (name, Some(context))))
+                .map(|(model, context)| Candidate {
                     endpoint: "lmx".into(),
                     model,
                     tier: Tier::Small,
                     cost: CostClass::Local,
                     price: Some((0.0, 0.0)),
                     tools: true,
-                    context: None,
+                    context,
                 })
                 .collect::<Vec<_>>();
             sources.push(Source { name: "loom-lmx".into(), status: Ok(candidates.len()) });

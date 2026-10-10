@@ -275,6 +275,13 @@ impl LmxProvider {
         })
     }
     /// Router names of the native v2 models.
+    /// Display names of the native models with the context each gets.
+    pub fn native_contexts(&self) -> Vec<(String, u64)> {
+        self.native
+            .iter()
+            .map(|m| (m.display_name(), super::lmx_native_runtime::context_tokens(m)))
+            .collect()
+    }
     pub fn native_names(&self) -> Vec<String> {
         self.native.iter().map(|m| m.display_name()).collect()
     }

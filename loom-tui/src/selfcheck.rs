@@ -2535,6 +2535,24 @@ fn token_footer(report: &mut Report) {
     report.dump(S, &canvas);
 }
 
+fn auto_compaction_status(report: &mut Report) {
+    const S: &str = "auto_compaction_status";
+    let mut app = app_with([AgentEvent::scoped("main", AgentUpdate::TurnStarted { id: Some("t".into()) })]);
+    app.apply_event(AgentEvent::global(AgentUpdate::CompressionState { running: true, error: None }));
+    for width in [48u16, 100] {
+        let canvas = app.render(width, 24);
+        let text = screen_text(&canvas);
+        report.check(S, format!("{width}: 요청 전 자동 압축 중 표시"), text.contains("압축 중"), &text);
+        report.dump(S, &canvas);
+    }
+    app.apply_event(AgentEvent::global(AgentUpdate::CompressionState { running: false, error: None }));
+    app.apply_event(AgentEvent::global(AgentUpdate::Notice(
+        "이전 대화가 길어져 3턴을 자동으로 요약했습니다.".into(),
+    )));
+    let text = screen_text(&app.render(100, 24));
+    report.check(S, "압축이 끝나면 압축 표시 해제", !text.contains("압축 중"), &text);
+}
+
 fn settings_categories(report: &mut Report) {
     const S: &str = "settings_categories";
     let mut app = App::new(false);
@@ -2902,6 +2920,7 @@ pub fn run() -> Report {
     settings_categories(&mut report);
     tool_targets_are_whole(&mut report);
     token_footer(&mut report);
+    auto_compaction_status(&mut report);
     composer_and_navigation(&mut report);
     input_images_and_model_hierarchy(&mut report);
     tour(&mut report);

@@ -39,7 +39,9 @@ setting). Answer from facts you checked, not from memory of other tools.
 In the app: `/model` (choose model), `/runtime` (download, convert to LMX, remove local
 models, inference device), `/skills`, `/provider`, `/routing`, `/doctor` (environment and
 local model checks), `/settings`, `/status`, `/cost`, `/context`, `/work`, `/diff`,
-`/approvals`, `/compact`, `/new`, `/resume`, `/help`.
+`/approvals`, `/compact`, `/new`, `/resume`, `/help`. Earlier turns are summarized
+automatically before a request once they no longer fit the model's context
+("컨텍스트 압축 중" shows meanwhile); `/compact` does it on demand.
 
 From a shell (`loom` is the installed binary; in the source tree `scripts/loom`):
 `loom models` (everything the router can use), `loom model import <file.gguf>`

@@ -33,6 +33,13 @@ impl ScriptedModel {
             requests: Mutex::new(Vec::new()),
         }
     }
+    /// A scripted model under `name` that reports a context window of `tokens`.
+    pub fn with_context(name: &str, tokens: u64, replies: impl IntoIterator<Item = Response>) -> Self {
+        let mut model = Self::new(replies);
+        model.candidate.model = name.into();
+        model.candidate.context = Some(tokens);
+        model
+    }
     pub fn requests(&self) -> Vec<Request> {
         self.requests.lock().unwrap().clone()
     }
@@ -67,5 +74,16 @@ impl ModelPort for ScriptedModel {
             candidate: self.candidate.clone(),
             skipped: Vec::new(),
         })
+    }
+
+    fn limits(&self) -> Vec<super::ModelLimits> {
+        vec![super::ModelLimits {
+            endpoint: self.candidate.endpoint.clone(),
+            model: self.candidate.model.clone(),
+            context: self.candidate.context,
+            tools: self.candidate.tools,
+            disabled: None,
+            cooldown_until: None,
+        }]
     }
 }

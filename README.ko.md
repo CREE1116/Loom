@@ -77,6 +77,12 @@ loom model inspect lmx/<id> --verify
 loom model bench <id> --prompt 512 --gen 64
 ```
 
+## 긴 대화
+
+이전 대화가 모델 컨텍스트(로컬 모델은 실제 크기)를 넘기 시작하면 다음 요청 전에 Loom이
+자동으로 요약하고, 그동안 "컨텍스트 압축 중"을 표시합니다. `/compact`로 직접 요약할 수도
+있습니다.
+
 ## 스킬
 
 스킬은 `SKILL.md`(머리말에 `name`, `description`, 그 아래 지침)가 든 폴더입니다. 저장소와
