@@ -110,7 +110,7 @@ fn accepted_turns_can_fork_and_rewind_code_without_overwriting_unrelated_user_ch
     fs::write(d.path().join("file.txt"), "one\n").unwrap();
     let options = ExecutionOptions {
         session: Some("rewind".into()),
-        checks: Some(vec!["true".into()]),
+        checks: Some(vec![if cfg!(windows) { "exit /b 0" } else { "true" }.into()]),
         ..Default::default()
     };
     let mut core = Core::open(d.path()).unwrap();

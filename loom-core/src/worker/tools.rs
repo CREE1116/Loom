@@ -350,7 +350,7 @@ impl<'a> Workspace<'a> {
             // macOS may spell the same workspace as /var/... or /private/var/....
             // Resolve the nearest existing ancestor so even a new file can be addressed.
             let (ancestor, canonical) = requested.ancestors()
-                .find_map(|ancestor| ancestor.canonicalize().ok().map(|real| (ancestor, real)))
+                .find_map(|ancestor| dunce::canonicalize(ancestor).ok().map(|real| (ancestor, real)))
                 .ok_or_else(|| format!("{path} is outside the workspace"))?;
             let normalized = canonical.join(requested.strip_prefix(ancestor).unwrap_or(Path::new("")));
             normalized.strip_prefix(&self.root)
@@ -1201,9 +1201,7 @@ impl<'a> Workspace<'a> {
             format!("truncated search preview: first {limit} matching lines or fewer; narrow path/include/pattern for complete results.\n")
         } else { String::new() };
         for line in lines.into_iter().take(limit) {
-            let mut parts = line.splitn(3, ':');
-            let (Some(file), Some(no), Some(body)) = (parts.next(), parts.next(), parts.next())
-            else {
+            let Some((file, no, body)) = split_rg_line(line) else {
                 continue;
             };
             let rel = self.rel(file);
@@ -1385,6 +1383,7 @@ impl<'a> Workspace<'a> {
             .strip_prefix(&self.root)
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_else(|_| path.trim_start_matches("./").to_owned())
+            .replace(std::path::MAIN_SEPARATOR, "/")
     }
 
     fn map(&self, path: &str, budget: Option<u64>) -> ToolOutput {
@@ -2507,6 +2506,30 @@ impl<'a> Workspace<'a> {
     }
 }
 
+fn split_rg_line(line: &str) -> Option<(&str, &str, &str)> {
+    let bytes = line.as_bytes();
+    let start = if bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && matches!(bytes[2], b'\\' | b'/')
+    {
+        3
+    } else if bytes.len() >= 7
+        && &bytes[..4] == b"\\\\?\\"
+        && bytes[4].is_ascii_alphabetic()
+        && bytes[5] == b':'
+        && matches!(bytes[6], b'\\' | b'/')
+    {
+        7
+    } else {
+        0
+    };
+    let (rel_file, rest) = line[start..].split_once(':')?;
+    let file = &line[..start + rel_file.len()];
+    let (no, body) = rest.split_once(':')?;
+    Some((file, no, body))
+}
+
 fn spec(name: &str, description: &str, parameters: Value) -> ToolSpec {
     ToolSpec {
         name: name.into(),
@@ -2540,6 +2563,14 @@ mod map_tests {
 
     #[test]
     fn map_and_outline_expose_multilanguage_symbols_to_read_only_workers() {
+        assert_eq!(
+            split_rg_line(r"C:\work\src\lib.py:12:def helper():"),
+            Some((r"C:\work\src\lib.py", "12", "def helper():"))
+        );
+        assert_eq!(
+            split_rg_line(r"\\?\C:\work\src\lib.py:12:def helper():"),
+            Some((r"\\?\C:\work\src\lib.py", "12", "def helper():"))
+        );
         let directory = tempfile::tempdir().unwrap();
         assert!(
             Command::new("git")
@@ -2779,7 +2810,10 @@ mod map_tests {
             blame.text
         );
         let diagnostics = worker.call("diagnostics", &json!({"path":"src/lib.rs"}));
+        #[cfg(unix)]
         assert!(!diagnostics.is_error, "{}", diagnostics.text);
+        #[cfg(not(unix))]
+        assert!(diagnostics.is_error && diagnostics.text.contains("PTY execution is only supported on Unix"), "{}", diagnostics.text);
         let impact = worker.call("symbol_impact", &json!({"id":"src/lib.rs::value"}));
         assert!(
             !impact.is_error
@@ -2821,7 +2855,8 @@ mod map_tests {
             loop {
                 match lease.try_lock_exclusive() {
                     Ok(()) => break,
-                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+                        || error.raw_os_error() == fs2::lock_contended_error().raw_os_error() => {
                         assert!(Instant::now() < deadline, "overlay cleanup did not release {}", slot.display());
                         std::thread::sleep(Duration::from_millis(10));
                     }

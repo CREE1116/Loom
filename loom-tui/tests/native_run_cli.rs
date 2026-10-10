@@ -124,7 +124,11 @@ fn loom_bench_core_runs_edit_flow_and_applies_after_validation() {
         .arg(&script)
         .args([
             "--core-check",
-            "grep -q '{ 2 }' src/lib.rs",
+            if cfg!(windows) {
+                "findstr /c:\"{ 2 }\" src\\lib.rs >nul"
+            } else {
+                "grep -q '{ 2 }' src/lib.rs"
+            },
             "--max-steps",
             "8",
             "--max-seconds",

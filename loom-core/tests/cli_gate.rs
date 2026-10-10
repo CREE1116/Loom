@@ -215,7 +215,7 @@ fn cli_proposes_without_writing_then_approves_and_replays_from_another_process()
             script.path().to_str().unwrap(),
             "--no-approve",
             "--check",
-            "true",
+            if cfg!(windows) { "exit /b 0" } else { "true" },
             "--json",
         ],
     );

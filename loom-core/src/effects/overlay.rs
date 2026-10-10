@@ -59,7 +59,7 @@ impl Overlay {
                 check_preparation(cancel)?;
                 match registry.try_lock_exclusive() {
                     Ok(()) => break,
-                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock =>
+                    Err(error) if lock_contended(&error) =>
                         std::thread::sleep(Duration::from_millis(10)),
                     Err(error) => return Err(error.into()),
                 }
@@ -93,7 +93,7 @@ impl Overlay {
                 for attempt in 0..4 {
                     match lease.try_lock_exclusive() {
                         Ok(()) => return Some(Ok((overlays.join(format!("{slot}")), lease))),
-                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        Err(e) if lock_contended(&e) => {
                             if attempt < 3 {
                                 std::thread::sleep(Duration::from_millis(5));
                             }
@@ -520,6 +520,13 @@ impl Overlay {
     }
 }
 
+fn lock_contended(error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::WouldBlock
+        || error.raw_os_error().is_some_and(|code| {
+            Some(code) == fs2::lock_contended_error().raw_os_error()
+        })
+}
+
 fn check_preparation(cancel: Option<&AtomicBool>) -> Result<()> {
     if cancel.is_some_and(|cancel| cancel.load(Ordering::Acquire)) {
         bail!("overlay preparation cancelled");
@@ -615,5 +622,20 @@ impl Drop for Overlay {
                     .arg(&dir)
                     .output();
             });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::lock_contended;
+    use std::io::{Error, ErrorKind};
+
+    #[test]
+    fn lock_contention_recognizes_fs2_os_error_without_swallowing_other_errors() {
+        assert!(lock_contended(&fs2::lock_contended_error()));
+        assert!(lock_contended(&Error::from(ErrorKind::WouldBlock)));
+        assert!(!lock_contended(&Error::from(ErrorKind::PermissionDenied)));
+        assert!(!lock_contended(&Error::other("lock failed")));
+        assert!(!lock_contended(&Error::from_raw_os_error(2)));
     }
 }

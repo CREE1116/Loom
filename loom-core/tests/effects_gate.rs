@@ -222,12 +222,14 @@ fn initial_overlay_cancellation_interrupts_registry_lock_wait() {
         finished.send(result).unwrap();
     });
     entering.recv().unwrap();
-    std::thread::sleep(Duration::from_millis(30));
+    let waiting = done.recv_timeout(Duration::from_millis(30));
     cancel.store(true, Ordering::Release);
     // Keep the lock held until after observing cancellation; a blocking lock cannot pass.
     let result = done.recv_timeout(Duration::from_millis(500));
     drop(registry);
     worker.join().unwrap();
+    assert!(matches!(waiting, Err(std::sync::mpsc::RecvTimeoutError::Timeout)),
+        "registry contention returned instead of waiting: {waiting:?}");
     assert!(result.expect("cancelled preparation waited for the registry lock")
         .unwrap_err().to_string().contains("cancelled"));
 }
@@ -270,7 +272,15 @@ fn sequential_overlays_reuse_build_paths_but_concurrent_overlays_are_distinct() 
         .modified()
         .unwrap();
     let concurrent = Overlay::create(directory.path(), &base).unwrap();
+    let cancellable = Overlay::create_cancellable(directory.path(), &base, &AtomicBool::new(false)).unwrap();
     assert_ne!(first.dir(), concurrent.dir());
+    assert_ne!(first.dir(), cancellable.dir());
+    assert_ne!(concurrent.dir(), cancellable.dir());
+    let original = fs::read(directory.path().join("lib.rs")).unwrap();
+    for overlay in [&first, &concurrent, &cancellable] {
+        assert_eq!(fs::read(overlay.dir().join("lib.rs")).unwrap(), original);
+        assert_eq!(Revision::capture(overlay.dir()).unwrap(), base);
+    }
     drop(first);
     let second = Overlay::create(directory.path(), &base).unwrap();
     assert_eq!(second.dir(), path);
@@ -332,7 +342,12 @@ fn runner_structures_failures_and_keeps_the_raw_output() {
     let base = Revision::capture(directory.path()).unwrap();
     let overlay = Overlay::create(directory.path(), &base).unwrap();
     let runner = Runner::new(overlay.artifacts().clone());
-    let result = runner.run(overlay.dir(), "printf 'test result: FAILED. 2 passed; 1 failed;\\n---- broken stdout ----\\n'; exit 1", Duration::from_secs(5), &AtomicBool::new(false), None).unwrap();
+    let command = if cfg!(windows) {
+        "echo test result: FAILED. 2 passed; 1 failed; & echo ---- broken stdout ---- & exit /b 1"
+    } else {
+        "printf 'test result: FAILED. 2 passed; 1 failed;\\n---- broken stdout ----\\n'; exit 1"
+    };
+    let result = runner.run(overlay.dir(), command, Duration::from_secs(5), &AtomicBool::new(false), None).unwrap();
     assert_eq!(result.status, RunStatus::Failed);
     assert_eq!(result.passed, 2);
     assert_eq!(result.failed, 1);
@@ -358,7 +373,11 @@ fn zero_exit_with_failed_tests_is_still_a_failure_with_an_artifact() {
     let result = runner
         .run(
             overlay.dir(),
-            "printf 'test result: FAILED. 0 passed; 1 failed;\\n'",
+            if cfg!(windows) {
+                "echo test result: FAILED. 0 passed; 1 failed; & exit /b 0"
+            } else {
+                "printf 'test result: FAILED. 0 passed; 1 failed;\\n'"
+            },
             Duration::from_secs(5),
             &AtomicBool::new(false),
             None,
@@ -513,7 +532,11 @@ fn runner_timeout_and_pre_cancel_never_report_passed() {
     let result = runner
         .run(
             overlay.dir(),
-            "sleep 30",
+            if cfg!(windows) {
+                "powershell.exe -NoProfile -NonInteractive -Command \"Start-Sleep -Seconds 30\""
+            } else {
+                "sleep 30"
+            },
             Duration::from_millis(50),
             &AtomicBool::new(false),
             None,
@@ -523,7 +546,11 @@ fn runner_timeout_and_pre_cancel_never_report_passed() {
     let result = runner
         .run(
             overlay.dir(),
-            "touch should-not-run",
+            if cfg!(windows) {
+                "type nul > should-not-run"
+            } else {
+                "touch should-not-run"
+            },
             Duration::from_secs(5),
             &AtomicBool::new(true),
             None,

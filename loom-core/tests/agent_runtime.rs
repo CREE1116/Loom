@@ -492,7 +492,12 @@ fn source_mutating_validator_is_rejected() {
         "edit",
         Intent::Edit,
         Options {
-            checks: vec!["printf corrupt > src/a.rs".into()],
+            checks: vec![if cfg!(windows) {
+                "echo corrupt > src/a.rs"
+            } else {
+                "printf corrupt > src/a.rs"
+            }
+            .into()],
             ..options()
         },
         &model,
@@ -611,7 +616,12 @@ fn validation_evidence_survives_overlay_cleanup() {
             "create",
             Intent::Edit,
             Options {
-                checks: vec!["printf persistent-evidence".into()],
+                checks: vec![if cfg!(windows) {
+                    "echo persistent-evidence"
+                } else {
+                    "printf persistent-evidence"
+                }
+                .into()],
                 ..options()
             },
             &model,
@@ -1123,24 +1133,31 @@ fn repeated_empty_replies_end_the_task_instead_of_asking_forever() {
 #[test]
 fn commands_naming_the_real_workspace_act_on_the_isolated_copy() {
     let d = repo();
-    let root = d.path().canonicalize().unwrap();
+    let root = dunce::canonicalize(d.path()).unwrap();
     let mut core = Core::open(d.path()).unwrap();
-    let command = format!(
-        "mkdir -p {0}/hello_world && printf 'print(\"hi\")\\n' > {0}/hello_world/hello.py && cat {0}/hello_world/hello.py",
-        root.display()
-    );
+    let command = if cfg!(windows) {
+        format!(
+            "mkdir \"{0}\\hello_world\" && echo print(\"hi\")> \"{0}\\hello_world\\hello.py\" && type \"{0}\\hello_world\\hello.py\"",
+            root.display()
+        )
+    } else {
+        format!(
+            "mkdir -p {0}/hello_world && printf 'print(\"hi\")\\n' > {0}/hello_world/hello.py && cat {0}/hello_world/hello.py",
+            root.display()
+        )
+    };
     let model = ScriptedModel::new([
         response(vec![("run", json!({"kind":"command","command":command}))]),
         response(vec![("finish", json!({"summary":"created"}))]),
     ]);
-    let options = Options { checks: vec!["true".into()], ..options() };
+    let options = Options { checks: vec![if cfg!(windows) { "exit /b 0" } else { "true" }.into()], ..options() };
     let task = core.execute("create hello_world/hello.py", Intent::Edit, options, &model, cancel(), &|_| {}).unwrap();
     let result = model.requests()[1].messages.iter().flat_map(|m| &m.parts).find_map(|part| match part {
         Part::ToolResult { output, .. } => Some(output.clone()),
         _ => None,
     }).unwrap();
     assert!(result.contains(r#""status":"Passed""#) && result.contains(r#"print(\"hi\")"#), "the command must succeed in the copy: {result}");
-    assert!(!result.contains(".loom/overlays"), "output names the workspace, not the copy: {result}");
+    assert!(!result.contains(".loom/overlays") && !result.contains(r".loom\overlays"), "output names the workspace, not the copy: {result}");
     assert!(task.patch.files.iter().any(|file| file.path.ends_with("hello_world/hello.py")), "{:?}", task.patch.files);
     assert!(!root.join("hello_world").exists(), "the real workspace changes only after approval");
 }
@@ -1175,10 +1192,12 @@ fn plan_mode_accepts_a_written_plan_and_direct_work_without_forcing_agents() {
 
 #[test]
 fn explicit_check_commands_run_without_replacing_core_validation() {
-    for configured in [vec![], vec!["printf configured-check".to_owned()]] {
+    let configured_cmd = if cfg!(windows) { "echo configured-check" } else { "printf configured-check" };
+    let manual_cmd = if cfg!(windows) { "echo manual-check" } else { "printf manual-check" };
+    for configured in [vec![], vec![configured_cmd.to_owned()]] {
         let d = repo();
         let model = ScriptedModel::new([
-            response(vec![("run", json!({"kind":"check","command":"printf manual-check"}))]),
+            response(vec![("run", json!({"kind":"check","command":manual_cmd}))]),
             response(vec![("finish", json!({"summary":"checked"}))]),
         ]);
         let mut core = Core::open(d.path()).unwrap();
@@ -1206,8 +1225,9 @@ fn check_without_a_command_runs_configured_validation() {
         response(vec![("finish", json!({"summary":"checked"}))]),
     ]);
     let mut core = Core::open(d.path()).unwrap();
+    let configured_cmd = if cfg!(windows) { "echo configured-check" } else { "printf configured-check" };
     core.execute("run configured checks", Intent::Auto,
-        Options { checks: vec!["printf configured-check".into()], ..options() },
+        Options { checks: vec![configured_cmd.into()], ..options() },
         &model, cancel(), &|_| {}).unwrap();
     let requests = model.requests();
     let result = requests[1].messages.iter().flat_map(|message| &message.parts).find_map(|part| match part {

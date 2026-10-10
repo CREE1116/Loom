@@ -82,7 +82,7 @@ pub struct Workspace {
 
 impl Workspace {
     pub fn open(root: &Path) -> anyhow::Result<Self> {
-        let root = root.canonicalize()?;
+        let root = dunce::canonicalize(root)?;
         let checks = if root.join("Cargo.toml").exists() {
             vec![
                 "cargo build --quiet".into(),
@@ -278,8 +278,10 @@ impl Workspace {
         if lines.is_empty() {
             return ToolOutput::ok(Phase::Orient, format!("no matches for `{pattern}`"));
         }
-        let files: std::collections::BTreeSet<&str> =
-            lines.iter().filter_map(|l| l.split(':').next()).collect();
+        let files: std::collections::BTreeSet<&str> = lines
+            .iter()
+            .filter_map(|l| split_rg_line(l).map(|(file, _, _)| file))
+            .collect();
         if lines.len() > FIND_MAX_LINES {
             let mut msg = format!(
                 "{} matches in {} files — too broad; narrow the pattern or path. Files:\n",
@@ -294,9 +296,7 @@ impl Workspace {
         let graph = self.graph();
         let mut out = String::new();
         for line in lines {
-            let mut parts = line.splitn(3, ':');
-            let (Some(file), Some(no), Some(body)) = (parts.next(), parts.next(), parts.next())
-            else {
+            let Some((file, no, body)) = split_rg_line(line) else {
                 continue;
             };
             let rel = self.rel(file);
@@ -374,6 +374,7 @@ impl Workspace {
             .strip_prefix(&self.root)
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_else(|_| path.trim_start_matches("./").to_owned())
+            .replace(std::path::MAIN_SEPARATOR, "/")
     }
 
     fn outline(&self, path: &str) -> ToolOutput {
@@ -558,12 +559,11 @@ impl Workspace {
         }
         // Guard against a symlinked artifacts directory or log escaping the workspace.
         let artifacts = self.root.join(".loom/artifacts");
-        let real_artifacts = artifacts.canonicalize();
+        let real_artifacts = dunce::canonicalize(&artifacts);
         if !real_artifacts
             .as_ref()
             .is_ok_and(|p| p.starts_with(&self.root))
-            || !abs
-                .canonicalize()
+            || !dunce::canonicalize(&abs)
                 .is_ok_and(|p| p.starts_with(real_artifacts.as_ref().unwrap()))
         {
             return ToolOutput::err(Phase::Orient, "artifact not found inside workspace");
@@ -751,9 +751,15 @@ impl Workspace {
                 .take(2)
                 .collect::<Vec<_>>()
                 .join(" ");
+            #[cfg(unix)]
             let child = Command::new("sh")
                 .arg("-c")
                 .arg(command)
+                .current_dir(&self.root)
+                .output();
+            #[cfg(windows)]
+            let child = Command::new("cmd")
+                .args(["/C", command])
                 .current_dir(&self.root)
                 .output();
             raw.extend_from_slice(format!("$ {command}\n").as_bytes());
@@ -822,7 +828,7 @@ impl Workspace {
     fn save_check_artifact(&self, raw: &[u8]) -> io::Result<String> {
         let dir = self.root.join(".loom/artifacts");
         fs::create_dir_all(&dir)?;
-        if !dir.canonicalize()?.starts_with(&self.root) {
+        if !dunce::canonicalize(&dir)?.starts_with(&self.root) {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 "artifact directory outside workspace",
@@ -845,6 +851,30 @@ impl Workspace {
         }
         unreachable!()
     }
+}
+
+fn split_rg_line(line: &str) -> Option<(&str, &str, &str)> {
+    let bytes = line.as_bytes();
+    let start = if bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && matches!(bytes[2], b'\\' | b'/')
+    {
+        3
+    } else if bytes.len() >= 7
+        && &bytes[..4] == b"\\\\?\\"
+        && bytes[4].is_ascii_alphabetic()
+        && bytes[5] == b':'
+        && matches!(bytes[6], b'\\' | b'/')
+    {
+        7
+    } else {
+        0
+    };
+    let (rel_file, rest) = line[start..].split_once(':')?;
+    let file = &line[..start + rel_file.len()];
+    let (no, body) = rest.split_once(':')?;
+    Some((file, no, body))
 }
 
 fn spec(name: &str, description: &str, parameters: Value) -> ToolSpec {
@@ -988,10 +1018,17 @@ mod tests {
     #[test]
     fn check_summarizes_failing_tests_and_stores_full_log() {
         let (dir, mut ws) = workspace();
-        ws.checks = vec![
-            "printf 'build succeeded\\n'".into(),
-            "printf 'running 5 tests\\n---- tests::all stdout ----\\nassertion details that should only live in the artifact\\nfailures:\\n    tests::all\\n    tests::hours_minutes\\n\\ntest result: FAILED. 3 passed; 2 failed; 0 ignored; 0 measured\\n'; exit 1".into(),
-        ];
+        ws.checks = if cfg!(windows) {
+            vec![
+                "echo build succeeded".into(),
+                "(echo running 5 tests & echo ---- tests::all stdout ---- & echo assertion details that should only live in the artifact & echo failures: & echo     tests::all & echo     tests::hours_minutes & echo. & echo test result: FAILED. 3 passed; 2 failed; 0 ignored; 0 measured) & exit /b 1".into(),
+            ]
+        } else {
+            vec![
+                "printf 'build succeeded\\n'".into(),
+                "printf 'running 5 tests\\n---- tests::all stdout ----\\nassertion details that should only live in the artifact\\nfailures:\\n    tests::all\\n    tests::hours_minutes\\n\\ntest result: FAILED. 3 passed; 2 failed; 0 ignored; 0 measured\\n'; exit 1".into(),
+            ]
+        };
         let output = ws.call("check", &json!({}));
         assert!(output.is_error);
         let result: Value = serde_json::from_str(&output.text).unwrap();
@@ -1017,7 +1054,11 @@ mod tests {
     #[test]
     fn check_reports_first_compiler_error_location() {
         let (_dir, mut ws) = workspace();
-        ws.checks = vec!["printf 'error[E0308]: mismatched types\\n  --> src/lib.rs:12:7\\nerror: could not compile package\\n' >&2; exit 1".into()];
+        ws.checks = if cfg!(windows) {
+            vec!["(echo error[E0308]: mismatched types & echo   --^> src/lib.rs:12:7 & echo error: could not compile package) 1>&2 & exit /b 1".into()]
+        } else {
+            vec!["printf 'error[E0308]: mismatched types\\n  --> src/lib.rs:12:7\\nerror: could not compile package\\n' >&2; exit 1".into()]
+        };
         let output = ws.call("check", &json!({}));
         assert!(output.is_error);
         let result: Value = serde_json::from_str(&output.text).unwrap();
@@ -1032,10 +1073,17 @@ mod tests {
     #[test]
     fn check_sums_multiple_successful_test_suites() {
         let (dir, mut ws) = workspace();
-        ws.checks = vec![
-            "printf 'build ok\\n'".into(),
-            "printf 'test result: ok. 4 passed; 0 failed; 0 ignored\\ntest result: ok. 2 passed; 0 failed; 0 ignored\\n'".into(),
-        ];
+        ws.checks = if cfg!(windows) {
+            vec![
+                "echo build ok".into(),
+                "echo test result: ok. 4 passed; 0 failed; 0 ignored & echo test result: ok. 2 passed; 0 failed; 0 ignored".into(),
+            ]
+        } else {
+            vec![
+                "printf 'build ok\\n'".into(),
+                "printf 'test result: ok. 4 passed; 0 failed; 0 ignored\\ntest result: ok. 2 passed; 0 failed; 0 ignored\\n'".into(),
+            ]
+        };
         let output = ws.call("check", &json!({}));
         assert!(!output.is_error, "{}", output.text);
         let result: Value = serde_json::from_str(&output.text).unwrap();

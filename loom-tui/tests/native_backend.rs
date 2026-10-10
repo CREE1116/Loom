@@ -78,7 +78,7 @@ fn native_graph_dispatch_projects_split_and_keeps_child_activity_history() {
     Command::new("git").current_dir(d.path()).args(["init","-q"]).status().unwrap();
     fs::write(d.path().join("left.rs"),"pub fn left_value() -> u32 { 1 }\n").unwrap();
     fs::write(d.path().join("right.rs"),"pub fn right_value() -> u32 { 1 }\n").unwrap();
-    let mut backend = NativeBackend::with_model(d.path(),Arc::new(Port {left:worker("left.rs"),right:worker("right.rs")}),ExecutionOptions {checks:Some(vec!["true".into()]),..Default::default()}).unwrap();
+    let mut backend = NativeBackend::with_model(d.path(),Arc::new(Port {left:worker("left.rs"),right:worker("right.rs")}),ExecutionOptions {checks:Some(vec![if cfg!(windows) { "exit /b 0" } else { "true" }.into()]),..Default::default()}).unwrap();
     while backend.poll().unwrap().is_some() {}
     backend.command(AgentCommand::Submit {text:":edit Change left_value and right_value to return 2".into(),model:"scripted".into(),effort:None,skills:vec![],images:vec![]}).unwrap();
     let deadline=Instant::now()+Duration::from_secs(15);
@@ -232,7 +232,7 @@ fn backend() -> (tempfile::TempDir, NativeBackend) {
         d.path(),
         Arc::new(ScriptedModel::new(replies)),
         ExecutionOptions {
-            checks: Some(vec!["true".into()]),
+            checks: Some(vec![if cfg!(windows) { "exit /b 0" } else { "true" }.into()]),
             ..Default::default()
         },
     )

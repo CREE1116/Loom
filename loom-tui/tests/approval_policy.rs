@@ -69,7 +69,12 @@ fn script() -> Arc<m::ScriptedModel> {
 fn settings(state: &tempfile::TempDir) -> Settings {
     Settings {
         state: Some(state.path().to_owned()),
-        checks: vec!["grep -q '{ 2 }' src/lib.rs".into()],
+        checks: vec![if cfg!(windows) {
+            "findstr /c:\"{ 2 }\" src\\lib.rs >nul"
+        } else {
+            "grep -q '{ 2 }' src/lib.rs"
+        }
+        .into()],
         steps: 2,
         attempts: 1,
         ..Default::default()
@@ -388,7 +393,7 @@ fn validation_failure_with_never_preserves_files_and_selected_policy() -> Result
     let root = fixture()?;
     let state = tempfile::tempdir()?;
     let mut options = settings(&state);
-    options.checks = vec!["false".into()];
+    options.checks = vec![if cfg!(windows) { "exit /b 1" } else { "false" }.into()];
     let mut agent = backend(&root, options)?;
     initial_permissions(&mut agent)?;
     update(&mut agent, "approval", "never")?;

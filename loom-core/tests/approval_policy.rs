@@ -54,7 +54,12 @@ fn options(policy: ApprovalPolicy) -> Options {
     control.set_approval_policy(policy);
     Options {
         control,
-        checks: vec!["test -f result.txt".into()],
+        checks: vec![if cfg!(windows) {
+            "if exist result.txt (exit /b 0) else (exit /b 1)"
+        } else {
+            "test -f result.txt"
+        }
+        .into()],
         steps: 1,
         seconds: 30,
         validation_reserve: 0,

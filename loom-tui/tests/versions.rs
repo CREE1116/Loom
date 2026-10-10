@@ -95,7 +95,12 @@ fn wait(
 fn settings(state: &tempfile::TempDir) -> Settings {
     Settings {
         state: Some(state.path().to_owned()),
-        checks: vec!["grep -q '{ 2 }' src/lib.rs".into()],
+        checks: vec![if cfg!(windows) {
+            "findstr /c:\"{ 2 }\" src\\lib.rs >nul"
+        } else {
+            "grep -q '{ 2 }' src/lib.rs"
+        }
+        .into()],
         steps: 2,
         attempts: 1,
         ..Default::default()
@@ -760,10 +765,17 @@ fn interrupt_during_approval_resolves_the_turn_without_applying() -> Result<()> 
         let marker = tempfile::tempdir()?;
         let pause = marker.path().join("pause");
         let mut options = settings(&state);
-        options.checks = vec![format!(
-            "if test -f '{}'; then sleep 3; fi; grep -q '{{ 2 }}' src/lib.rs",
-            pause.display()
-        )];
+        options.checks = vec![if cfg!(windows) {
+            format!(
+                "if exist \"{}\" (ping -n 4 127.0.0.1 >nul) & findstr /c:\"{{ 2 }}\" src\\lib.rs >nul",
+                pause.display()
+            )
+        } else {
+            format!(
+                "if test -f '{}'; then sleep 3; fi; grep -q '{{ 2 }}' src/lib.rs",
+                pause.display()
+            )
+        }];
         let mut backend =
             VersionBackend::with_model(version, root.path(), script(version), options)?;
         backend.command(command())?;
@@ -1020,7 +1032,7 @@ fn rewind_restores_code_and_conversation_to_an_earlier_reply() -> Result<()> {
         ])
     };
     let model = Arc::new(m::ScriptedModel::new([edit("{ 1 }", "{ 2 }", "a"), edit("{ 2 }", "{ 3 }", "b")]));
-    let options = Settings { checks: vec!["true".into()], ..settings(&state) };
+    let options = Settings { checks: vec![if cfg!(windows) { "exit /b 0" } else { "true" }.into()], ..settings(&state) };
     let mut backend = VersionBackend::with_model(Version::Loom, root.path(), model, options)?;
     let mut turns = Vec::new();
     for text in ["change the value to two", "change the value to three"] {

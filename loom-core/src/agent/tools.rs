@@ -129,13 +129,26 @@ fn run_result_value(result: TestResult, store: &dyn ArtifactStore) -> Result<Val
 fn in_copy(command: &str, workspace: &Path, copy: &Path) -> String {
     let copy = copy.to_string_lossy();
     let workspace = workspace.to_string_lossy();
-    let mut roots = vec![workspace.trim_end_matches('/').to_owned()];
-    if let Some(short) = workspace.strip_prefix("/private") {
+    let base = workspace.trim_end_matches(['/', '\\']);
+    let mut roots = vec![base.to_owned()];
+    if let Some(short) = base.strip_prefix("/private") {
         roots.push(short.trim_end_matches('/').to_owned());
+    }
+    if let Some(plain) = base.strip_prefix(r"\\?\") {
+        let plain = plain.trim_end_matches(['/', '\\']);
+        roots.push(plain.to_owned());
+        if plain.contains('\\') {
+            roots.push(plain.replace('\\', "/"));
+        }
+    } else if base.as_bytes().get(1) == Some(&b':') {
+        roots.insert(0, format!(r"\\?\{base}"));
+        if base.contains('\\') {
+            roots.push(base.replace('\\', "/"));
+        }
     }
     roots.retain(|root| !root.is_empty());
     // One pass, so the copy's own path (inside the workspace) is never rewritten again.
-    let path_char = |c: char| c.is_alphanumeric() || "/._-~".contains(c);
+    let path_char = |c: char| c.is_alphanumeric() || "/\\._-~".contains(c);
     let mut out = String::with_capacity(command.len());
     let mut index = 0;
     while index < command.len() {
@@ -145,7 +158,10 @@ fn in_copy(command: &str, workspace: &Path, copy: &Path) -> String {
             .then(|| {
                 roots.iter().find(|root| {
                     rest.starts_with(root.as_str())
-                        && rest[root.len()..].chars().next().is_none_or(|c| c == '/' || !path_char(c))
+                        && rest[root.len()..]
+                            .chars()
+                            .next()
+                            .is_none_or(|c| matches!(c, '/' | '\\') || !path_char(c))
                 })
             })
             .flatten();

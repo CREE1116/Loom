@@ -113,7 +113,12 @@ fn file_patterns_and_filtered_search_are_available_to_read_only_workers_without_
 fn graph_child_check_is_deferred_and_never_reported_as_passed() {
     let (_directory, mut task) = task(2);
     task.defer_validation_to_core = true;
-    task.checks = vec!["touch check-ran".into()];
+    task.checks = vec![if cfg!(windows) {
+        "echo ran > check-ran"
+    } else {
+        "touch check-ran"
+    }
+    .into()];
     let model = ScriptedModel::new([
         call("check", json!({})),
         call(
@@ -341,7 +346,10 @@ fn plan_and_live_terminal_tools_work_in_the_worker_loop() {
     ]);
     let result = run(&mut task, &model, &AtomicBool::new(false), |_| {}).unwrap();
     assert_eq!(result.plan[0].step, "inspect output");
+    #[cfg(unix)]
     assert!(model.requests()[2].messages.last().unwrap().parts.iter().any(|p|matches!(p,Part::ToolResult{output,is_error:false,..} if output.contains("terminal-evidence"))));
+    #[cfg(not(unix))]
+    assert!(model.requests()[2].messages.last().unwrap().parts.iter().any(|p|matches!(p,Part::ToolResult{output,is_error:true,..} if output.contains("native PTY execution is only supported on Unix"))));
 }
 #[test]
 fn parallel_child_can_propose_and_merge_without_writing_original() {
@@ -662,7 +670,7 @@ fn a_successful_edit_invalidates_cached_reads_and_evidence() {
 #[test]
 fn unchanged_checks_keep_exploration_evidence_and_stop_repeated_validation() {
     let (_directory, mut task) = task(12);
-    task.checks = vec!["true".into()];
+    task.checks = vec![if cfg!(windows) { "exit /b 0" } else { "true" }.into()];
     let model = ScriptedModel::new([
         call("read", json!({"path":"lib.rs"})),
         call("check", json!({})),
@@ -718,7 +726,14 @@ fn unchanged_checks_keep_exploration_evidence_and_stop_repeated_validation() {
 #[test]
 fn an_edit_invalidates_the_check_cache_and_verifies_the_new_patch() {
     let (_directory, mut task) = task(6);
-    task.checks = vec!["test \"$(cat lib.rs)\" = 'pub fn value() -> u32 { 2 }'".into()];
+    task.checks = vec![
+        if cfg!(windows) {
+            "findstr /x /c:\"pub fn value() -> u32 { 2 }\" lib.rs >nul"
+        } else {
+            "test \"$(cat lib.rs)\" = 'pub fn value() -> u32 { 2 }'"
+        }
+        .into(),
+    ];
     let model = ScriptedModel::new([
         call("read", json!({"path":"lib.rs"})),
         call("check", json!({})),
@@ -1126,6 +1141,7 @@ fn html_escaped_edit_arguments_are_applied_unescaped() {
     assert_eq!(result.status, WorkerStatus::Proposed);
 }
 
+#[cfg(unix)]
 #[test]
 fn starting_a_running_command_again_points_at_the_live_session() {
     let (_directory, mut task) = task(4);
@@ -1157,12 +1173,20 @@ fn starting_a_running_command_again_points_at_the_live_session() {
 #[test]
 fn worker_checks_share_one_deadline_and_do_not_start_late_commands() {
     let (_directory, mut task) = task(2);
-    task.budget.seconds = 1;
-    task.checks = vec![
-        "sleep 0.6".into(),
-        "sleep 0.6".into(),
-        "printf should-not-run > late-check.txt".into(),
-    ];
+    task.budget.seconds = if cfg!(windows) { 2 } else { 1 };
+    task.checks = if cfg!(windows) {
+        vec![
+            "ping -n 2 127.0.0.1 >nul".into(),
+            "ping -n 3 127.0.0.1 >nul".into(),
+            "echo should-not-run > late-check.txt".into(),
+        ]
+    } else {
+        vec![
+            "sleep 0.6".into(),
+            "sleep 0.6".into(),
+            "printf should-not-run > late-check.txt".into(),
+        ]
+    };
     let model = ScriptedModel::new([
         call("check", json!({})),
         call("finish", json!({"summary":"checked"})),
@@ -1192,6 +1216,7 @@ fn worker_checks_share_one_deadline_and_do_not_start_late_commands() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn model_wait_is_deducted_from_a_late_terminal_command_deadline() {
     struct SlowModel(ScriptedModel);
@@ -1237,6 +1262,7 @@ fn model_wait_is_deducted_from_a_late_terminal_command_deadline() {
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn failed_terminal_exit_is_reported_as_error_with_its_exit_code_and_output() {
     let (_directory, mut task) = task(2);
@@ -1271,6 +1297,7 @@ fn failed_terminal_exit_is_reported_as_error_with_its_exit_code_and_output() {
         matches!(part, Part::ToolResult { is_error: true, output, .. } if output.contains("specific failure"))));
 }
 
+#[cfg(unix)]
 #[test]
 fn large_terminal_output_stays_valid_bounded_json_with_a_complete_raw_artifact() {
     use loom_core::base::ArtifactStore;
@@ -1421,14 +1448,19 @@ fn editing_one_file_does_not_resend_an_unchanged_other_file() {
     .unwrap();
     assert_eq!(reads.len(), 2);
     assert_eq!(reads[0]["cached"], false);
-    assert_eq!(
-        reads[1]["cached"], true,
-        "an unrelated edit invalidated unchanged source evidence"
-    );
-    let before = reads[0]["result"].as_str().unwrap().len();
-    let after = reads[1]["result"].as_str().unwrap().len();
-    eprintln!("unchanged helper result bytes: {before} -> {after}");
-    assert!(after < 350 && before > 7000);
+    #[cfg(unix)]
+    {
+        assert_eq!(
+            reads[1]["cached"], true,
+            "an unrelated edit invalidated unchanged source evidence"
+        );
+        let before = reads[0]["result"].as_str().unwrap().len();
+        let after = reads[1]["result"].as_str().unwrap().len();
+        eprintln!("unchanged helper result bytes: {before} -> {after}");
+        assert!(after < 350 && before > 7000);
+    }
+    #[cfg(not(unix))]
+    assert_eq!(reads[1]["cached"], false);
     assert_eq!(
         fs::read_to_string(task.overlay.dir().join("helper.txt")).unwrap(),
         helper
@@ -1472,6 +1504,7 @@ fn editing_a_file_invalidates_cached_reads_through_its_symlink_alias() {
     assert!(reads[1]["result"].as_str().unwrap().contains("{ 2 }"));
 }
 
+#[cfg(unix)]
 #[test]
 fn arbitrary_commands_invalidate_cached_source_evidence() {
     let (_directory, mut task) = task(4);
@@ -1729,6 +1762,7 @@ fn rejected_tool_generation_recovers_once_without_retrying_other_bad_requests() 
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn source_reads_are_not_reused_while_a_terminal_can_still_change_them() {
     let (_directory, mut task) = task(4);

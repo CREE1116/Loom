@@ -3930,7 +3930,12 @@ fn version_approval_restore(report: &mut Report) {
             "fix service.py",
             loom_core::agent::Intent::Edit,
             loom_core::agent::Options {
-                checks: vec!["grep -q up service.py".into()],
+                checks: vec![if cfg!(windows) {
+                    "findstr /c:up service.py >nul"
+                } else {
+                    "grep -q up service.py"
+                }
+                .into()],
                 validation_reserve: 0,
                 ..Default::default()
             },

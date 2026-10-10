@@ -5,6 +5,10 @@ use loom_core::{
 };
 use serde_json::json;
 use std::{fs, process::Command, sync::atomic::AtomicBool, time::Duration};
+fn check_command(unix: &str, windows: &str) -> String {
+    if cfg!(windows) { windows } else { unix }.to_owned()
+}
+
 fn repo() -> tempfile::TempDir {
     let d = tempfile::tempdir().unwrap();
     Command::new("git")
@@ -251,7 +255,7 @@ fn automatic_graph_workers_cannot_apply_a_partial_or_out_of_scope_result() {
             ExecutionOptions {
                 intent: TaskIntent::Edit,
                 max_attempts: 1,
-                checks: Some(vec!["true".into()]),
+                checks: Some(vec![check_command("true", "exit /b 0")]),
                 ..Default::default()
             },
             &port,
@@ -307,7 +311,7 @@ fn automatic_graph_worker_panic_reports_failure_without_waiting_out_the_executio
                     seconds: 30,
                     tokens: 10000,
                 },
-                checks: Some(vec!["true".into()]),
+                checks: Some(vec![check_command("true", "exit /b 0")]),
                 ..Default::default()
             },
             &Port,
@@ -339,7 +343,7 @@ fn validated_proposal_waits_for_approval_and_replays_after_restart() {
         .execute(
             "change file",
             ExecutionOptions {
-                checks: Some(vec!["test \"$(cat file.txt)\" = new".into()]),
+                checks: Some(vec![check_command("test \"$(cat file.txt)\" = new", "findstr /x /c:new file.txt >nul")]),
                 approve: false,
                 ..Default::default()
             },
@@ -379,7 +383,7 @@ fn approved_patch_contains_the_exact_validated_tree_including_generated_artifact
             "change file",
             ExecutionOptions {
                 checks: Some(vec![
-                    "printf 'generated\\n' > generated.txt; test \"$(cat file.txt)\" = new".into(),
+                    check_command("printf 'generated\\n' > generated.txt; test \"$(cat file.txt)\" = new", r#"powershell -NoProfile -Command "[IO.File]::WriteAllText('generated.txt', 'generated'+[char]10); if ((Get-Content -Raw file.txt).Trim() -ne 'new') { exit 1 }""#),
                 ]),
                 approve: false,
                 ..Default::default()
@@ -442,7 +446,7 @@ fn finish_without_a_patch_cannot_complete_an_edit_task() {
         .execute(
             "change file",
             ExecutionOptions {
-                checks: Some(vec!["true".into()]),
+                checks: Some(vec![check_command("true", "exit /b 0")]),
                 max_attempts: 1,
                 ..Default::default()
             },
@@ -470,7 +474,7 @@ fn finish_can_explicitly_return_a_conversational_answer_without_edits() {
         .execute(
             "안녕",
             ExecutionOptions {
-                checks: Some(vec!["false".into()]),
+                checks: Some(vec![check_command("false", "exit /b 1")]),
                 max_attempts: 1,
                 ..Default::default()
             },
@@ -533,7 +537,7 @@ fn finish_without_changes_does_not_restart_a_new_worker_or_call_map() {
             "change file",
             ExecutionOptions {
                 max_attempts: 8,
-                checks: Some(vec!["true".into()]),
+                checks: Some(vec![check_command("true", "exit /b 0")]),
                 ..Default::default()
             },
             &model,
@@ -598,7 +602,7 @@ fn core_repairs_a_finished_proposal_from_validation_evidence_without_user_resume
             ExecutionOptions {
                 max_attempts: 2,
                 intent: TaskIntent::Edit,
-                checks: Some(vec!["test \"$(cat file.txt)\" = new".into()]),
+                checks: Some(vec![check_command("test \"$(cat file.txt)\" = new", "findstr /x /c:new file.txt >nul")]),
                 ..Default::default()
             },
             &model,
@@ -753,7 +757,7 @@ fn unresolved_finish_does_not_trigger_another_tier_attempt() {
             "change file",
             ExecutionOptions {
                 max_attempts: 8,
-                checks: Some(vec!["true".into()]),
+                checks: Some(vec![check_command("true", "exit /b 0")]),
                 ..Default::default()
             },
             &model,
@@ -1140,7 +1144,7 @@ fn validation_respects_the_shared_deadline() {
         .execute(
             "change file",
             ExecutionOptions {
-                checks: Some(vec!["sleep 3".into(), "exit 87".into()]),
+                checks: Some(vec![check_command("sleep 3", "ping -n 4 127.0.0.1 >nul"), "exit 87".into()]),
                 budget: loom_core::worker::Budget {
                     steps: 5,
                     seconds: 1,
@@ -1175,7 +1179,7 @@ fn validation_respects_the_shared_deadline() {
 fn retry_receives_observed_scope_misses_instead_of_only_the_stale_plan() {
     let d = repo();
     let options = ExecutionOptions {
-        checks: Some(vec!["test \"$(cat file.txt)\" = expected".into()]),
+        checks: Some(vec![check_command("test \"$(cat file.txt)\" = expected", "findstr /x /c:expected file.txt >nul")]),
         max_attempts: 1,
         approve: false,
         ..Default::default()
@@ -1314,7 +1318,7 @@ fn retry_preserves_the_failed_proposal_and_can_read_previous_validation_evidence
         response("edit", json!({"path":"file.txt","old":"old","new":"bad"})),
         response("finish", json!({"summary":"first proposal"})),
     ]);
-    let options=ExecutionOptions{max_attempts:1,checks:Some(vec!["if [ \"$(cat file.txt)\" != new ]; then printf 'specific-failure-evidence\\n'; exit 1; fi".into()]),..Default::default()};
+    let options=ExecutionOptions{max_attempts:1,checks:Some(vec![check_command("if [ \"$(cat file.txt)\" != new ]; then printf 'specific-failure-evidence\\n'; exit 1; fi", "findstr /x /c:new file.txt >nul || (echo specific-failure-evidence& exit /b 1)")]),..Default::default()};
     let task = core
         .execute(
             "change file",
@@ -1354,7 +1358,7 @@ fn an_active_task_cannot_be_resumed_by_another_core_instance() {
     let mut core = Core::open(d.path()).unwrap();
     let mut rejected = None;
     let options = ExecutionOptions {
-        checks: Some(vec!["true".into()]),
+        checks: Some(vec![check_command("true", "exit /b 0")]),
         ..Default::default()
     };
     core.execute(
@@ -1394,7 +1398,7 @@ fn three_way_application_preserves_nonconflicting_user_edits_and_refuses_conflic
         .execute(
             "change file",
             ExecutionOptions {
-                checks: Some(vec!["true".into()]),
+                checks: Some(vec![check_command("true", "exit /b 0")]),
                 approve: false,
                 ..Default::default()
             },
@@ -1423,7 +1427,7 @@ fn three_way_application_preserves_nonconflicting_user_edits_and_refuses_conflic
         .execute(
             "change file",
             ExecutionOptions {
-                checks: Some(vec!["true".into()]),
+                checks: Some(vec![check_command("true", "exit /b 0")]),
                 approve: false,
                 ..Default::default()
             },
@@ -1453,7 +1457,7 @@ fn a_stale_client_cannot_reject_an_already_accepted_task() {
         .execute(
             "change file",
             ExecutionOptions {
-                checks: Some(vec!["true".into()]),
+                checks: Some(vec![check_command("true", "exit /b 0")]),
                 approve: false,
                 ..Default::default()
             },
@@ -1569,7 +1573,7 @@ fn escalation_is_monotonic_across_restart_and_handoff_contains_failure_evidence(
 fn resuming_a_scope_conflict_uses_the_current_workspace_as_its_base() {
     let d = repo();
     let options = ExecutionOptions {
-        checks: Some(vec!["true".into()]),
+        checks: Some(vec![check_command("true", "exit /b 0")]),
         approve: false,
         max_attempts: 1,
         ..Default::default()
@@ -1624,7 +1628,7 @@ fn retry_can_read_logs_from_the_previous_workers_own_check() {
     use loom_core::base::ArtifactStore;
     let d = repo();
     let options = ExecutionOptions {
-        checks: Some(vec!["printf 'worker-check-evidence\\n'; exit 1".into()]),
+        checks: Some(vec![check_command("printf 'worker-check-evidence\\n'; exit 1", "echo worker-check-evidence& exit /b 1")]),
         max_attempts: 1,
         ..Default::default()
     };
@@ -1696,7 +1700,7 @@ fn a_prose_reply_ends_the_turn_without_exploring_validating_or_retrying() {
         .execute(
             "안녕",
             ExecutionOptions {
-                checks: Some(vec!["false".into()]),
+                checks: Some(vec![check_command("false", "exit /b 1")]),
                 ..Default::default()
             },
             &model,
@@ -1750,7 +1754,7 @@ fn structured_finish_text_after_edit_is_a_proposal_subject_to_independent_valida
                     intent: TaskIntent::Edit,
                     approve: false,
                     max_attempts: 1,
-                    checks: Some(vec!["test \"$(cat file.txt)\" = new".into()]),
+                    checks: Some(vec![check_command("test \"$(cat file.txt)\" = new", "findstr /x /c:new file.txt >nul")]),
                     ..Default::default()
                 },
                 &model,
@@ -1798,7 +1802,7 @@ fn prose_after_an_edit_is_not_an_answer() {
         .execute(
             "change file",
             ExecutionOptions {
-                checks: Some(vec!["true".into()]),
+                checks: Some(vec![check_command("true", "exit /b 0")]),
                 max_attempts: 1,
                 ..Default::default()
             },
