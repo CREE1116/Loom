@@ -887,7 +887,15 @@ fn cancelling_an_idle_stream_closes_the_socket_without_waiting_for_data() {
                 }
                 ready.send(()).unwrap();
                 socket.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
-                closed.send(matches!(socket.read(&mut [0; 1]), Ok(0))).unwrap();
+                let disconnected = match socket.read(&mut [0; 1]) {
+                    Ok(0) => true,
+                    Err(e) => matches!(
+                        e.kind(),
+                        std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted
+                    ),
+                    Ok(_) => false,
+                };
+                closed.send(disconnected).unwrap();
                 break;
             });
             let provider = connect(Endpoint { name: "test".into(), protocol, base_url: endpoint, api_key: None, headers: vec![] });

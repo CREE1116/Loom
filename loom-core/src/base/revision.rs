@@ -595,7 +595,11 @@ mod stat_cache {
             let ctime_ns = i128::from(std::os::unix::fs::MetadataExt::ctime(metadata)) * 1_000_000_000
                 + i128::from(std::os::unix::fs::MetadataExt::ctime_nsec(metadata));
             #[cfg(not(unix))]
-            let ctime_ns = 0;
+            let ctime_ns = metadata
+                .created()
+                .ok()
+                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                .map_or(0, |d| d.as_nanos() as i128);
             Self {
                 len: metadata.len(),
                 mtime_ns: metadata
@@ -619,7 +623,8 @@ mod stat_cache {
         pub fn reuse(&self, name: &[u8], stat: &Stat) -> Option<&str> {
             let (cached, hash) = self.entries.get(std::str::from_utf8(name).ok()?)?;
             let settled = stat.mtime_ns + 2_000_000_000 < self.written_ns;
-            (cached == stat && settled && stat.mtime_ns > 0 && stat.ctime_ns > 0).then_some(hash.as_str())
+            (cached == stat && settled && stat.mtime_ns > 0 && (cfg!(not(unix)) || stat.ctime_ns > 0))
+                .then_some(hash.as_str())
         }
     }
 

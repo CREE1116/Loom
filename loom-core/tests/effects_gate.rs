@@ -282,6 +282,32 @@ fn sequential_overlays_reuse_build_paths_but_concurrent_overlays_are_distinct() 
         assert_eq!(Revision::capture(overlay.dir()).unwrap(), base);
     }
     drop(first);
+    {
+        use fs2::FileExt;
+        let lease = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path.with_extension("lock"))
+            .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            match lease.try_lock_exclusive() {
+                Ok(()) => break,
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::WouldBlock
+                        || error.raw_os_error() == fs2::lock_contended_error().raw_os_error() =>
+                {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "overlay cleanup did not release {}",
+                        path.display()
+                    );
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => panic!("overlay lease check failed: {error}"),
+            }
+        }
+    }
     let second = Overlay::create(directory.path(), &base).unwrap();
     assert_eq!(second.dir(), path);
     assert_eq!(
