@@ -719,7 +719,8 @@ fn fetch_location(
         match fs2::FileExt::try_lock_exclusive(&file) {
             Ok(()) => break,
             Err(e)
-                if e.kind() == std::io::ErrorKind::WouldBlock
+                if (e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.raw_os_error() == fs2::lock_contended_error().raw_os_error())
                     && lock_started.elapsed() < Duration::from_millis(250) =>
             {
                 check_progress(progress, file.metadata()?.len(), size)?;

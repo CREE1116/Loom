@@ -89,6 +89,7 @@ impl Sessions {
         file.write_all(&serde_json::to_vec(session)?)?;
         file.as_file().sync_all()?;
         file.persist(self.path(&session.id)?).map_err(|e| e.error)?;
+        #[cfg(unix)]
         fs::File::open(&self.root)?.sync_all()?;
         Ok(())
     }

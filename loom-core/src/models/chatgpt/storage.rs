@@ -212,7 +212,9 @@ impl Store {
             match fs2::FileExt::try_lock_exclusive(&file) {
                 Ok(()) => return Ok(file),
                 Err(e)
-                    if e.kind() == std::io::ErrorKind::WouldBlock && Instant::now() < deadline =>
+                    if (e.kind() == std::io::ErrorKind::WouldBlock
+                        || e.raw_os_error() == fs2::lock_contended_error().raw_os_error())
+                        && Instant::now() < deadline =>
                 {
                     std::thread::sleep(Duration::from_millis(25))
                 }

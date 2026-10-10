@@ -290,7 +290,8 @@ fn lock(path: &Path, progress: &mut dyn FnMut(u64, u64) -> bool) -> Result<fs::F
         match fs2::FileExt::try_lock_exclusive(&file) {
             Ok(()) => return Ok(file),
             Err(error)
-                if error.kind() == std::io::ErrorKind::WouldBlock
+                if (error.kind() == std::io::ErrorKind::WouldBlock
+                    || error.raw_os_error() == fs2::lock_contended_error().raw_os_error())
                     && started.elapsed() < Duration::from_secs(30) =>
             {
                 std::thread::sleep(Duration::from_millis(20))

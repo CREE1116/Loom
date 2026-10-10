@@ -414,7 +414,10 @@ impl Core {
         for _ in 0..if wait { 40 } else { 0 } {
             match lock.try_lock_exclusive() {
                 Ok(()) => return Ok(lock),
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::WouldBlock
+                        || e.raw_os_error() == fs2::lock_contended_error().raw_os_error() =>
+                {
                     std::thread::sleep(std::time::Duration::from_millis(5))
                 }
                 Err(e) => return Err(e.into()),

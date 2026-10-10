@@ -77,6 +77,7 @@ fn stdio(extra: &str) -> TempDir {
     dir
 }
 
+#[cfg(unix)]
 #[test]
 fn open_is_lazy_and_stdio_discovery_calls_and_resources_are_real() {
     let dir = stdio("");
@@ -128,6 +129,7 @@ fn open_is_lazy_and_stdio_discovery_calls_and_resources_are_real() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn discovery_failure_is_visible_and_tool_errors_are_errors() {
     let dir = stdio("BAD_LIST = '1'");
@@ -195,6 +197,7 @@ fn invalid_config_and_pre_cancelled_calls_do_not_start_processes() {
     assert!(!dir.path().join("started").exists());
 }
 
+#[cfg(unix)]
 #[test]
 fn readonly_classification_requires_explicit_mcp_annotation() {
     let dir = stdio("");
@@ -286,6 +289,7 @@ fn cancellation_deadline_and_drop_reap_process_groups() {
     assert!(stopped(pid));
 }
 
+#[cfg(unix)]
 #[test]
 fn oversized_stdio_message_is_rejected_promptly() {
     let dir = stdio("");
@@ -603,6 +607,7 @@ fn searxng_html_extracts_real_result_links_and_rejects_challenge_pages() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn server_name_collisions_are_disambiguated_without_misrouting() {
     let dir = config(
@@ -626,6 +631,7 @@ fn server_name_collisions_are_disambiguated_without_misrouting() {
     assert_eq!(outputs.iter().filter(|s| s.contains(":second:")).count(), 2);
 }
 
+#[cfg(unix)]
 #[test]
 fn network_denied_discovery_and_stdio_call_never_contact_http_servers() {
     let http = Http::new(|_, _, _| ("503 Unavailable".into(), String::new(), String::new()));
@@ -653,6 +659,40 @@ fn network_denied_discovery_and_stdio_call_never_contact_http_servers() {
         .contains("network denied")
     );
     assert!(http.requests.lock().unwrap().is_empty());
+}
+
+#[cfg(not(unix))]
+#[test]
+fn non_unix_stdio_surfaces_diagnostic_and_network_denied_skips_http() {
+    let http = Http::new(|_, _, _| ("503 Unavailable".into(), String::new(), String::new()));
+    let dir = config(&format!(
+        "[mcp_servers.remote]\nurl='{}/mcp'\n[mcp_servers.local]\ncommand='python3'\nargs=['-u','server.py']\n",
+        http.url
+    ));
+    let ext = Extensions::open(dir.path()).unwrap();
+    assert!(ext.is_read_only("web_search"));
+    assert!(ext.is_read_only("web_fetch"));
+    assert!(ext.requires_network("web_search"));
+    assert!(ext.requires_network("web_fetch"));
+    let specs = ext.specs_with_network(false);
+    assert!(specs.iter().all(|s| !ext.requires_network(&s.name)));
+    assert!(http.requests.lock().unwrap().is_empty());
+    let diagnostics = specs
+        .iter()
+        .find(|s| s.name == "extensions_diagnostics")
+        .unwrap();
+    let out = ext
+        .call(
+            &diagnostics.name,
+            &json!({}),
+            &AtomicBool::new(false),
+            TIMEOUT,
+        )
+        .unwrap();
+    assert!(
+        out.contains("MCP stdio process-group supervision requires Unix"),
+        "{out}"
+    );
 }
 
 #[test]

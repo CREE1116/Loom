@@ -118,7 +118,7 @@ impl Workspace {
     /// Resolve a workspace-relative path, refusing anything outside the root.
     fn resolve(&self, path: &str) -> Result<(PathBuf, String), String> {
         let rel = Path::new(path.trim().trim_start_matches("./"));
-        if rel.is_absolute() && !rel.starts_with(&self.root) {
+        if (rel.is_absolute() || rel.has_root()) && !rel.starts_with(&self.root) {
             return Err(format!("{path} is outside the workspace"));
         }
         let rel = rel.strip_prefix(&self.root).unwrap_or(rel);

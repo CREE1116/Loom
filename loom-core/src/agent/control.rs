@@ -105,7 +105,7 @@ fn migrate_legacy_tasks(legacy: &Path, current: &Path) -> Result<()> {
 
 impl Core {
     pub fn open(root: &Path) -> Result<Self> {
-        let root = root.canonicalize()?;
+        let root = dunce::canonicalize(root)?;
         let tasks = root.join(".loom/tasks");
         fs::create_dir_all(&tasks)?;
         migrate_legacy_tasks(&root.join(".loom/v5/tasks"), &tasks)?;
@@ -523,7 +523,9 @@ impl Core {
         let mut file = File::create(&temporary)?;
         file.write_all(&serde_json::to_vec_pretty(task)?)?;
         file.sync_all()?;
+        drop(file);
         fs::rename(temporary, self.tasks.join(format!("{}.json", task.id)))?;
+        #[cfg(unix)]
         File::open(&self.tasks)?.sync_all()?;
         Ok(())
     }
@@ -539,7 +541,10 @@ impl Core {
         for _ in 0..40 {
             match file.try_lock_exclusive() {
                 Ok(()) => return Ok(file),
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::WouldBlock
+                        || e.raw_os_error() == fs2::lock_contended_error().raw_os_error() =>
+                {
                     std::thread::sleep(std::time::Duration::from_millis(5))
                 }
                 Err(e) => return Err(e.into()),
