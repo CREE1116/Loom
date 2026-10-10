@@ -1760,6 +1760,7 @@ dependencies = [
  "base64 0.22.1",
  "cc",
  "clap",
+ "dunce",
  "encoding_rs",
  "flate2",
  "fs2",

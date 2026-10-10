@@ -92,7 +92,7 @@ impl Revision {
         cancel: Option<&AtomicBool>,
     ) -> Result<Self> {
         check_cancel(cancel)?;
-        let root = root.canonicalize().context("Opening revision workspace")?;
+        let root = dunce::canonicalize(&root).context("Opening revision workspace")?;
         let mut run = |command: &mut Command| -> Result<Vec<u8>> {
             check_cancel(cancel)?;
             let Output {
@@ -112,7 +112,7 @@ impl Revision {
             command
         };
         let top = run(git().args(["rev-parse", "--show-toplevel"]))?;
-        if raw_path(top.strip_suffix(b"\n").unwrap_or(&top))?.canonicalize()? != root {
+        if dunce::canonicalize(raw_path(top.strip_suffix(b"\n").unwrap_or(&top))?)? != root {
             bail!("revision workspace must be the Git repository root");
         }
         // Starting from an empty, private index also handles an unborn HEAD and deletions.
@@ -257,9 +257,7 @@ impl Revision {
 
     fn materialize_inner(&self, root: &Path, cancel: Option<&AtomicBool>) -> Result<()> {
         check_cancel(cancel)?;
-        let root = root
-            .canonicalize()
-            .context("Opening materialization worktree")?;
+        let root = dunce::canonicalize(root).context("Opening materialization worktree")?;
         let run = |command: &mut Command| -> Result<Vec<u8>> {
             check_cancel(cancel)?;
             let output = match cancel {
@@ -284,7 +282,7 @@ impl Revision {
             bail!("materialization requires an existing Git worktree");
         }
         let top = run(git().args(["rev-parse", "--show-toplevel"]))?;
-        if raw_path(top.strip_suffix(b"\n").unwrap_or(&top))?.canonicalize()? != root {
+        if dunce::canonicalize(raw_path(top.strip_suffix(b"\n").unwrap_or(&top))?)? != root {
             bail!("materialization must target the Git worktree root");
         }
         let tree = run(git().args(["ls-tree", "-r", "-z", self.as_str()]))?;

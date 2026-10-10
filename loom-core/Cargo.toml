@@ -20,6 +20,8 @@ flate2 = "1"
 fs2 = "0.4"
 libc = "0.2"
 getrandom = "0.2"
+# Windows: plain paths for tools (git) that do not accept `\\?\` verbatim paths.
+dunce = "1"
 jsonwebtoken = "9"
 llama-cpp-2 = { version = "0.1.158", default-features = false, features = ["common"] }
 llama-cpp-sys-2 = { version = "0.1.158", default-features = false }
