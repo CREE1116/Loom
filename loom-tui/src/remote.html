@@ -27,6 +27,7 @@
       --ok: #4cc38a; --bad: #ff6b6b; --warn: #f0b44c; --code: #151820; --shadow: 0 8px 30px rgba(0, 0, 0, .5);
     }
   }
+  [hidden] { display: none !important; }
   * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
   html, body { margin: 0; height: 100%; background: var(--bg); color: var(--fg);
     font: 15.5px/1.55 -apple-system, BlinkMacSystemFont, "Apple SD Gothic Neo", "Pretendard", "Segoe UI", sans-serif; }
@@ -197,7 +198,11 @@
 <footer>
   <div class="dock">
     <div id="requests"><div id="approvals"></div><div id="questions"></div></div>
-    <div class="queue-count" id="queue-count" role="status" hidden></div>
+    <div id="recovery" class="choices" hidden>
+      <button class="btn primary" id="retry-model" data-remote-action>이어서 시도</button>
+      <span class="queue-count">모델·추론 옵션을 바꾼 뒤 다시 시도할 수 있습니다.</span>
+    </div>
+    <button class="chip" id="queue-count" hidden></button>
     <div class="chips">
       <button class="chip" id="model-chip"><svg viewBox="0 0 24 24"><path d="M12 3l8 4.5v9L12 21l-8-4.5v-9z"/><path d="M12 12l8-4.5M12 12v9M12 12L4 7.5"/></svg><span id="model-label">모델</span></button>
       <button class="chip" id="effort-chip" hidden><svg viewBox="0 0 24 24"><path d="M13 2L4 14h7l-1 8 9-12h-7z"/></svg><span id="effort-label"></span></button>
@@ -222,6 +227,19 @@
   <div class="grip"></div>
   <h2>추론 강도</h2>
   <div class="body" id="effort-list"></div>
+</section>
+<section class="sheet" id="queue-sheet" aria-label="대기열">
+  <div class="grip"></div><h2>대기열</h2>
+  <div class="info">즉시 보내기는 현재 응답을 중단한 뒤 선택한 메시지를 전송합니다.</div>
+  <div class="body" id="queue-list"></div>
+</section>
+<section class="sheet" id="queue-options-sheet" aria-label="대기 메시지 옵션">
+  <div class="grip"></div><h2>대기 메시지 옵션</h2>
+  <div class="body" style="padding:14px">
+    <label>모델 <select id="queue-model" style="width:100%;min-height:44px"></select></label>
+    <label>추론 강도 <select id="queue-effort" style="width:100%;min-height:44px"></select></label>
+    <button class="btn primary" id="queue-save" data-remote-action style="margin-top:12px">옵션 저장</button>
+  </div>
 </section>
 <section class="sheet" id="menu-sheet" aria-label="메뉴">
   <div class="grip"></div>
@@ -565,8 +583,9 @@
     $("title").textContent = state.title || "Loom";
     const queued = state.queued || 0;
     $("queue-count").hidden = queued === 0;
+    $("queue-count").setAttribute("aria-label", "대기열 " + queued + "개");
     $("queue-count").textContent = queued > 0
-      ? "전송 대기 " + queued + "개" + (state.questions?.length ? " · 질문에 답해주세요." : "") : "";
+      ? "대기열 " + queued + "개" + (state.queue_paused ? " · 일시정지" : "") + (state.questions?.length ? " · 질문에 답해주세요." : "") : "";
     $("model-label").textContent = state.model_label || state.model || "모델";
     const efforts = state.efforts || [];
     $("effort-chip").hidden = !efforts.length;
@@ -574,6 +593,7 @@
     $("conn-info").textContent = state.public
       ? "인터넷(HTTPS)으로 연결됨 · 이 주소를 아는 사람은 Loom을 조작할 수 있습니다."
       : "같은 네트워크로 연결됨 · 암호화되지 않은 연결입니다. 믿을 수 있는 네트워크에서만 쓰세요.";
+    $("recovery").hidden = !state.recovery || state.busy;
     updateSend();
     const atBottom = follow;
     renderThread();
@@ -582,6 +602,7 @@
     if (atBottom) requestAnimationFrame(() => { scroller.scrollTop = scroller.scrollHeight; });
     if (sheetOpen === "model-sheet") renderModels();
     if (sheetOpen === "effort-sheet") renderEfforts();
+    if (sheetOpen === "queue-sheet") renderQueue();
     syncConnection();
   }
 
@@ -594,6 +615,51 @@
       ? '<svg viewBox="0 0 24 24"><rect x="7" y="7" width="10" height="10" rx="2" fill="currentColor" stroke="none"/></svg>'
       : '<svg viewBox="0 0 24 24"><path d="M12 19V5M5 12l7-7 7 7"/></svg>';
   }
+
+  let queueEdit = null;
+  function queueBody(action, item) {
+    return { action, index: item.index, revision: state.queue_revision };
+  }
+  function renderQueue() {
+    const nodes = [];
+    if (state.queue_paused) nodes.push(h("button", { class: "btn", "data-remote-action": true,
+      onclick: () => command({ action: "queue_resume" }, "대기열 전송을 재개합니다") }, "대기열 재개"));
+    for (const item of state.queue || []) {
+      // Capture the displayed revision; an updated queue must never redirect an old click.
+      const revision = state.queue_revision;
+      nodes.push(h("div", { class: "approval" }, h("div", { class: "failed-text" }, item.text),
+        h("div", { class: "queue-count" }, (item.model_label || item.model) + " · " + (item.effort || "기본")
+          + (item.images ? " · 이미지 " + item.images + "개" : "") + (item.skills ? " · 스킬 " + item.skills + "개" : "")),
+        h("div", { class: "choices" },
+          h("button", { class: "btn primary", "data-remote-action": true,
+            onclick: () => command({ ...queueBody("queue_send", item), revision }, "선택한 메시지를 우선 전송합니다") }, "즉시 보내기"),
+          h("button", { class: "btn", onclick: () => editQueue(item, revision) }, "옵션 변경"),
+          h("button", { class: "btn", "data-remote-action": true,
+            onclick: () => command({ ...queueBody("queue_remove", item), revision }, "대기 메시지를 삭제했습니다") }, "삭제"))));
+    }
+    if (!nodes.length) nodes.push(h("div", { class: "info" }, "대기 중인 메시지가 없습니다."));
+    $("queue-list").replaceChildren(...nodes);
+  }
+  function queueEfforts(value = "") {
+    const model = (state.models || []).find(m => m.id === $("queue-model").value);
+    $("queue-effort").replaceChildren(...[{ value: "", description: "기본" }, ...(model?.efforts || [])]
+      .map(e => h("option", { value: e.value }, e.value || e.description)));
+    $("queue-effort").value = value;
+    if ($("queue-effort").selectedIndex < 0) $("queue-effort").value = "";
+  }
+  function editQueue(item, revision) {
+    queueEdit = { ...queueBody("queue_update", item), revision };
+    $("queue-model").replaceChildren(...(state.models || []).map(m => h("option", { value: m.id }, m.label)));
+    $("queue-model").value = item.model;
+    queueEfforts(item.effort || "");
+    openSheet("queue-options-sheet");
+  }
+  $("queue-model").onchange = () => queueEfforts();
+  $("queue-save").onclick = () => {
+    if (queueEdit) command({ ...queueEdit, model: $("queue-model").value, effort: $("queue-effort").value }, "대기 메시지 옵션을 변경했습니다");
+  };
+  $("queue-count").onclick = () => { renderQueue(); openSheet("queue-sheet"); };
+  $("retry-model").onclick = () => command({ action: "retry" }, "이전 요청을 이어서 시도합니다");
 
   // ---- Sheets ----
   let sheetOpen = null;

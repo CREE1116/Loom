@@ -21,7 +21,7 @@ pub struct RemoteView {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::{AnswerValue, InputRequest, Question, QuestionAnswer};
+    use crate::agent::{AgentEvent, AgentUpdate, AnswerValue, InputRequest, Question, QuestionAnswer};
 
     #[test]
     fn remote_send_preserves_the_entire_local_composer_and_attachments() {
@@ -56,6 +56,49 @@ mod tests {
                 .iter()
                 .all(|q| q.images.is_empty() && q.skills.is_empty())
         );
+    }
+
+    #[test]
+    fn remote_queue_edits_are_stale_checked_and_immediate_send_waits_for_interrupt() {
+        let mut app = App::new(false);
+        app.thread = Some("session".into());
+        app.turn = Some("active".into());
+        app.busy = true;
+        app.model = "auto".into();
+        app.models = vec!["auto".into(), "other".into()];
+        app.checked_remote_command(Command::Send("first".into())).unwrap();
+        app.checked_remote_command(Command::Send("second".into())).unwrap();
+        let revision = app.remote_queue_revision();
+        app.checked_remote_command(Command::Queue { index: 1, revision: revision.clone(), operation: "queue_update".into(), model: Some("other".into()), effort: Some("".into()) }).unwrap();
+        assert_eq!(app.queued[1].model, "other");
+        assert_eq!(app.model, "auto");
+        assert!(app.checked_remote_command(Command::Queue { index: 1, revision, operation: "queue_remove".into(), model: None, effort: None }).is_err());
+        assert_eq!(app.queued.len(), 2);
+        let command = Command::Queue { index: 1, revision: app.remote_queue_revision(), operation: "queue_send".into(), model: None, effort: None };
+        assert_eq!(app.checked_remote_command(command).unwrap(), Some(Intent::Interrupt));
+        assert_eq!(app.queued[0].text, "second");
+        assert_eq!(app.next_queued(), None);
+        app.apply_event(AgentEvent::scoped("session", AgentUpdate::TurnCompleted { id: Some("active".into()), status: "interrupted".into(), error: None }));
+        assert_eq!(app.next_queued(), Some(Intent::Submit("second".into())));
+        assert_eq!(app.queued[0].text, "first");
+    }
+
+    #[test]
+    fn recovery_preserves_drafts_and_paused_work_without_automatic_resubmission() {
+        let mut app = App::new(false);
+        app.thread = Some("session".into());
+        app.editor.insert("local draft");
+        app.queued.push_back(QueuedMessage { text: "next task".into(), model: "auto".into(), effort: None, images: vec![], skills: vec![] });
+        app.apply_event(AgentEvent::scoped("session", AgentUpdate::TurnCompleted { id: None, status: "failed".into(), error: None }));
+        assert!(app.recovery_available && app.queue_paused);
+        assert_eq!(app.next_queued(), None);
+        app.checked_remote_command(Command::Retry).unwrap();
+        assert_eq!(app.editor.text, "local draft");
+        assert_eq!(app.queued.len(), 2);
+        assert_eq!(app.queued[1].text, "next task");
+        assert!(!app.recovery_available);
+        assert!(app.checked_remote_command(Command::Retry).is_err());
+        assert!(matches!(app.next_queued(), Some(Intent::Submit(text)) if text.contains("이미 완료한")));
     }
 
     #[test]
@@ -142,6 +185,30 @@ mod tests {
 }
 
 impl App {
+    fn remote_queue_revision(&self) -> String {
+        use std::hash::{Hash, Hasher};
+        let mut hash = std::collections::hash_map::DefaultHasher::new();
+        format!("{:?}", self.queued).hash(&mut hash);
+        format!("{:x}", hash.finish())
+    }
+    pub(super) fn retry_failed_turn(&mut self) -> Option<Intent> {
+        if self.readonly || !self.recovery_available || self.busy || self.turn.is_some() || self.submitted.is_some() || self.compacting || self.execution_limit.is_some()
+            || self.thread.is_none() || self.permission_pending.is_some()
+            || !self.approvals.is_empty() || !self.input_forms.is_empty() {
+            self.error("현재 작업과 승인·질문 또는 사용 제한을 확인한 뒤 다시 시도하세요.");
+            return None;
+        }
+        let goal = self.entries.iter().rev().find(|e| e.kind == Kind::User && !e.body.starts_with("이전 요청을 이어서 완료해 주세요.")).map(|e| e.body.clone()).unwrap_or_default();
+        let text = format!("이전 요청을 이어서 완료해 주세요. 먼저 실제 작업 상태와 기록을 확인하고 이미 완료한 명령이나 변경은 반복하지 마세요. 실패 원인이 남아 있으면 알려주세요.\n\n이전 요청: {goal}");
+        // Submit before paused work, preserving its settings, attachments and the local draft.
+        let intent = self.remote_command(Command::Send(text));
+        self.recovery_available = false;
+        if intent.is_none() && !self.queued.is_empty() {
+            return self.activate(Action::ForceQueued(self.queued.len() - 1));
+        }
+        intent
+    }
+
     pub fn remote_started(&mut self, url: String, qr: Vec<Vec<bool>>, tunnel_pending: bool) {
         self.remote = Some(RemoteView {
             url,
@@ -268,7 +335,8 @@ impl App {
         let models: Vec<_> = self
             .models
             .iter()
-            .map(|id| json!({"id": id, "label": label(id), "group": group(id)}))
+            .map(|id| json!({"id": id, "label": label(id), "group": group(id),
+                "efforts": self.model_profiles.iter().find(|p| &p.id == id).map(|p| p.efforts.iter().map(|e| json!({"value": e.value, "description": e.description})).collect::<Vec<_>>()).unwrap_or_default()}))
             .collect();
         let efforts: Vec<_> = self
             .model_profile()
@@ -289,6 +357,13 @@ impl App {
             "efforts": efforts,
             "models": models,
             "queued": self.queued.len(),
+            "queue_paused": self.queue_paused,
+            "queue_revision": self.remote_queue_revision(),
+            "queue": self.queued.iter().enumerate().map(|(index, q)| json!({
+                "index": index, "text": q.text, "model": q.model, "model_label": label(&q.model),
+                "effort": q.effort, "images": q.images.len(), "skills": q.skills.len(),
+            })).collect::<Vec<_>>(),
+            "recovery": self.recovery_available,
             "public": self.remote.as_ref().is_some_and(|v| v.public),
             "entries": entries,
             "approvals": approvals,
@@ -302,6 +377,29 @@ impl App {
             return Err("열람 전용 창에서는 조작할 수 없습니다.".into());
         }
         match &command {
+            Command::Retry if !self.recovery_available || self.busy || self.turn.is_some() || self.submitted.is_some() || self.compacting || self.execution_limit.is_some()
+                || self.thread.is_none() || !self.approvals.is_empty() || !self.input_forms.is_empty()
+                || self.permission_pending.is_some() => return Err("현재 작업과 승인·질문 또는 사용 제한을 확인해주세요.".into()),
+            Command::ResumeQueue if self.execution_limit.is_some() => return Err("사용 제한을 확인하거나 모델을 변경해주세요.".into()),
+            Command::Queue { index, revision, operation, model, effort } => {
+                if *revision != self.remote_queue_revision() || *index >= self.queued.len() {
+                    return Err("대기열이 변경되었습니다. 새 목록에서 다시 선택해주세요.".into());
+                }
+                if operation == "queue_send" && (self.execution_limit.is_some() || self.permission_pending.is_some()
+                    || self.compacting || !self.approvals.is_empty() || !self.input_forms.is_empty()) {
+                    return Err("승인·질문과 사용 제한을 먼저 확인해주세요.".into());
+                }
+                if operation == "queue_update" {
+                    let model = model.as_ref().ok_or("모델을 선택해주세요.")?;
+                    let effort = effort.as_ref().ok_or("추론 수준을 선택해주세요.")?;
+                    if !self.models.contains(model) || (!effort.is_empty() && !self.model_profiles.iter().find(|p| &p.id == model).is_some_and(|p| p.efforts.iter().any(|e| &e.value == effort))) {
+                        return Err("선택한 모델이나 추론 수준을 지원하지 않습니다.".into());
+                    }
+                }
+                if !["queue_send", "queue_remove", "queue_update"].contains(&operation.as_str()) {
+                    return Err("지원하지 않는 대기열 동작입니다.".into());
+                }
+            }
             Command::Send(text) => {
                 if text.trim().is_empty() {
                     return Err("메시지를 입력해주세요.".into());
@@ -355,6 +453,21 @@ impl App {
     /// message sent while the user is typing here leaves their draft alone.
     pub fn remote_command(&mut self, command: Command) -> Option<Intent> {
         match command {
+            Command::Retry => self.retry_failed_turn(),
+            Command::ResumeQueue => self.activate(Action::ResumeQueue),
+            Command::Queue { index, operation, model, effort, .. } => match operation.as_str() {
+                "queue_send" => self.activate(Action::ForceQueued(index)),
+                "queue_remove" => self.activate(Action::RemoveQueued(index)),
+                "queue_update" => {
+                    if let Some(item) = self.queued.get_mut(index) {
+                        if let Some(model) = model { item.model = model; }
+                        item.effort = effort.filter(|e| !e.is_empty());
+                        self.notify("대기 메시지의 옵션을 변경했습니다.");
+                    }
+                    None
+                }
+                _ => None,
+            },
             Command::Send(text) => {
                 let draft = std::mem::take(&mut self.editor);
                 let confirmed = std::mem::replace(&mut self.paste_confirmed, true);

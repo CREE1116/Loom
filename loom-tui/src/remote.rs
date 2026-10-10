@@ -35,6 +35,9 @@ const ACTION_TIMEOUT: Duration = Duration::from_secs(5);
 pub enum Command {
     Send(String),
     Interrupt,
+    Retry,
+    ResumeQueue,
+    Queue { index: usize, revision: String, operation: String, model: Option<String>, effort: Option<String> },
     Reply {
         id: String,
         choice: String,
@@ -62,6 +65,13 @@ impl Command {
         Some(match value["action"].as_str()? {
             "send" => Self::Send(text("text")?),
             "interrupt" => Self::Interrupt,
+            "retry" => Self::Retry,
+            "queue_resume" => Self::ResumeQueue,
+            operation @ ("queue_send" | "queue_remove" | "queue_update") => Self::Queue {
+                index: usize::try_from(value["index"].as_u64()?).ok()?,
+                revision: text("revision")?, operation: operation.into(),
+                model: text("model"), effort: value["effort"].as_str().map(str::to_owned),
+            },
             "reply" => Self::Reply {
                 id: text("id")?,
                 choice: text("choice")?,

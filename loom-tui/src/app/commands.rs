@@ -14,6 +14,7 @@ impl App {
             return Some(None);
         }
         let intent = match name {
+            "/retry" => return Some(self.retry_failed_turn()),
             "/goal" => {
                 let action = match arg {
                     "" => GoalAction::Show,

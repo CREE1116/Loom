@@ -1266,3 +1266,26 @@ fn a_folder_that_is_not_a_repository_is_initialized_and_answered() {
     assert!(events.lock().unwrap().iter().any(|e| e["initialized"] == true));
     assert!(!matches!(task.status, Status::Unresolved), "{}", task.summary);
 }
+
+#[test]
+fn standalone_python_gets_independent_syntax_validation() {
+    for (target, content, expected) in [
+        ("example.py", "print('ok')\n", Status::AwaitingApproval),
+        ("example.py", "def broken(\n", Status::Unresolved),
+        ("odd ' $() % name.py", "print('ok')\n", Status::AwaitingApproval),
+    ] {
+        let d = repo();
+        fs::remove_file(d.path().join("Cargo.toml")).unwrap();
+        let mut core = Core::open(d.path()).unwrap();
+        let model = ScriptedModel::new([response(vec![
+            ("change", json!({"op":"create","target":target,"content":content})),
+            ("finish", json!({"summary":"created example"})),
+        ])]);
+        let task = core.execute("create a Python example", Intent::Edit,
+            Options { checks:vec![], ..options() }, &model, cancel(), &|_| {}).unwrap();
+        assert_eq!(task.status, expected, "{}", task.summary);
+        assert_eq!(task.checks.len(), 1);
+        assert_eq!(task.validation.len(), 1);
+        assert!(!d.path().join(target).exists(), "validation must keep the proposal isolated");
+    }
+}

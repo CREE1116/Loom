@@ -68,6 +68,22 @@ Inside Loom:
 Type a request. Loom reads the code, makes changes in its isolated copy, runs checks,
 and shows the diff; nothing touches your working tree until you approve.
 
+## Command environment
+
+Task commands write inside the isolated workspace by default, with network access
+turned off. Start tasks that need package downloads with:
+
+```sh
+loom --native-network --cwd /path/to/project
+```
+
+Restricted commands use a writable temporary `uv` cache unless a cache location is
+explicitly supplied. With network access disabled, `UV_OFFLINE=1` avoids repeated
+network resolution attempts. Global Python packages and a `uv` virtual environment
+are separate; `uv add --frozen` alone does not prove installation. Standalone Python
+file changes without configured project checks receive an independent syntax check.
+This checks syntax, not successful execution or model accuracy.
+
 ## Local models
 
 - Downloaded GGUF files are converted to **LMX**, Loom's single-file model format, by
@@ -102,10 +118,15 @@ Closing the QR window keeps remote control on; `/remote` opens it again.
 
 The page shows recent conversation entries, grouped tool activity, approvals and
 questions. Send or queue messages, stop work, answer choices or custom questions,
-choose a model and reasoning level, compact, or start a new conversation. Failed
+choose a model and reasoning level, compact, or start a new conversation. Open the
+queue to send an item immediately, edit its model/reasoning options, remove it, or
+resume paused work. Immediate sends wait for interruption acknowledgement; queue
+option edits affect only the selected message. Failed
 sends stay recoverable; they are never retried automatically. Local drafts, images
 and selected skills stay on the computer. The page can be added to a phone's home
-screen; it requires a live connection to Loom.
+screen; it requires a live connection to Loom. Model failures explain how to recover;
+the terminal and phone offer an explicit continuation button that asks the model to
+check existing work before continuing.
 
 Conversation and control APIs require the random token in the QR address. Anyone
 with that address can control the session. Local HTTP is unencrypted: use a trusted

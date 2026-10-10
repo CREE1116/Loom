@@ -393,6 +393,10 @@ impl ObservedPort {
     }
 }
 impl ModelPort for ObservedPort {
+    fn limits(&self) -> Vec<m::ModelLimits> {
+        self.inner.limits()
+    }
+
     fn complete(
         &self,
         need: m::Need,
@@ -778,6 +782,31 @@ pub fn budgets(context_tokens: Option<u64>) -> Budgets {
 #[cfg(test)]
 mod budget_tests {
     use super::*;
+
+    #[test]
+    fn tui_adapter_preserves_model_limits_for_context_fitting() {
+        let root = tempfile::tempdir().unwrap();
+        let model = Arc::new(m::ScriptedModel::with_context("small", 16384, [m::Response {
+            parts:vec![m::Part::Text("hello".into())], usage:m::Usage::default(),
+            stop:m::Stop::EndTurn, model:"small".into(), latency:Duration::ZERO,
+            route:None, gateway_connection:None, gateway_upstream_ms:None,
+        }]));
+        let settings = Settings { model:"small".into(),
+            history:vec![m::Message::user("earlier request"), m::Message {
+                role:m::Role::Assistant, parts:vec![m::Part::Text("older evidence ".repeat(3500))],
+            }], ..Default::default() };
+        let cancel = Arc::new(AtomicBool::new(false));
+        let observe: Observer = Arc::new(|_| {});
+        let port = ObservedPort::new(model.clone(), &settings, cancel.clone(), observe.clone());
+        assert_eq!(port.limits()[0].context, Some(16384));
+        execute(Version::Loom, root.path(), "say hello", Intent::Answer,
+            settings, model.clone(), cancel, observe).unwrap();
+        let requests = model.requests();
+        assert_eq!(requests.len(), 1);
+        assert!(m::router::estimate_tokens(&requests[0]) <= 16384 * 9 / 10);
+        assert!(requests[0].system.as_deref().unwrap().contains("network=disabled"));
+        assert!(requests[0].messages.iter().any(|message| message.text() == "say hello"));
+    }
 
     #[test]
     fn small_windows_shrink_budgets_and_large_ones_keep_defaults() {

@@ -296,6 +296,20 @@ impl Core {
                 &touched,
             );
             if task.checks.is_empty()
+                && task.patch.files.iter().all(|f| f.path.extension().and_then(|e| e.to_str()) == Some("py"))
+            {
+                if let Some(paths) = task.patch.files.iter()
+                    .map(|f| f.path.to_str().map(str::to_owned)).collect::<Option<Vec<_>>>()
+                {
+                    // Encode filenames so shell metacharacters cannot become commands.
+                    // AST parsing checks syntax without running the example or writing pyc files.
+                    let encoded: String = serde_json::to_vec(&paths)?.iter()
+                        .map(|byte| format!("{byte:02x}")).collect();
+                    let python = if cfg!(windows) { "python" } else { "python3" };
+                    task.checks = vec![format!("{python} -c \"import ast,json,pathlib;[ast.parse(pathlib.Path(p).read_bytes(),filename=p) for p in json.loads(bytes.fromhex('{encoded}'))]\"")];
+                }
+            }
+            if task.checks.is_empty()
                 && task.patch.files.iter().all(|f| {
                     matches!(
                         f.path.extension().and_then(|e| e.to_str()),

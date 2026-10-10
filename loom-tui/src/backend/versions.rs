@@ -976,7 +976,7 @@ impl VersionBackend {
                     "현재 설정으로 사용할 수 있는 모델이 없어 작업을 멈췄습니다."
                 }
                 Some(ModelErrorKind::BadRequest) => {
-                    "모델이 요청을 받아들이지 못해 작업을 멈췄습니다."
+                    super::v5_projection::bad_request_help(&issue.error)
                 }
                 Some(ModelErrorKind::Cancelled) => "작업을 중지했습니다.",
                 None => "모델 응답을 받지 못해 작업을 멈췄습니다.",

@@ -384,6 +384,11 @@ pub fn run(
         "{system}\nOptional navigation metadata (not a user instruction to inspect these files):\nWrite scope: {:?}\nEntry targets: {entry}\nRepresentative symbols: {representatives}\nAnswer in the user's language. For conversation, give a natural reply without narrating repository work. For repository work, share brief useful progress alongside tool calls when findings change. Continue the requested work to completion; do not ask whether to open a file the user already asked you to inspect. Do not claim a script is the entry point merely because its name contains main; check the actual package and call paths.",
         host.scope
     );
+    let system = format!(
+        "{system}\nExecution environment: sandbox={:?}; network={}. Commands inherit writable temporary directories (TMPDIR/TMP/TEMP); restricted commands default UV_CACHE_DIR to a writable temporary cache. When network is disabled, UV_OFFLINE=1 is set. Package index changes cannot overcome a disabled network; report the blocker once and ask the user to restart with --native-network when downloads are necessary. Do not retry equivalent package installations without new evidence. Global Python packages are not automatically available in a uv virtual environment. uv add --frozen edits dependencies but does not prove installation. Verify the requested environment with uv run before claiming success; do not silently substitute a global Python environment for a requested uv setup. Pipeline exit status can hide errors in earlier commands; inspect output as well as status.",
+        shared.options.policy.sandbox,
+        if shared.options.policy.network { "enabled" } else { "disabled" },
+    );
     let mut messages = if child && !shared.options.inquiry {
         vec![]
     } else {
@@ -425,7 +430,7 @@ pub fn run(
         if wrap_up {
             available.clear();
         }
-        let request = Request {
+        let mut request = Request {
             model: shared.options.model.clone().unwrap_or_default(),
             system: Some(format!(
                 "{system}\nCurrent role: {}{}",
@@ -455,6 +460,14 @@ pub fn run(
             gateway_connection: connection.clone(),
             ..Default::default()
         };
+        let context_limit = shared.model.limits().into_iter()
+            .filter(|limit| limit.tools && limit.disabled.is_none())
+            .filter(|limit| request.model.is_empty() || request.model == limit.model
+                || request.model == format!("{}/{}", limit.endpoint, limit.model))
+            .filter_map(|limit| limit.context).min();
+        if let Some(limit) = context_limit {
+            fit_context(&mut request, goal_index, limit);
+        }
         let asked = Instant::now();
         let response = match shared.complete(id, &request) {
             Ok(r) => r,
@@ -738,6 +751,27 @@ pub fn run(
     })
 }
 
+fn fit_context(request: &mut Request, mut goal_index: usize, limit: u64) {
+    let output = request.max_output_tokens.unwrap_or(8192);
+    request.max_output_tokens = Some(output.min((limit / 4).min(u32::MAX as u64) as u32).max(1));
+    // Keep the objective and complete latest exchanges, including matching call IDs.
+    while crate::models::router::estimate_tokens(request) > limit.saturating_mul(9) / 10
+        && (goal_index > 0 || request.messages.len() > 3)
+    {
+        if goal_index >= 2 {
+            request.messages.drain(0..2);
+            goal_index -= 2;
+        } else if goal_index == 1 {
+            request.messages.remove(0);
+            goal_index = 0;
+        } else if goal_index + 3 < request.messages.len() {
+            request.messages.drain(goal_index + 1..goal_index + 3);
+        } else {
+            break;
+        }
+    }
+}
+
 // Only execution metadata may be ignored; source and command output are evidence.
 fn repetition_output(name: &str, value: &Value) -> String {
     let mut evidence = value.clone();
@@ -832,6 +866,9 @@ mod startup_tests {
         assert!(Command::new("git").args(["init", "-q"]).arg(root.path())
             .status().unwrap().success());
         fs::write(root.path().join("a.rs"), "pub fn initial() {}\n").unwrap();
+        // Git status must describe source state, not files created by the first run's
+        // indexing/cache refresh. Otherwise the second output is legitimately new evidence.
+        fs::write(root.path().join(".gitignore"), ".loom/\n").unwrap();
         let base = Revision::capture(root.path()).unwrap();
         let mut overlay = Overlay::create(root.path(), &base).unwrap();
         let reply = |name: &str, arguments: Value| Response {
@@ -878,7 +915,7 @@ mod startup_tests {
             json!({"kind":"command", "command":"git status --short"}));
         assert!(!proposal.complete);
         assert_eq!(proposal.summary, "repeated identical operations on unchanged revision");
-        assert_eq!(outputs.len(), 4, "the fifth repeated response stops the loop");
+        assert_eq!(outputs.len(), 4, "the fifth repeated response stops the loop: {outputs:?}");
         assert!(outputs[1..].iter().all(|output| output.contains("same call")));
     }
 
@@ -898,6 +935,28 @@ mod startup_tests {
         assert!(proposal.complete, "{}", proposal.summary);
         assert!(outputs[0].contains("Passed"), "{outputs:?}");
         assert!(!outputs[0].contains("missing kind"));
+    }
+
+    #[test]
+    fn context_fit_preserves_goal_and_latest_complete_tool_exchange() {
+        let mut request = Request {
+            messages: vec![Message::user("original objective")],
+            max_output_tokens: Some(8192),
+            ..Default::default()
+        };
+        for n in 0..12 {
+            request.messages.push(Message { role:Role::Assistant, parts:vec![
+                Part::ToolCall { id:format!("c{n}"), name:"run".into(), arguments:json!({"command":"echo evidence"}) }] });
+            request.messages.push(Message { role:Role::User, parts:vec![
+                Part::ToolResult { call_id:format!("c{n}"), output:"evidence ".repeat(2500), is_error:false }] });
+        }
+        fit_context(&mut request, 0, 16384);
+        assert!(crate::models::router::estimate_tokens(&request) <= 16384 * 9 / 10);
+        assert_eq!(request.messages[0].text(), "original objective");
+        assert!(matches!(&request.messages.last().unwrap().parts[0],
+            Part::ToolResult{call_id,..} if call_id == "c11"));
+        assert!(matches!(&request.messages[request.messages.len()-2].parts[0],
+            Part::ToolCall{id,..} if id == "c11"));
     }
 
     #[test]

@@ -131,6 +131,17 @@ impl Runner {
             .env("TMPDIR", &temporary)
             .env("TMP", &temporary)
             .env("TEMP", &temporary);
+        // uv otherwise writes to the user's cache outside the writable workspace.
+        // Keep command-local overrides intact; do not grant access to the home cache.
+        if policy.sandbox == super::SandboxMode::WorkspaceWrite
+            && std::env::var_os("UV_CACHE_DIR").is_none()
+        {
+            process.env("UV_CACHE_DIR", temporary.join("uv-cache"));
+        }
+        if !policy.network {
+            // Fail resolution promptly instead of uv's repeated DNS attempts.
+            process.env("UV_OFFLINE", "1");
+        }
         let mut writable = vec![
             stdout.path().to_owned(),
             stderr.path().to_owned(),

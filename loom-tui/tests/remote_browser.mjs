@@ -465,3 +465,29 @@ test('bounded action and poll timeouts recover without automatic POST retry', { 
   await f.page.reload();
   await f.page.waitForFunction(() => document.querySelector('#status').textContent === 'Ready');
 });
+
+test('phone can recover a failed model request and control queued options', async t => {
+  const f = await fixture(t, { viewport: { width: 390, height: 844 }, isMobile: true, hasTouch: true });
+  f.update({ recovery: true, queued: 1, queue_paused: true, queue_revision: 'revision-a',
+    queue: [{ index: 0, text: 'queued task', model: 'first', model_label: 'First model', effort: 'low' }] });
+  await f.open();
+  await f.page.locator('#text').fill('keep this draft');
+  await f.page.getByRole('button', { name: '이어서 시도', exact: true }).click();
+  await until(() => f.actions.some(a => a.action === 'retry'));
+  assert.equal(await f.page.locator('#text').inputValue(), 'keep this draft');
+  await f.page.getByRole('button', { name: '대기열 1개', exact: true }).click();
+  await f.page.getByRole('button', { name: '옵션 변경', exact: true }).click();
+  await f.page.locator('#queue-model').selectOption('second');
+  await f.page.getByRole('button', { name: '옵션 저장', exact: true }).click();
+  await until(() => f.actions.some(a => a.action === 'queue_update'));
+  const edit = f.actions.find(a => a.action === 'queue_update');
+  assert.equal(edit.model, 'second');
+  assert.equal(edit.effort, '');
+  assert.equal(edit.revision, 'revision-a');
+  await f.page.getByRole('button', { name: '대기열 1개', exact: true }).click();
+  await f.page.getByRole('button', { name: '즉시 보내기', exact: true }).click();
+  await until(() => f.actions.some(a => a.action === 'queue_send'));
+  assert.equal(f.actions.find(a => a.action === 'queue_send').index, 0);
+  assert.equal(await f.page.locator('#text').inputValue(), 'keep this draft');
+  assert.equal(await f.page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true);
+});

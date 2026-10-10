@@ -2613,6 +2613,24 @@ fn remote_control(report: &mut Report) {
     report.check(S, "브라우저용 상태에 대화와 상태 포함", snapshot["entries"].is_array() && snapshot["status"].is_string(), &snapshot.to_string());
     report.check(S, "원격 질문에 요청 식별자와 비밀 입력 표시",
         snapshot["questions"][0]["id"] == "remote-question" && snapshot["questions"][0]["questions"][0]["secret"] == true, &snapshot.to_string());
+    let mut recovery = app_with([]);
+    recovery.apply_event(AgentEvent::scoped("main", AgentUpdate::TurnCompleted {
+        id: None, status: "failed".into(), error: Some("request failed".into()),
+    }));
+    let canvas = recovery.render(80, 24);
+    report.check(S, "실패 후 이어서 시도 버튼", canvas.hits.iter().any(|h| h.action == Action::Command("/retry".into())), screen_text(&canvas));
+    report.dump(S, &canvas);
+    let narrow = recovery.render(40, 20);
+    report.check(S, "좁은 터미널에서도 이어서 시도 가능", narrow.hits.iter().any(|h| h.action == Action::Command("/retry".into())), screen_text(&narrow));
+    report.dump(S, &narrow);
+    report.check(S, "모바일에도 복구 상태 제공", recovery.remote_snapshot()["recovery"] == true, "");
+    let mut queued = app_with([]);
+    queued.busy = true;
+    queued.remote_command(crate::remote::Command::Send("queued from phone".into()));
+    report.check(S, "모바일 대기 메시지와 옵션 제공", queued.remote_snapshot()["queue"][0]["text"] == "queued from phone" && queued.remote_snapshot()["queue_revision"].is_string(), queued.remote_snapshot().to_string());
+    let reason = crate::backend::v5_projection::failure_summary("BadRequest: context window exceeded").unwrap();
+    report.check(S, "문맥 초과는 이유와 복구 방법 안내", reason.contains("문맥") && reason.contains("압축"), reason);
+
 }
 
 fn settings_categories(report: &mut Report) {

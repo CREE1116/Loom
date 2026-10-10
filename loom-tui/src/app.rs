@@ -593,6 +593,7 @@ pub struct App {
     preloaded_model: String,
     pub goal: Option<crate::agent::GoalState>,
     pub compacting: bool,
+    pub recovery_available: bool,
     pub thread: Option<String>,
     pub turn: Option<String>,
     pub model: String,
@@ -759,6 +760,7 @@ impl App {
             preloaded_model: String::new(),
             goal: None,
             compacting: false,
+            recovery_available: false,
             thread: None,
             turn: None,
             model: String::new(),
@@ -1881,6 +1883,7 @@ impl App {
         (!sections.is_empty()).then(|| sections.join("\n\n"))
     }
     fn begin_submission(&mut self, item: QueuedMessage) -> Intent {
+        self.recovery_available = false;
         self.submitted = Some(item.text.clone());
         self.submitted_skills = item.skills;
         self.submitted_images = item.images;
@@ -3817,6 +3820,10 @@ impl App {
                 Action::Interrupt,
                 false,
             );
+        }
+        if self.recovery_available && !self.is_working() && !self.readonly {
+            let (space, label) = if width < 65 { (14, "재시도") } else { (28, "이어서 시도") };
+            c.button(width.saturating_sub(space), composer_top, label, Action::Command("/retry".into()), false);
         }
         let mut chip_x = 2;
         for skill in &self.selected_skills {

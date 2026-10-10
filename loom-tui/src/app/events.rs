@@ -313,6 +313,7 @@ impl App {
                     self.finished_turns.insert(id.into());
                 }
                 self.busy = false;
+                self.recovery_available = status == "failed";
                 self.interrupt_requested = false;
                 self.turn = None;
                 self.active_images.clear();
@@ -597,6 +598,7 @@ impl App {
     }
 
     fn reset_session_view(&mut self) {
+        self.recovery_available = false;
         let model_engine = self.model_engine.clone();
         let model_memory_dirty = self.model_memory_dirty;
         let model_default_allowed = self.model_default_allowed;

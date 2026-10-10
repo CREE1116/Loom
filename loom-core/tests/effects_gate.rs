@@ -710,3 +710,27 @@ fn abandoned_overlays_of_other_revisions_are_swept_but_leased_ones_are_kept() {
     drop(overlay);
     drop(lease);
 }
+
+#[cfg(unix)]
+#[test]
+fn restricted_commands_get_a_writable_uv_cache_and_offline_policy() {
+    let directory = repository();
+    let base = Revision::capture(directory.path()).unwrap();
+    let overlay = Overlay::create(directory.path(), &base).unwrap();
+    let runner = Runner::new(overlay.artifacts().clone());
+    let result = runner.run_with_policy(overlay.dir(),
+        "test -n \"$UV_CACHE_DIR\" && test \"$UV_OFFLINE\" = 1 && mkdir -p \"$UV_CACHE_DIR\" && touch \"$UV_CACHE_DIR/probe\"",
+        Duration::from_secs(5), &AtomicBool::new(false), None,
+        loom_core::effects::ExecutionPolicy::default()).unwrap();
+    assert_eq!(result.status, RunStatus::Passed);
+    assert!(overlay.dir().join(".loom/tmp/uv-cache/probe").is_file());
+    if std::process::Command::new("uv").arg("--version").output().is_ok() {
+        let result = runner.run_with_policy(overlay.dir(),
+            "uv init --bare --vcs none --no-python-downloads --no-workspace ml-demo",
+            Duration::from_secs(10), &AtomicBool::new(false), None,
+            loom_core::effects::ExecutionPolicy::default()).unwrap();
+        let output = runner.artifacts().get(&result.artifact, None).unwrap();
+        assert_eq!(result.status, RunStatus::Passed, "{}", String::from_utf8_lossy(&output));
+        assert!(overlay.dir().join("ml-demo/pyproject.toml").is_file());
+    }
+}

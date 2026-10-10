@@ -18,8 +18,19 @@ fn friendly_model_issue(reason: &str) -> &'static str {
         Some(("RateLimited", _)) => "모델 서버의 요청 제한에 걸렸습니다.",
         Some(("Auth", _)) => "모델 인증을 확인하지 못했습니다.",
         Some(("Quota", _)) => "사용 가능한 모델 한도를 초과했습니다.",
-        Some(("BadRequest", _)) => "모델이 요청을 받아들이지 못했습니다.",
+        Some(("BadRequest", detail)) => bad_request_help(detail),
         _ => "모델 응답을 받지 못했습니다.",
+    }
+}
+
+pub(super) fn bad_request_help(detail: &str) -> &'static str {
+    let detail = detail.to_ascii_lowercase();
+    if ["context", "too many tokens", "prompt is too long", "maximum tokens"].iter().any(|s| detail.contains(s)) {
+        "대화가 모델의 문맥 한도를 넘었습니다. 대화를 압축하거나 더 큰 문맥을 지원하는 모델로 바꾼 뒤 ‘이어서 시도’를 누르세요."
+    } else if ["tool", "function calling"].iter().any(|s| detail.contains(s)) {
+        "모델이 도구 요청 형식을 처리하지 못했습니다. 도구를 지원하는 모델로 바꾼 뒤 ‘이어서 시도’를 누르세요."
+    } else {
+        "모델이 요청 형식을 받아들이지 못했습니다. 모델 설정을 확인하거나 다른 모델로 바꾼 뒤 ‘이어서 시도’를 누르세요. 자세한 원인은 작업 기록에 남아 있습니다."
     }
 }
 
@@ -44,10 +55,10 @@ pub fn failure_summary(summary: &str) -> Option<&'static str> {
                 },
             )
         }
-        Some(("Auth", _)) => Some("모델 연결의 인증을 확인하지 못해 멈췄습니다."),
-        Some(("RateLimited", _)) => Some("모델 서버의 요청 제한으로 응답을 받지 못했습니다."),
-        Some(("Quota", _)) => Some("모델 사용 한도로 응답을 받지 못했습니다."),
-        Some(("BadRequest", _)) => Some("모델이 요청을 받아들이지 못했습니다."),
+        Some(("Auth", _)) => Some("모델 인증을 확인하지 못했습니다. 공급자 연결에서 인증을 갱신한 뒤 ‘이어서 시도’를 누르세요."),
+        Some(("RateLimited", _)) => Some("모델 서버의 요청 제한에 걸렸습니다. 잠시 기다리거나 모델을 바꾼 뒤 ‘이어서 시도’를 누르세요."),
+        Some(("Quota", _)) => Some("모델 사용 한도로 응답을 받지 못했습니다. 사용량을 확인하거나 사용 가능한 모델로 바꾼 뒤 ‘이어서 시도’를 누르세요."),
+        Some(("BadRequest", detail)) => Some(bad_request_help(detail)),
         _ if summary == "cancelled or deadline reached" => {
             Some("작업 시간 한도에 도달해 멈췄습니다. /settings에서 한도를 바꿀 수 있습니다.")
         }
