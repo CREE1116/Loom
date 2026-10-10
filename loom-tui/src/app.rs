@@ -20,6 +20,7 @@ mod navigation;
 mod progress;
 pub mod providers;
 mod questions;
+pub mod remote_control;
 mod settings;
 #[cfg(test)]
 mod test_protocol;
@@ -490,6 +491,7 @@ const COMMANDS: &[(&str, &str)] = &[
     ("/clear", "기록을 보존하고 새 대화로 초기화"),
     ("/compression", "현재 대화의 실제 컨텍스트 압축"),
     ("/compact", "/compression과 동일: 컨텍스트 압축"),
+    ("/remote", "폰·브라우저에서 원격 조작: /remote [off]"),
     ("/stop", "현재 응답 중단 (/cancel도 가능)"),
     ("/status", "현재 실행·목표·대기열·작업 상태"),
     ("/doctor", "환경·도구체인·로컬모델 진단: /doctor"),
@@ -576,12 +578,16 @@ pub enum Intent {
     PreviewRewind(String),
     SaveSettings,
     ExportDiagnostics,
+    /// Turn remote control on (true) or off.
+    Remote(bool),
     UpdatePermission(String, String),
     TrustWorkspace(bool),
     RefreshUsage,
 }
 
 pub struct App {
+    /// Remote control address and QR code while it is on.
+    pub remote: Option<remote_control::RemoteView>,
     /// Last model handed to the native engine's background preload.
     preloaded_model: String,
     pub goal: Option<crate::agent::GoalState>,
@@ -747,6 +753,7 @@ pub struct App {
 impl App {
     pub fn new(readonly: bool) -> Self {
         Self {
+            remote: None,
             preloaded_model: String::new(),
             goal: None,
             compacting: false,
@@ -2728,6 +2735,12 @@ impl App {
         if ctrl_char(key, 'q') {
             return Some(Intent::Quit);
         }
+        if key.code == KeyCode::Esc
+            && let Some(view) = self.remote.as_mut().filter(|v| v.shown)
+        {
+            view.shown = false;
+            return None;
+        }
         // Escape takes priority over menus, selections and blocking UI while
         // a turn is active. Submit can precede assignment of the turn ID. On another
         // screen (models, settings, ...) Escape first returns to the conversation.
@@ -3883,6 +3896,7 @@ impl App {
             c.highlight(action, Tone::Selected);
         }
         self.paint_mouse_selection(&mut c);
+        self.paint_remote(&mut c);
         c
     }
     fn approval_visible(&self) -> bool {

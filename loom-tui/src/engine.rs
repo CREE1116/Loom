@@ -122,6 +122,9 @@ pub enum Tone {
     Number,
     Comment,
     Function,
+    /// QR code modules: fixed black and white whatever the terminal theme.
+    QrLight,
+    QrDark,
 }
 impl Tone {
     pub fn color(self, accent: Accent) -> Color {
@@ -176,6 +179,8 @@ impl Tone {
             Self::Number => Color::Magenta,
             Self::Comment => Color::DarkGrey,
             Self::Function => Color::Yellow,
+            Self::QrLight => Color::Rgb { r: 255, g: 255, b: 255 },
+            Self::QrDark => Color::Rgb { r: 0, g: 0, b: 0 },
         }
     }
 }
@@ -191,11 +196,15 @@ pub enum Background {
     Removed,
     Selected,
     Hover,
+    QrLight,
+    QrDark,
 }
 impl Background {
     fn color(self) -> Color {
         match self {
             Self::Default => Color::Reset,
+            Self::QrLight => Color::Rgb { r: 255, g: 255, b: 255 },
+            Self::QrDark => Color::Rgb { r: 0, g: 0, b: 0 },
             Self::ResponseA => Color::Rgb {
                 r: 18,
                 g: 24,
@@ -436,6 +445,28 @@ impl Canvas {
                 hit.x += x;
                 hit.y += y;
                 self.hits.push(hit);
+            }
+        }
+    }
+    /// Paints a QR code (`dark[y][x]`), two modules per cell with upper-half blocks, in
+    /// fixed black and white so phones read it on light and dark terminals alike.
+    pub fn qr(&mut self, x: u16, y: u16, dark: &[Vec<bool>]) {
+        for (row, pair) in dark.chunks(2).enumerate() {
+            let cy = y + row as u16;
+            if cy >= self.height {
+                break;
+            }
+            for (col, &top) in pair[0].iter().enumerate() {
+                let cx = x + col as u16;
+                if cx >= self.width {
+                    break;
+                }
+                let bottom = pair.get(1).is_some_and(|r| r[col]);
+                let cell = &mut self.cells[usize::from(cy) * usize::from(self.width) + usize::from(cx)];
+                cell.text = "▀".into();
+                cell.continuation = false;
+                cell.tone = if top { Tone::QrDark } else { Tone::QrLight };
+                cell.background = if bottom { Background::QrDark } else { Background::QrLight };
             }
         }
     }

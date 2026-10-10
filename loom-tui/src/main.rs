@@ -468,6 +468,8 @@ fn main() -> Result<()> {
     let mut last_poll = Instant::now();
     let mut build = BuildWatch::start();
     let mut last_paint = Instant::now() - Duration::from_millis(33);
+    let mut remote: Option<loom_tui::remote::Remote> = None;
+    let mut last_publish = Instant::now();
     loop {
         // A closed terminal window (SIGHUP) or a kill request ends the loop like Quit,
         // so Native workers are stopped below.
@@ -556,6 +558,20 @@ fn main() -> Result<()> {
         if let Some(intent) = app.next_queued() {
             send_intent(&mut app, backend.as_mut(), &intent);
             dirty = true;
+        }
+        if let Some(server) = &remote {
+            for command in server.take_commands() {
+                if let Some(intent) = app.remote_command(command) {
+                    send_intent(&mut app, backend.as_mut(), &intent);
+                }
+                dirty = true;
+            }
+            // Browsers wait on a long poll; publishing an unchanged state wakes none.
+            if last_publish.elapsed() >= Duration::from_millis(250) {
+                server.publish(&app.remote_snapshot());
+                dirty |= app.remote_clients(server.clients());
+                last_publish = Instant::now();
+            }
         }
         if !initial_model_recorded && app.thread.is_some() {
             app.remember_model_choice();
@@ -742,6 +758,22 @@ fn main() -> Result<()> {
                         {
                             app.error(format!("작업 폴더 저장 실패: {error}"));
                         }
+                    }
+                }
+                Intent::Remote(on) => {
+                    if *on {
+                        match loom_tui::remote::Remote::start(None) {
+                            Ok(server) => {
+                                let url = server.url().to_owned();
+                                app.remote_started(url.clone(), loom_tui::remote::qr_modules(&url));
+                                server.publish(&app.remote_snapshot());
+                                remote = Some(server);
+                            }
+                            Err(error) => app.error(format!("원격 조작을 켜지 못했습니다: {error}")),
+                        }
+                    } else {
+                        remote = None;
+                        app.remote_stopped();
                     }
                 }
                 Intent::ExportDiagnostics => {

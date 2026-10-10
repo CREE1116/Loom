@@ -39,7 +39,8 @@ setting). Answer from facts you checked, not from memory of other tools.
 In the app: `/model` (choose model), `/runtime` (download, convert to LMX, remove local
 models, inference device), `/skills`, `/provider`, `/routing`, `/doctor` (environment and
 local model checks), `/settings`, `/status`, `/cost`, `/context`, `/work`, `/diff`,
-`/approvals`, `/compact`, `/new`, `/resume`, `/help`. Earlier turns are summarized
+`/approvals`, `/compact`, `/remote` (web remote control: QR code for a phone on the
+same network; `/remote off`), `/new`, `/resume`, `/help`. Earlier turns are summarized
 automatically before a request once they no longer fit the model's context
 ("컨텍스트 압축 중" shows meanwhile); `/compact` does it on demand.
 

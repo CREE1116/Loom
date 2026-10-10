@@ -92,6 +92,14 @@ loom model inspect lmx/<id> --verify
 loom model bench <id> --prompt 512 --gen 64
 ```
 
+## Remote control
+
+Type `/remote` to open a small web server and show its address as a QR code; scan it
+with a phone on the same network to read the conversation, send messages, stop a task
+and answer approvals from the browser. `/remote off` stops it. Each session gets a new
+random token in the address and nothing is reachable without it, but traffic is plain
+HTTP: use it on networks you trust (or over a VPN such as Tailscale).
+
 ## Long conversations
 
 When earlier turns no longer fit the model's context (local models report theirs), Loom

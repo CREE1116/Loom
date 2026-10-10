@@ -1,0 +1,176 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="referrer" content="no-referrer">
+<title>Loom Remote</title>
+<style>
+  :root {
+    --bg: #ffffff; --fg: #1d1f23; --muted: #6b7280; --line: #e5e7eb; --card: #f6f7f9;
+    --accent: #3b82f6; --user: #eef4ff; --ok: #16a34a; --bad: #dc2626; --warn: #d97706;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #111316; --fg: #e6e7ea; --muted: #9aa0a8; --line: #2a2e35; --card: #1a1d22;
+      --accent: #60a5fa; --user: #1b2433; --ok: #4ade80; --bad: #f87171; --warn: #fbbf24;
+    }
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--fg);
+    font: 15px/1.5 -apple-system, BlinkMacSystemFont, "Apple SD Gothic Neo", "Segoe UI", sans-serif; }
+  body { display: flex; flex-direction: column; }
+  header { position: sticky; top: 0; z-index: 1; display: flex; align-items: center; gap: 8px;
+    padding: 10px 16px; border-bottom: 1px solid var(--line); background: var(--bg); }
+  header .title { font-weight: 600; flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  header .status { color: var(--muted); font-size: 13px; white-space: nowrap; }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); flex: none; }
+  .dot.busy { background: var(--accent); animation: pulse 1.2s infinite; }
+  .dot.off { background: var(--bad); }
+  @keyframes pulse { 50% { opacity: .35; } }
+  main { flex: 1; overflow-y: auto; padding: 12px 16px 24px; }
+  .entry { margin: 10px 0; }
+  .user { background: var(--user); border-radius: 12px; padding: 8px 12px; white-space: pre-wrap; word-break: break-word; }
+  .assistant { white-space: pre-wrap; word-break: break-word; }
+  .tool { color: var(--muted); font-size: 13px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .tool.failed { color: var(--bad); }
+  .system { color: var(--muted); font-size: 13px; white-space: pre-wrap; }
+  .approval { border: 1px solid var(--warn); border-radius: 12px; padding: 12px; margin: 12px 0; background: var(--card); }
+  .approval h3 { margin: 0 0 6px; font-size: 15px; }
+  .approval pre { max-height: 40vh; overflow: auto; font-size: 12px; background: var(--bg); padding: 8px; border-radius: 8px; }
+  .choices { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px; }
+  button { font: inherit; border: 1px solid var(--line); background: var(--card); color: var(--fg);
+    border-radius: 10px; padding: 8px 14px; min-height: 40px; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  button.stop { border-color: var(--bad); color: var(--bad); }
+  button:disabled { opacity: .5; }
+  footer { border-top: 1px solid var(--line); padding: 10px 12px calc(10px + env(safe-area-inset-bottom)); background: var(--bg); }
+  form { display: flex; gap: 8px; align-items: flex-end; }
+  textarea { flex: 1; min-width: 0; resize: none; font: inherit; color: var(--fg); background: var(--card);
+    border: 1px solid var(--line); border-radius: 10px; padding: 8px 10px; max-height: 40vh; }
+  .note { color: var(--muted); font-size: 12px; margin-top: 6px; }
+  .empty { color: var(--muted); text-align: center; margin-top: 30vh; }
+</style>
+</head>
+<body>
+<header>
+  <span class="dot" id="dot"></span>
+  <span class="title" id="title">Loom</span>
+  <span class="status" id="status">연결 중…</span>
+  <button class="stop" id="stop" hidden>중지</button>
+</header>
+<main id="log"><p class="empty">대화를 불러오는 중…</p></main>
+<footer>
+  <form id="form">
+    <textarea id="text" rows="1" placeholder="메시지 입력…" enterkeyhint="send"></textarea>
+    <button class="primary" type="submit">보내기</button>
+  </form>
+  <div class="note" id="note">같은 네트워크에서 접속 중 · 이 주소를 아는 사람은 이 Loom을 조작할 수 있습니다.</div>
+</footer>
+<script>
+(() => {
+  // Keep the token out of the address bar and history once read; a reload finds it in
+  // this tab's session storage.
+  let token = new URLSearchParams(location.search).get("t") || "";
+  try {
+    if (token) sessionStorage.setItem("loom-token", token);
+    else token = sessionStorage.getItem("loom-token") || "";
+  } catch (_) {}
+  history.replaceState(null, "", "/");
+  const $ = (id) => document.getElementById(id);
+  const log = $("log"), text = $("text");
+  let version = 0, last = null, follow = true;
+
+  const api = (path, body) => fetch(path, {
+    method: body ? "POST" : "GET",
+    headers: Object.assign({ Authorization: "Bearer " + token }, body ? { "Content-Type": "application/json" } : {}),
+    body: body ? JSON.stringify(body) : undefined,
+    cache: "no-store",
+  });
+
+  log.addEventListener("scroll", () => {
+    follow = log.scrollTop + log.clientHeight >= log.scrollHeight - 40;
+  });
+
+  function el(tag, cls, content) {
+    const node = document.createElement(tag);
+    if (cls) node.className = cls;
+    if (content !== undefined) node.textContent = content;
+    return node;
+  }
+
+  function render(state) {
+    last = state;
+    $("title").textContent = state.title || "Loom";
+    $("status").textContent = [state.status, state.model].filter(Boolean).join(" · ");
+    $("dot").className = "dot" + (state.busy ? " busy" : "");
+    $("stop").hidden = !state.busy;
+    log.replaceChildren();
+    const entries = state.entries || [];
+    if (!entries.length && !(state.approvals || []).length) {
+      log.append(el("p", "empty", "아직 대화가 없습니다. 아래에 메시지를 입력하세요."));
+    }
+    for (const e of entries) {
+      const box = el("div", "entry");
+      if (e.kind === "user") box.append(el("div", "user", e.body));
+      else if (e.kind === "assistant") box.append(el("div", "assistant", e.body || e.title || "…"));
+      else if (e.kind === "tool" || e.kind === "change") {
+        const mark = e.status === "failed" ? "!" : e.status === "inProgress" ? "◌" : "✓";
+        box.append(el("div", "tool" + (e.status === "failed" ? " failed" : ""), mark + " " + (e.title || e.body.split("\n")[0])));
+      } else box.append(el("div", "system", [e.title, e.body].filter(Boolean).join("\n")));
+      log.append(box);
+    }
+    for (const a of state.approvals || []) {
+      const card = el("div", "approval");
+      card.append(el("h3", "", a.title || "승인 요청"));
+      if (a.summary) card.append(el("div", "", a.summary));
+      if (a.detail) card.append(el("pre", "", a.detail));
+      const row = el("div", "choices");
+      a.choices.forEach((c, i) => {
+        const b = el("button", i === 0 ? "primary" : "", c.label);
+        b.disabled = a.answering;
+        b.onclick = () => { b.disabled = true; api("/api/reply", { id: a.id, choice: c.result }); };
+        row.append(b);
+      });
+      card.append(row);
+      log.append(card);
+    }
+    if (follow) log.scrollTop = log.scrollHeight;
+  }
+
+  async function poll() {
+    for (;;) {
+      try {
+        const res = await api("/api/state?since=" + version);
+        if (res.status === 401) { $("status").textContent = "토큰이 맞지 않습니다"; $("dot").className = "dot off"; return; }
+        const data = await res.json();
+        if (data.version !== version) { version = data.version; render(data.state); }
+        $("dot").classList.remove("off");
+      } catch (_) {
+        $("status").textContent = "연결 끊김 · 다시 연결 중…";
+        $("dot").className = "dot off";
+        await new Promise((r) => setTimeout(r, 2000));
+      }
+    }
+  }
+
+  $("form").addEventListener("submit", async (ev) => {
+    ev.preventDefault();
+    const value = text.value.trim();
+    if (!value) return;
+    text.value = "";
+    text.style.height = "";
+    follow = true;
+    await api("/api/send", { text: value });
+  });
+  text.addEventListener("keydown", (ev) => {
+    if (ev.key === "Enter" && !ev.shiftKey && !ev.isComposing) { ev.preventDefault(); $("form").requestSubmit(); }
+  });
+  text.addEventListener("input", () => { text.style.height = ""; text.style.height = text.scrollHeight + "px"; });
+  $("stop").onclick = () => api("/api/interrupt", {});
+  poll();
+})();
+</script>
+</body>
+</html>

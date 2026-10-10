@@ -56,6 +56,32 @@ impl App {
                     Some(Intent::Compact)
                 }
             }
+            "/remote" => match arg {
+                "" | "on" => match self.remote.as_mut() {
+                    // Already on: show the address and QR code again.
+                    Some(view) => {
+                        view.shown = true;
+                        None
+                    }
+                    None if self.readonly => {
+                        self.error("열람 전용 창입니다. 메인 창에서 실행하세요.");
+                        None
+                    }
+                    None => Some(Intent::Remote(true)),
+                },
+                "off" | "stop" => self.remote.is_some().then_some(Intent::Remote(false)),
+                "hide" => {
+                    if let Some(view) = self.remote.as_mut() {
+                        view.shown = false;
+                    }
+                    None
+                }
+                "copy" => self.remote.as_ref().map(|view| Intent::Copy(view.url.clone())),
+                _ => {
+                    self.error("사용법: /remote [off]");
+                    None
+                }
+            },
             "/stop" | "/cancel" => {
                 if arg.is_empty() {
                     self.activate(Action::Interrupt)

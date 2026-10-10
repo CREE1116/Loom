@@ -2553,6 +2553,51 @@ fn auto_compaction_status(report: &mut Report) {
     report.check(S, "압축이 끝나면 압축 표시 해제", !text.contains("압축 중"), &text);
 }
 
+fn remote_control(report: &mut Report) {
+    const S: &str = "remote_control";
+    let url = "http://192.168.0.2:8787/?t=00112233445566778899aabbccddeeff";
+    let mut app = app_with([AgentEvent::scoped("main", AgentUpdate::TurnStarted { id: None })]);
+    app.remote_started(url.into(), crate::remote::qr_modules(url));
+    let canvas = app.render(100, 40);
+    let text = screen_text(&canvas);
+    let qr_cells = canvas.cells.iter().filter(|c| c.tone == Tone::QrDark || c.tone == Tone::QrLight).count();
+    report.check(S, "100x40: QR 코드와 주소 표시", qr_cells > 200 && text.contains("원격 조작") && text.contains("8787"), &text);
+    report.check(
+        S,
+        "QR은 터미널 테마와 무관한 흑백",
+        canvas.cells.iter().any(|c| c.background == crate::engine::Background::QrLight)
+            && canvas.cells.iter().any(|c| c.tone == Tone::QrDark),
+        "",
+    );
+    report.check(
+        S,
+        "닫기 버튼과 주소 복사",
+        canvas.hits.iter().any(|h| h.action == Action::Command("/remote hide".into()))
+            && canvas.hits.iter().any(|h| h.action == Action::Command("/remote copy".into())),
+        "",
+    );
+    report.dump(S, &canvas);
+    let small = screen_text(&app.render(60, 20));
+    report.check(S, "60x20: QR 대신 넓히라는 안내와 주소", small.contains("넓히면") && small.contains("8787"), &small);
+    app.key(crossterm::event::KeyEvent::new(crossterm::event::KeyCode::Esc, KeyModifiers::NONE), &canvas);
+    report.check(S, "Esc로 창만 닫고 원격은 유지", app.remote.as_ref().is_some_and(|v| !v.shown), "");
+    report.check(S, "/remote로 다시 열기", { app.activate(Action::Command("/remote".into())); app.remote.as_ref().is_some_and(|v| v.shown) }, "");
+    report.check(S, "/remote off는 끄기 요청", app.activate(Action::Command("/remote off".into())) == Some(Intent::Remote(false)), "");
+
+    // A message from the browser is sent without touching the draft typed here.
+    let mut app = app_with([]);
+    app.editor.insert("my draft");
+    let intent = app.remote_command(crate::remote::Command::Send("run the tests".into()));
+    report.check(
+        S,
+        "원격 메시지 전송은 입력 중인 초안을 보존",
+        matches!(&intent, Some(Intent::Submit(text)) if text == "run the tests") && app.editor.text == "my draft",
+        format!("{intent:?} draft={:?}", app.editor.text),
+    );
+    let snapshot = app.remote_snapshot();
+    report.check(S, "브라우저용 상태에 대화와 상태 포함", snapshot["entries"].is_array() && snapshot["status"].is_string(), &snapshot.to_string());
+}
+
 fn settings_categories(report: &mut Report) {
     const S: &str = "settings_categories";
     let mut app = App::new(false);
@@ -2921,10 +2966,37 @@ pub fn run() -> Report {
     tool_targets_are_whole(&mut report);
     token_footer(&mut report);
     auto_compaction_status(&mut report);
+    remote_control(&mut report);
     composer_and_navigation(&mut report);
     input_images_and_model_hierarchy(&mut report);
     tour(&mut report);
     report
+}
+
+fn searchable_commands(report: &mut Report) {
+    use crossterm::event::{KeyCode, KeyEvent};
+    const S: &str = "searchable_commands";
+    for width in [48, 100, 180] {
+        let mut app = App::new(false);
+        app.editor.insert("작성 중인 요청");
+        let canvas = app.render(width, 30);
+        app.key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL), &canvas);
+        for character in "컨텍스트".chars() {
+            let canvas = app.render(width, 30);
+            app.key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE), &canvas);
+        }
+        let canvas = app.render(width, 30);
+        let text = screen_text(&canvas);
+        report.check(S, format!("{width}: 설명으로 명령 검색, 초안 보존"),
+            text.contains("/compact") && !text.contains("/quit")
+                && app.editor.text == "작성 중인 요청", &text);
+        report.dump(S, &canvas);
+        app.key(crossterm::event::KeyEvent::new(crossterm::event::KeyCode::Esc, KeyModifiers::NONE), &canvas);
+        let canvas = app.render(width, 30);
+        report.check(S, format!("{width}: 검색 취소 후 초안 복원"),
+            app.editor.text == "작성 중인 요청" && !screen_text(&canvas).contains("/compact"),
+            screen_text(&canvas));
+    }
 }
 
 fn loom_diff_projection(report: &mut Report) {
