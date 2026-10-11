@@ -165,6 +165,37 @@ fn summarize(
     Ok(summary)
 }
 
+fn hook_progress(event: loom_core::agent::events::Event) -> Progress {
+    Progress {operation:"loom".into(),summary:event.target.clone(),detail:serde_json::to_string(&event).unwrap_or_default(),event:None}
+}
+
+/// Conversation summarization uses the same hook protocol as worker compaction.
+fn summarize_with_hooks(
+    root: &std::path::Path, session: &str, mut policy: loom_core::effects::ExecutionPolicy,
+    model: &dyn ModelPort, requested: &str, mut history: Vec<models::Message>,
+    cancel: Option<Arc<AtomicBool>>, trigger: &str, observe: &loom_core::agent::events::Observer<'_>,
+) -> Result<String> {
+    use loom_core::{hooks::{Hooks, HookEvent, Invocation}, base::FileArtifactStore};
+    policy.sandbox = loom_core::effects::SandboxMode::ReadOnly;
+    let hooks = Hooks::open(root)?;
+    let artifacts = FileArtifactStore::open(root)?;
+    let flag = cancel.clone().unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
+    let started = std::time::Instant::now();
+    let fire = |event, summary: Option<&str>| hooks.run(Invocation {
+        event, worker:"main", directory:root,
+        input:serde_json::json!({"session_id":session,"workspace":root,"model":requested,"trigger":trigger,"summary":summary}),
+        policy,cancel:&flag,remaining:std::time::Duration::from_secs(120).saturating_sub(started.elapsed()),observe,
+    },&artifacts);
+    let pre = fire(HookEvent::PreCompact,None)?;
+    if let Some(reason) = pre.halt { anyhow::bail!("{reason}"); }
+    if !pre.context.is_empty() { history.push(models::Message::user(format!("Hook context for compaction:\n{}",pre.context.join("\n").chars().take(16000).collect::<String>()))); }
+    let mut summary = summarize(model,requested,history,cancel)?;
+    let post = fire(HookEvent::PostCompact,Some(&summary))?;
+    if let Some(reason) = post.halt { anyhow::bail!("{reason}"); }
+    if !post.context.is_empty() { summary.push_str(&format!("\nHook context:\n{}",post.context.join("\n").chars().take(16000).collect::<String>())); }
+    Ok(summary)
+}
+
 /// Context window (tokens) of the model a request names, when known.
 fn context_of(model: &dyn ModelPort, requested: &str) -> Option<u64> {
     if requested == "auto" {
@@ -724,6 +755,8 @@ impl VersionBackend {
             s
         });
         self.session = stored.id.clone();
+        self.settings.hook_session_id = Some(self.session.clone());
+        self.settings.hook_session_start = Some(if stored.task_ids.is_empty() {"startup"} else {"resume"}.into());
 
         let session_ids: HashSet<&str> = stored.task_ids.iter().map(String::as_str).collect();
         let session_tasks: Vec<_> = history
@@ -1168,6 +1201,7 @@ impl VersionBackend {
         }));
         let root = self.root.clone();
         let mut settings = self.settings.clone();
+        self.settings.hook_session_start = None;
         settings.readonly |= !self.trusted;
         settings.context_bytes = budgets.worker;
         let requested = settings.model.clone();
@@ -1195,7 +1229,7 @@ impl VersionBackend {
                     let _ = tx.send(Message::Compacting);
                     let mut history = compact.as_deref().map(compacted_history).unwrap_or_default();
                     history.extend(full.iter().cloned());
-                    let result = summarize(model.as_ref(), &requested, history, Some(cancel.clone()));
+                    let result = summarize_with_hooks(&root,&session,settings.policy,model.as_ref(), &requested, history, Some(cancel.clone()),"auto",&|event|observer(hook_progress(event)));
                     if let Ok(summary) = &result {
                         folded = Some(summary.clone());
                     }
@@ -1497,12 +1531,13 @@ impl AgentBackend for VersionBackend {
                 let (root, model, tx, session) = (self.root.clone(), self.model.clone(), self.tx.clone(), self.session.clone());
                 let previous = stored.compact_summary.clone();
                 let requested = self.settings.model.clone();
+                let hook_policy = self.settings.policy;
                 let through = stored.task_ids.len();
                 thread::spawn(move || {
                     let result = (|| -> Result<String> {
                         let mut history = previous.as_deref().map(compacted_history).unwrap_or_default();
                         history.extend(loom_core::agent::Core::open(&root)?.context(&ids, 120_000)?);
-                        summarize(model.as_ref(), &requested, history, None)
+                        summarize_with_hooks(&root,&session,hook_policy,model.as_ref(), &requested, history, None,"manual",&|event| {let _=tx.send(Message::Progress(hook_progress(event)));})
                     })();
                     let _ = tx.send(Message::Compacted { session, through, result: result.map_err(|error| error.to_string()), auto: false });
                 });
@@ -2021,9 +2056,14 @@ impl AgentBackend for VersionBackend {
     }
 
     fn shutdown(&mut self) -> Result<()> {
+        if self.stopped { return Ok(()); }
         self.cancel.store(true, Ordering::SeqCst);
         self.inquiry_cancel.store(true, Ordering::SeqCst);
         self.stopped = true;
+        // SessionEnd is tied to backend shutdown, never to a turn finish.
+        if self.trusted && !self.session.is_empty() {
+            loom_core::hooks::Hooks::end_session(&self.root,&self.session,self.settings.policy)?;
+        }
         Ok(())
     }
 }
@@ -2265,6 +2305,28 @@ mod provider_reload_tests {
             endpoint: "fixture".into(), model: id.into(), tier: models::Tier::Small,
             cost: models::CostClass::Local, price: Some((0.0, 0.0)), tools: true, context: None,
         }, std::iter::empty()))
+    }
+    #[cfg(unix)]
+    #[test]
+    fn manual_compaction_fires_hooks_and_preserves_context() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        std::fs::create_dir(root.path().join(".loom"))?;
+        std::fs::write(root.path().join(".loom/hooks.json"),serde_json::json!({"hooks":{
+            "PreCompact":[{"matcher":"^manual$","hooks":[{"type":"command","command":"printf '%s' '{\"hookSpecificOutput\":{\"additionalContext\":\"keep-the-objective\"}}'"}]}],
+            "PostCompact":[{"matcher":"^manual$","hooks":[{"type":"command","command":"printf '%s' '{\"hookSpecificOutput\":{\"additionalContext\":\"after-summary\"}}'"}]}]
+        }}).to_string())?;
+        let model = models::ScriptedModel::new([models::Response {
+            parts:vec![models::Part::Text("summary".into())],stop:models::Stop::EndTurn,
+            usage:Default::default(),model:"scripted".into(),latency:Duration::ZERO,route:None,gateway_connection:None,gateway_upstream_ms:None
+        }]);
+        let events = std::sync::Mutex::new(Vec::new());
+        let summary = summarize_with_hooks(root.path(),"session-test",Default::default(),&model,"auto",vec![models::Message::user("objective")],None,"manual",&|event|events.lock().unwrap().push(event))?;
+        assert!(model.requests()[0].messages.iter().any(|message|message.text().contains("keep-the-objective")));
+        assert!(summary.contains("summary") && summary.contains("after-summary"));
+        let events = events.into_inner().unwrap();
+        assert_eq!(events.iter().filter(|event|event.detail["started"]==true).count(),2);
+        assert!(events.iter().all(|event|!event.failed));
+        Ok(())
     }
     #[test]
     fn initial_model_waits_for_discovery_and_can_be_cancelled() {

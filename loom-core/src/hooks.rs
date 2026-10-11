@@ -2,12 +2,10 @@
 //! execution; hooks never evaluate model text as shell source.
 use crate::{
     agent::events::{Event, Observer, Stage},
-    base::{ArtifactStore, FileArtifactStore},
+    base::FileArtifactStore,
     effects::{ExecutionPolicy, RunStatus, Runner},
 };
 use anyhow::{Context, Result, ensure};
-use globset::{Glob, GlobSet, GlobSetBuilder};
-use serde::Deserialize;
 use serde_json::{Value, json};
 use std::{
     fs,
@@ -18,22 +16,36 @@ use std::{
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HookEvent {
-    TaskStart,
     PreToolUse,
     PostToolUse,
-    TaskEnd,
+    UserPromptSubmit,
+    Stop,
+    Interrupt,
+    SubagentStart,
+    SubagentStop,
+    PreCompact,
+    PostCompact,
+    SessionStart,
+    SessionEnd,
 }
 impl HookEvent {
     pub fn name(self) -> &'static str {
         match self {
-            Self::TaskStart => "TaskStart",
             Self::PreToolUse => "PreToolUse",
             Self::PostToolUse => "PostToolUse",
-            Self::TaskEnd => "TaskEnd",
+            Self::UserPromptSubmit => "UserPromptSubmit",
+            Self::Stop => "Stop",
+            Self::Interrupt => "Interrupt",
+            Self::SubagentStart => "SubagentStart",
+            Self::SubagentStop => "SubagentStop",
+            Self::PreCompact => "PreCompact",
+            Self::PostCompact => "PostCompact",
+            Self::SessionStart => "SessionStart",
+            Self::SessionEnd => "SessionEnd",
         }
     }
     fn blocking(self) -> bool {
-        matches!(self, Self::TaskStart | Self::PreToolUse)
+        matches!(self, Self::PreToolUse | Self::UserPromptSubmit)
     }
 }
 
@@ -46,72 +58,95 @@ mod tests {
         fs::create_dir_all(root.join(".loom")).unwrap();
         fs::write(root.join(".loom/config.toml"), text).unwrap();
     }
-    #[cfg(unix)]
     #[test]
-    fn temporary_symlinks_cannot_make_real_source_files_writable_to_hooks() {
-        let root = tempfile::tempdir().unwrap();
-        fs::create_dir_all(root.path().join("src")).unwrap();
-        config(
-            root.path(),
-            "[hooks]\nenabled=true\n[[hooks.PostToolUse]]\nname='write'\ncommand='touch src/changed'\n",
-        );
-        std::os::unix::fs::symlink(root.path().join("src"), root.path().join(".loom/tmp")).unwrap();
-        let (result, _) = fire(
-            root.path(),
-            &Hooks::open(root.path()).unwrap(),
-            &AtomicBool::new(false),
-        );
-        assert!(result.err().unwrap().to_string().contains("symlinks"));
-        assert!(!root.path().join("src/changed").exists());
-    }
-    #[test]
-    fn hooks_require_opt_in_validate_names_and_keep_a_configuration_snapshot() {
+    fn compatible_groups_use_regex_seconds_and_reject_unsupported_handlers() {
         let root = tempfile::tempdir().unwrap();
         config(
             root.path(),
-            "[[hooks.PreToolUse]]\nname='test'\ncommand='exit 2'\n",
-        );
-        assert!(
-            !Hooks::open(root.path())
-                .unwrap()
-                .has(HookEvent::PreToolUse, "find")
-        );
-        config(
-            root.path(),
-            "[hooks]\nenabled=true\n[[hooks.PreToolUse]]\nname='test'\ncommand='exit 2'\nmatcher='find|mcp_*'\n",
+            "[[hooks.PreToolUse]]\nmatcher='^Bash$'\n[[hooks.PreToolUse.hooks]]\ntype='command'\ncommand='echo test'\ntimeout=3\n",
         );
         let hooks = Hooks::open(root.path()).unwrap();
-        assert!(hooks.has(HookEvent::PreToolUse, "find"));
-        assert!(hooks.has(HookEvent::PreToolUse, "mcp_test"));
-        assert!(!hooks.has(HookEvent::PreToolUse, "find_other"));
-        config(root.path(), "[hooks]\nenabled=false\n");
-        assert!(hooks.has(HookEvent::PreToolUse, "find"));
+        assert!(hooks.has(HookEvent::PreToolUse, "run"));
+        assert!(!hooks.has(HookEvent::PreToolUse, "run_else"));
+        assert_eq!(hooks.entries[0].config.timeout_ms, 3000);
+        assert!(hooks.guidance().contains("built-in runtime knowledge"));
+        assert!(hooks.guidance().contains("PreToolUse /"));
         config(
             root.path(),
-            "[hooks]\nenabled=true\n[[hooks.PreToolUse]]\nname='test'\ncommand='exit 2'\ntimeout_ms=0\n",
+            "[[hooks.PreToolUse]]\n[[hooks.PreToolUse.hooks]]\ntype='command'\ncommand='echo test'\nasync=true\n",
         );
         assert!(
             Hooks::open(root.path())
                 .err()
                 .unwrap()
                 .to_string()
-                .contains("timeout_ms")
+                .contains("async")
         );
+    }
+    #[test]
+    fn compatible_decisions_rewrite_context_and_stop_have_distinct_meanings() {
+        let mut outcome = HookOutcome::default();
+        decode_output(HookEvent::PreToolUse,r#"{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"allow","updatedInput":{"command":"safe"},"additionalContext":"policy"}}"#,16,&mut outcome).unwrap();
+        assert_eq!(outcome.updated_input.unwrap()["command"], "safe");
+        assert_eq!(outcome.context, vec!["policy"]);
+        let mut outcome = HookOutcome::default();
+        decode_output(
+            HookEvent::PostToolUse,
+            r#"{"decision":"block","reason":"review"}"#,
+            100,
+            &mut outcome,
+        )
+        .unwrap();
+        assert_eq!(outcome.feedback.as_deref(), Some("review"));
+        assert!(outcome.halt.is_none());
+        let mut outcome = HookOutcome::default();
+        decode_output(
+            HookEvent::Stop,
+            r#"{"decision":"block","reason":"test again"}"#,
+            100,
+            &mut outcome,
+        )
+        .unwrap();
+        assert!(outcome.continue_work);
+        decode_output(
+            HookEvent::Stop,
+            r#"{"continue":false,"stopReason":"enough"}"#,
+            100,
+            &mut outcome,
+        )
+        .unwrap();
+        assert!(!outcome.continue_work && outcome.halt.as_deref() == Some("enough"));
+        assert!(
+            decode_output(
+                HookEvent::PreToolUse,
+                r#"{"continue":false}"#,
+                100,
+                &mut outcome
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn old_flat_format_and_old_lifecycle_events_are_rejected() {
+        let root = tempfile::tempdir().unwrap();
         config(
             root.path(),
-            "[hooks]\nenabled=true\n[[hooks.PreToolUes]]\nname='test'\ncommand='exit 2'\n",
+            "[[hooks.PreToolUse]]\nname='old'\ncommand='echo old'\n",
         );
+        assert!(Hooks::open(root.path()).is_err());
+        config(root.path(), "[[hooks.TaskEnd]]\n");
         assert!(Hooks::open(root.path()).is_err());
     }
     #[cfg(unix)]
-    fn fire(root: &Path, hooks: &Hooks, cancel: &AtomicBool) -> (Result<()>, Vec<Event>) {
+    fn fire(root: &Path, hooks: &Hooks, cancel: &AtomicBool) -> (Result<HookOutcome>, Vec<Event>) {
         let events = Mutex::new(Vec::new());
         let result = hooks.run(
             Invocation {
                 event: HookEvent::PostToolUse,
                 worker: "main",
                 directory: root,
-                input: json!({"tool_name":"open", "tool_input":{"target":"$(touch injected)"}}),
+                input: json!({"tool_name":"open","tool_input":{"target":"$(touch injected)"}}),
                 policy: ExecutionPolicy {
                     sandbox: crate::effects::SandboxMode::FullAccess,
                     network: true,
@@ -126,119 +161,114 @@ mod tests {
     }
     #[cfg(unix)]
     #[test]
-    fn hook_stdin_is_data_and_exit_status_is_not_inferred_from_output() {
+    fn command_stdin_is_data_and_stdout_and_stderr_are_not_confused() {
         let root = tempfile::tempdir().unwrap();
         config(
             root.path(),
-            "[hooks]\nenabled=true\n[[hooks.PostToolUse]]\nname='stdin'\ncommand=\"cat; printf 'test result: FAILED. 1 failed\\\\n'\"\nmatcher='open'\n",
+            "[[hooks.PostToolUse]]\nmatcher='^open$'\n[[hooks.PostToolUse.hooks]]\ntype='command'\ncommand=\"cat; printf 'test result: FAILED. 1 failed' >&2\"\n",
         );
-        let (result, events) = fire(
-            root.path(),
-            &Hooks::open(root.path()).unwrap(),
-            &AtomicBool::new(false),
-        );
+        let hooks = Hooks::open(root.path()).unwrap();
+        let (result, events) = fire(root.path(), &hooks, &AtomicBool::new(false));
         result.unwrap();
-        let reference =
-            serde_json::from_value(events[1].detail["result"]["artifact"].clone()).unwrap();
-        let bytes = FileArtifactStore::open(root.path())
-            .unwrap()
-            .get(&reference, None)
-            .unwrap();
-        let output = String::from_utf8(bytes).unwrap();
-        assert!(output.contains("\"hook_event_name\":\"PostToolUse\""));
-        assert!(output.contains("$(touch injected)"));
-        assert!(!root.path().join("injected").exists());
         assert!(!events[1].failed);
+        assert_eq!(events[1].detail["result"]["status"], "Passed");
+        assert!(
+            events[1].detail["result"]["output"]
+                .as_str()
+                .unwrap()
+                .contains("$(touch injected)")
+        );
+        assert!(!root.path().join("injected").exists());
     }
     #[cfg(unix)]
     #[test]
-    fn post_hooks_continue_after_failure_and_timeouts_or_cancel_cannot_run_forever() {
+    fn failures_timeouts_cancellation_and_symlinks_are_observable_and_bounded() {
         let root = tempfile::tempdir().unwrap();
         config(
             root.path(),
-            "[hooks]\nenabled=true\n[[hooks.PostToolUse]]\nname='failed'\ncommand='exit 2'\n[[hooks.PostToolUse]]\nname='next'\ncommand='echo next'\n",
+            "[[hooks.PostToolUse]]\n[[hooks.PostToolUse.hooks]]\ntype='command'\ncommand='exit 1'\n[[hooks.PostToolUse.hooks]]\ntype='command'\ncommand='echo {}'\n",
         );
-        let (result, events) = fire(
+        let (_, events) = fire(
             root.path(),
             &Hooks::open(root.path()).unwrap(),
             &AtomicBool::new(false),
         );
-        assert!(result.is_err());
         assert_eq!(events.len(), 4);
         assert!(events[1].failed && !events[3].failed);
         config(
             root.path(),
-            "[hooks]\nenabled=true\n[[hooks.PostToolUse]]\nname='slow'\ncommand='sleep 5'\ntimeout_ms=20\n",
+            "[[hooks.PostToolUse]]\n[[hooks.PostToolUse.hooks]]\ntype='command'\ncommand='sleep 5'\ntimeout=1\n",
         );
         let started = Instant::now();
-        let (result, _) = fire(
+        let (_, events) = fire(
             root.path(),
             &Hooks::open(root.path()).unwrap(),
             &AtomicBool::new(false),
         );
-        assert!(result.err().unwrap().to_string().contains("TimedOut"));
-        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(events[1].failed && started.elapsed() < Duration::from_secs(2));
         config(
             root.path(),
-            "[hooks]\nenabled=true\n[[hooks.PostToolUse]]\nname='cancelled'\ncommand='touch injected'\n",
+            "[[hooks.PostToolUse]]\n[[hooks.PostToolUse.hooks]]\ntype='command'\ncommand='touch injected'\n",
         );
-        assert!(
-            fire(
-                root.path(),
-                &Hooks::open(root.path()).unwrap(),
-                &AtomicBool::new(true)
-            )
-            .0
-            .is_err()
+        let (_, events) = fire(
+            root.path(),
+            &Hooks::open(root.path()).unwrap(),
+            &AtomicBool::new(true),
         );
-        assert!(!root.path().join("injected").exists());
+        assert!(events[1].failed && !root.path().join("injected").exists());
+        fs::create_dir_all(root.path().join("src")).unwrap();
+        fs::remove_dir_all(root.path().join(".loom/tmp")).unwrap();
+        std::os::unix::fs::symlink(root.path().join("src"), root.path().join(".loom/tmp")).unwrap();
+        let (_, events) = fire(
+            root.path(),
+            &Hooks::open(root.path()).unwrap(),
+            &AtomicBool::new(false),
+        );
+        assert!(events[1].failed && !root.path().join("src/injected").exists());
+    }
+    #[test]
+    fn configuration_is_snapshotted_and_global_disable_applies_to_json_too() {
+        let root = tempfile::tempdir().unwrap();
+        config(
+            root.path(),
+            "[[hooks.PreToolUse]]\nmatcher='^Bash$'\n[[hooks.PreToolUse.hooks]]\ntype='command'\ncommand='echo {}'\n",
+        );
+        let hooks = Hooks::open(root.path()).unwrap();
+        config(root.path(), "[hooks]\nenabled=false\n");
+        fs::write(
+            root.path().join(".loom/hooks.json"),
+            r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"echo {}"}]}]}}"#,
+        )
+        .unwrap();
+        assert!(hooks.has(HookEvent::PreToolUse, "run"));
+        assert!(!Hooks::open(root.path()).unwrap().has(HookEvent::Stop, ""));
     }
 }
 
-#[derive(Default, Deserialize)]
-struct Settings {
-    #[serde(default)]
-    hooks: Config,
-}
-#[derive(Default, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-struct Config {
-    enabled: bool,
-    #[serde(rename = "TaskStart")]
-    task_start: Vec<CommandHook>,
-    #[serde(rename = "PreToolUse")]
-    pre_tool: Vec<CommandHook>,
-    #[serde(rename = "PostToolUse")]
-    post_tool: Vec<CommandHook>,
-    #[serde(rename = "TaskEnd")]
-    task_end: Vec<CommandHook>,
-}
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
 struct CommandHook {
     name: String,
     command: String,
-    #[serde(default = "wildcard")]
     matcher: String,
-    #[serde(default = "timeout")]
     timeout_ms: u64,
-}
-fn wildcard() -> String {
-    "*".into()
-}
-fn timeout() -> u64 {
-    10_000
+    context_limit: usize,
 }
 struct Hook {
     event: HookEvent,
     config: CommandHook,
-    matcher: GlobSet,
+    matcher: Option<regex::Regex>,
 }
 #[derive(Default)]
 pub struct Hooks {
     entries: Vec<Hook>,
 }
-
+#[derive(Default, Debug, Clone)]
+pub struct HookOutcome {
+    pub context: Vec<String>,
+    pub updated_input: Option<Value>,
+    pub feedback: Option<String>,
+    pub continue_work: bool,
+    pub halt: Option<String>,
+}
 pub struct Invocation<'a> {
     pub event: HookEvent,
     pub worker: &'a str,
@@ -249,108 +279,322 @@ pub struct Invocation<'a> {
     pub remaining: Duration,
     pub observe: &'a Observer<'a>,
 }
+fn event_name(name: &str) -> Result<HookEvent> {
+    Ok(match name {
+        "PreToolUse" => HookEvent::PreToolUse,
+        "PostToolUse" => HookEvent::PostToolUse,
+        "UserPromptSubmit" => HookEvent::UserPromptSubmit,
+        "Stop" => HookEvent::Stop,
+        "Interrupt" => HookEvent::Interrupt,
+        "SubagentStart" => HookEvent::SubagentStart,
+        "SubagentStop" => HookEvent::SubagentStop,
+        "PreCompact" => HookEvent::PreCompact,
+        "PostCompact" => HookEvent::PostCompact,
+        "SessionStart" => HookEvent::SessionStart,
+        "SessionEnd" => HookEvent::SessionEnd,
+        other => anyhow::bail!(
+            "unsupported hook event {other}; PermissionRequest and MCP/async handlers are not supported"
+        ),
+    })
+}
+fn alias(tool: &str) -> &str {
+    match tool {
+        "run" => "Bash",
+        "agent" => "Agent",
+        _ => tool,
+    }
+}
+impl Hook {
+    fn matches(&self, event: HookEvent, value: &str) -> bool {
+        self.event == event
+            && (matches!(
+                event,
+                HookEvent::Stop | HookEvent::UserPromptSubmit | HookEvent::Interrupt
+            ) || self
+                .matcher
+                .as_ref()
+                .is_none_or(|m| m.is_match(value) || m.is_match(alias(value))))
+    }
+}
 impl Hooks {
-    pub fn open(root: &Path) -> Result<Self> {
-        let path = root.join(".loom/config.toml");
-        let text = match fs::read_to_string(&path) {
-            Ok(text) => text,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(Self::default());
-            }
-            Err(error) => return Err(error).context("reading hook configuration"),
-        };
-        ensure!(
-            text.len() <= 1024 * 1024,
-            "hook configuration exceeds 1 MiB"
-        );
-        let settings: Settings = toml::from_str(&text)
-            .with_context(|| format!("parsing hooks in {}", path.display()))?;
-        if !settings.hooks.enabled {
-            return Ok(Self::default());
-        }
-        let mut entries = Vec::new();
-        for (event, configs) in [
-            (HookEvent::TaskStart, settings.hooks.task_start),
-            (HookEvent::PreToolUse, settings.hooks.pre_tool),
-            (HookEvent::PostToolUse, settings.hooks.post_tool),
-            (HookEvent::TaskEnd, settings.hooks.task_end),
-        ] {
-            ensure!(configs.len() <= 32, "at most 32 hooks per event");
-            for config in configs {
-                ensure!(
-                    !config.name.trim().is_empty() && !config.command.trim().is_empty(),
-                    "hook name and command required"
-                );
-                ensure!(
-                    (1..=60_000).contains(&config.timeout_ms),
-                    "hook {} timeout_ms must be 1..60000",
-                    config.name
-                );
-                ensure!(
-                    !entries
-                        .iter()
-                        .any(|hook: &Hook| hook.event == event && hook.config.name == config.name),
-                    "duplicate hook {} for {}",
-                    config.name,
-                    event.name()
-                );
-                ensure!(
-                    matches!(event, HookEvent::PreToolUse | HookEvent::PostToolUse)
-                        || config.matcher == "*",
-                    "tool matcher only supported for tool hooks"
-                );
-                let mut matcher = GlobSetBuilder::new();
-                for pattern in config.matcher.split('|') {
-                    matcher.add(Glob::new(pattern.trim()).context("invalid hook matcher")?);
-                }
-                entries.push(Hook {
-                    event,
-                    config,
-                    matcher: matcher.build()?,
-                });
-            }
-        }
-        Ok(Self { entries })
-    }
-    pub fn has(&self, event: HookEvent, tool: &str) -> bool {
-        self.entries
-            .iter()
-            .any(|hook| hook.event == event && hook.matcher.is_match(tool))
-    }
-    pub fn run(&self, invocation: Invocation<'_>, artifacts: &FileArtifactStore) -> Result<()> {
-        let tool = invocation.input["tool_name"].as_str().unwrap_or("");
-        if !self.has(invocation.event, tool) {
+    pub fn end_session(root: &Path, session_id: &str, mut policy: ExecutionPolicy) -> Result<()> {
+        let hooks = Self::open(root)?;
+        if !hooks.has(HookEvent::SessionEnd, "other") {
             return Ok(());
         }
+        policy.sandbox = crate::effects::SandboxMode::ReadOnly;
+        let artifacts = FileArtifactStore::open(root)?;
+        let events = std::sync::Mutex::new(
+            fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(root.join(".loom/hooks-session-events.jsonl"))?,
+        );
+        hooks.run(Invocation {event:HookEvent::SessionEnd,worker:"main",directory:root,
+            input:json!({"session_id":session_id,"reason":"other","workspace":root,"model":"auto"}),policy,
+            cancel:&AtomicBool::new(false),remaining:Duration::from_secs(3),observe:&|event| {
+                use std::io::Write;
+                if let Ok(mut file)=events.lock() { let _=writeln!(file,"{}",serde_json::to_string(&event).unwrap_or_default()); }
+            }},&artifacts)?;
+        Ok(())
+    }
+
+    /// Knowledge is embedded in the binary, not dependent on project documents.
+    pub fn guidance(&self) -> String {
+        let mut text = include_str!("knowledge/hooks.md").to_owned();
+        text.push_str("\nActive hooks for this task:");
+        if self.entries.is_empty() {
+            text.push_str(" none (disabled or unconfigured).");
+        }
+        for hook in &self.entries {
+            text.push_str(&format!(
+                "\n- {} / {} (matcher: {}, timeout: {} ms)",
+                hook.event.name(),
+                hook.config.name,
+                hook.config.matcher,
+                hook.config.timeout_ms
+            ));
+        }
+        text
+    }
+    pub fn open(root: &Path) -> Result<Self> {
+        let mut hooks = Self::default();
+        let mut disabled = false;
+        for (file, is_json) in [
+            (root.join(".loom/config.toml"), false),
+            (root.join(".loom/hooks.json"), true),
+        ] {
+            let text = match fs::read_to_string(&file) {
+                Ok(text) => text,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(e).context("reading hook configuration"),
+            };
+            ensure!(
+                text.len() <= 1024 * 1024,
+                "hook configuration exceeds 1 MiB"
+            );
+            let document: Value = if is_json {
+                serde_json::from_str(&text)?
+            } else {
+                serde_json::to_value(toml::from_str::<toml::Value>(&text)?)?
+            };
+            let Some(value) = document.get("hooks") else {
+                continue;
+            };
+            let config = value.as_object().context("hooks must be an object")?;
+            if !is_json && config.get("enabled") == Some(&json!(false)) {
+                disabled = true;
+            }
+            for (key, groups) in config {
+                if key == "enabled" {
+                    ensure!(groups.is_boolean(), "hooks.enabled must be boolean");
+                    continue;
+                }
+                let event = event_name(key)?;
+                let groups = groups
+                    .as_array()
+                    .context("hook event must contain an array")?;
+                ensure!(groups.len() <= 32, "at most 32 matcher groups per event");
+                for (index, group) in groups.iter().enumerate() {
+                    let object = group
+                        .as_object()
+                        .context("hook matcher group must be an object")?;
+                    ensure!(
+                        object
+                            .keys()
+                            .all(|key| matches!(key.as_str(), "matcher" | "hooks")),
+                        "only Codex-style matcher groups are supported; flat legacy hooks are not supported"
+                    );
+                    let matcher = group
+                        .get("matcher")
+                        .map(|v| v.as_str().context("matcher must be a string"))
+                        .transpose()?
+                        .unwrap_or("*");
+                    let handlers = group
+                        .get("hooks")
+                        .and_then(Value::as_array)
+                        .context("matcher group requires hooks array")?;
+                    ensure!(handlers.len() <= 32, "at most 32 handlers per group");
+                    for (handler_index, handler) in handlers.iter().enumerate() {
+                        let object = handler
+                            .as_object()
+                            .context("hook handler must be an object")?;
+                        ensure!(
+                            object.keys().all(|key| matches!(
+                                key.as_str(),
+                                "name"
+                                    | "command"
+                                    | "type"
+                                    | "timeout"
+                                    | "command_windows"
+                                    | "additionalContextLimit"
+                                    | "statusMessage"
+                                    | "async"
+                            )),
+                            "unknown hook handler field (timeout is in seconds; timeout_ms is unsupported)"
+                        );
+                        ensure!(
+                            handler["type"] == "command",
+                            "only command hooks are supported; MCP/prompt/agent handlers are unsupported"
+                        );
+                        ensure!(
+                            handler.get("async").is_none_or(|v| v == &json!(false)),
+                            "async hooks are unsupported; use synchronous command hooks"
+                        );
+                        let command = if cfg!(windows) {
+                            handler.get("command_windows").or(handler.get("command"))
+                        } else {
+                            handler.get("command")
+                        };
+                        let command = command
+                            .and_then(Value::as_str)
+                            .context("hook command required")?
+                            .to_owned();
+                        let name = handler
+                            .get("name")
+                            .map(|v| v.as_str().context("name must be a string"))
+                            .transpose()?
+                            .map(str::to_owned)
+                            .unwrap_or_else(|| {
+                                format!(
+                                    "{}:{key}:{index}:{handler_index}",
+                                    file.file_name().unwrap().to_string_lossy()
+                                )
+                            });
+                        ensure!(
+                            !name.trim().is_empty() && !command.trim().is_empty(),
+                            "hook name and command required"
+                        );
+                        ensure!(
+                            !hooks
+                                .entries
+                                .iter()
+                                .any(|h| h.event == event && h.config.name == name),
+                            "duplicate hook {name}"
+                        );
+                        let terminal =
+                            matches!(event, HookEvent::Interrupt | HookEvent::SessionEnd);
+                        let seconds = handler
+                            .get("timeout")
+                            .map(|v| v.as_u64().context("timeout must be integer seconds"))
+                            .transpose()?
+                            .unwrap_or(if terminal { 1 } else { 600 });
+                        ensure!(
+                            (1..=if terminal { 3 } else { 600 }).contains(&seconds),
+                            "hook {name} timeout must be 1..{} seconds",
+                            if terminal { 3 } else { 600 }
+                        );
+                        let compiled = if matcher == "*" || matcher.is_empty() {
+                            None
+                        } else {
+                            Some(regex::Regex::new(matcher).context("invalid regex matcher")?)
+                        };
+                        let context_limit = handler
+                            .get("additionalContextLimit")
+                            .map(|v| {
+                                v.as_u64()
+                                    .context("additionalContextLimit must be a positive integer")
+                            })
+                            .transpose()?
+                            .unwrap_or(2500)
+                            .min(16384) as usize
+                            * 4;
+                        ensure!(
+                            context_limit > 0,
+                            "Loom requires a bounded positive additionalContextLimit"
+                        );
+                        hooks.entries.push(Hook {
+                            event,
+                            config: CommandHook {
+                                name,
+                                command,
+                                matcher: matcher.into(),
+                                timeout_ms: seconds * 1000,
+                                context_limit,
+                            },
+                            matcher: compiled,
+                        });
+                        ensure!(
+                            hooks.entries.len() <= 256,
+                            "at most 256 command handlers per workspace"
+                        );
+                    }
+                }
+            }
+        }
+        if disabled {
+            hooks.entries.clear();
+        }
+        Ok(hooks)
+    }
+    pub fn has(&self, event: HookEvent, value: &str) -> bool {
+        self.entries.iter().any(|h| h.matches(event, value))
+    }
+    pub fn run(
+        &self,
+        invocation: Invocation<'_>,
+        artifacts: &FileArtifactStore,
+    ) -> Result<HookOutcome> {
+        let match_value = invocation.input["tool_name"]
+            .as_str()
+            .or(invocation.input["source"].as_str())
+            .or(invocation.input["trigger"].as_str())
+            .or(invocation.input["agent_type"].as_str())
+            .or(invocation.input["reason"].as_str())
+            .unwrap_or("")
+            .to_owned();
+        let mut outcome = HookOutcome::default();
+        let runner = Runner::new(artifacts.clone());
+        let started = Instant::now();
         let mut input = invocation.input.clone();
         input["hook_event_name"] = json!(invocation.event.name());
         input["worker_id"] = json!(invocation.worker);
         input["cwd"] = json!(invocation.directory);
         input["sandbox"] = json!(invocation.policy.sandbox);
         input["network"] = json!(invocation.policy.network);
-        let input = serde_json::to_vec(&input)?;
-        ensure!(input.len() <= 1024 * 1024, "hook input exceeds 1 MiB");
-        let runner = Runner::new(artifacts.clone());
-        let started = Instant::now();
-        let mut errors = Vec::new();
+        input["permission_mode"] = json!(if invocation.policy.sandbox
+            == crate::effects::SandboxMode::ReadOnly
+        {
+            "plan"
+        } else {
+            "default"
+        });
+        input["transcript_path"] = json!(null); // Event log is not a stable chat transcript.
+        input["session_id"] = input
+            .get("session_id")
+            .cloned()
+            .unwrap_or_else(|| input["run_id"].clone());
+        input["turn_id"] = input["task_id"].clone();
         for hook in self
             .entries
             .iter()
-            .filter(|hook| hook.event == invocation.event && hook.matcher.is_match(tool))
+            .filter(|h| h.matches(invocation.event, &match_value))
         {
             let target = format!("hook · {} · {}", invocation.event.name(), hook.config.name);
-            let mut detail = json!({"tool":"hook", "hook_event":invocation.event.name(), "name":hook.config.name});
-            detail["started"] = json!(true);
+            let mut detail = json!({"tool":"hook","hook_event":invocation.event.name(),"name":hook.config.name,"started":true});
             (invocation.observe)(Event::new(
                 invocation.worker,
                 Stage::Run,
                 &target,
                 detail.clone(),
             ));
+            let mut payload = input.clone();
+            {
+                if let Some(tool) = payload["tool_name"].as_str() {
+                    let tool = tool.to_owned();
+                    payload["loom_tool_name"] = json!(tool);
+                    payload["tool_name"] = json!(alias(&tool));
+                }
+                if let Some(args) = &outcome.updated_input {
+                    payload["tool_input"] = args.clone();
+                }
+            }
+            let bytes = serde_json::to_vec(&payload)?;
+            ensure!(bytes.len() <= 1024 * 1024, "hook input exceeds 1 MiB");
             let result = runner.run_hook(
                 invocation.directory,
                 &hook.config.command,
-                &input,
+                &bytes,
                 Duration::from_millis(hook.config.timeout_ms)
                     .min(invocation.remaining.saturating_sub(started.elapsed())),
                 invocation.cancel,
@@ -358,47 +602,177 @@ impl Hooks {
             );
             detail.as_object_mut().unwrap().remove("started");
             detail["completed"] = json!(true);
-            let error = match result {
-                Ok(result) => {
-                    detail["result"] = serde_json::to_value(&result)?;
+            let parsed = match result {
+                Ok(output) => {
+                    detail["result"] = serde_json::to_value(&output.result)?;
+                    detail["result"]["output"] =
+                        json!(format!("{}{}", output.stdout, output.stderr));
+                    if let Ok(value) = serde_json::from_str::<Value>(&output.stdout) {
+                        if let Some(message) = value["systemMessage"].as_str() {
+                            detail["system_message"] = json!(clip(message, 4096));
+                        }
+                    }
                     detail["result"]["artifact_target"] =
-                        json!(format!("artifact:{}", result.artifact.id));
-                    (result.status != RunStatus::Passed).then(|| {
-                        let output = artifacts
-                            .get(
-                                &result.artifact,
-                                Some(0..2048.min(result.artifact.bytes as usize)),
-                            )
-                            .unwrap_or_default();
-                        format!(
-                            "hook {}/{} {:?}: {}",
-                            invocation.event.name(),
+                        json!(format!("artifact:{}", output.result.artifact.id));
+                    if matches!(
+                        output.result.status,
+                        RunStatus::Cancelled | RunStatus::TimedOut
+                    ) {
+                        Err(anyhow::anyhow!(
+                            "hook {} {:?}",
                             hook.config.name,
-                            result.status,
-                            String::from_utf8_lossy(&output)
+                            output.result.status
+                        ))
+                    } else if output.exit_code == Some(2) {
+                        let reason = clip(&output.stderr, 8000);
+                        let reason = if reason.trim().is_empty() {
+                            format!("blocked by hook {}", hook.config.name)
+                        } else {
+                            reason
+                        };
+                        apply_block(invocation.event, reason, &mut outcome);
+                        Ok(())
+                    } else if output.exit_code != Some(0) {
+                        Err(anyhow::anyhow!(
+                            "hook {} failed: {}",
+                            hook.config.name,
+                            clip(&output.stderr, 2048)
+                        ))
+                    } else {
+                        let mut decoded = outcome.clone();
+                        decode_output(
+                            invocation.event,
+                            &output.stdout,
+                            hook.config.context_limit,
+                            &mut decoded,
                         )
-                    })
+                        .map(|()| {
+                            outcome = decoded;
+                        })
+                    }
                 }
-                Err(error) => Some(format!(
-                    "hook {}/{}: {error}",
-                    invocation.event.name(),
-                    hook.config.name
-                )),
+                Err(e) => Err(e),
             };
-            if let Some(error) = &error {
+            if let Err(error) = parsed {
+                let error = clip(
+                    &format!(
+                        "hook {}/{}: {error}",
+                        invocation.event.name(),
+                        hook.config.name
+                    ),
+                    4096,
+                );
                 detail["error"] = json!(error);
+                // Failure is observable; only explicit policy decisions block calls.
             }
             let mut event = Event::new(invocation.worker, Stage::Run, target, detail);
-            event.failed = error.is_some();
+            event.failed = event.detail.get("error").is_some()
+                || outcome.halt.is_some()
+                || outcome.continue_work
+                || outcome.feedback.is_some()
+                || event.detail["result"]["status"] == "Failed";
             (invocation.observe)(event);
-            if let Some(error) = error {
-                errors.push(error);
-                if invocation.event.blocking() {
-                    break;
-                }
+            if invocation.event.blocking() && outcome.halt.is_some() {
+                break;
+            }
+            if outcome.halt.is_some() {
+                break;
             }
         }
-        ensure!(errors.is_empty(), "{}", errors.join("\n"));
-        Ok(())
+        Ok(outcome)
     }
+}
+fn clip(text: &str, max: usize) -> String {
+    text.chars().take(max).collect()
+}
+fn apply_block(event: HookEvent, reason: String, outcome: &mut HookOutcome) {
+    match event {
+        HookEvent::PreToolUse | HookEvent::UserPromptSubmit => outcome.halt = Some(reason),
+        HookEvent::PostToolUse => outcome.feedback = Some(reason),
+        HookEvent::Stop | HookEvent::SubagentStop => {
+            outcome.continue_work = true;
+            outcome.feedback = Some(reason);
+        }
+        _ => {}
+    }
+}
+fn decode_output(
+    event: HookEvent,
+    stdout: &str,
+    limit: usize,
+    outcome: &mut HookOutcome,
+) -> Result<()> {
+    if stdout.trim().is_empty() {
+        return Ok(());
+    }
+    let output: Value = match serde_json::from_str(stdout) {
+        Ok(value) => value,
+        Err(_) if event == HookEvent::SessionStart && !stdout.trim_start().starts_with('{') => {
+            outcome.context.push(clip(stdout, limit));
+            return Ok(());
+        }
+        Err(e) => return Err(e).context("hook stdout must be one JSON object"),
+    };
+    ensure!(output.is_object(), "hook stdout must be one JSON object");
+    let specific = &output["hookSpecificOutput"];
+    if let Some(name) = specific["hookEventName"].as_str() {
+        ensure!(name == event.name(), "hook output event mismatch");
+    }
+    if let Some(context) = specific["additionalContext"].as_str() {
+        outcome.context.push(clip(context, limit));
+    }
+    if event == HookEvent::PreToolUse {
+        ensure!(
+            output.get("continue").is_none()
+                && output.get("stopReason").is_none()
+                && output.get("suppressOutput").is_none(),
+            "unsupported PreToolUse output fields"
+        );
+        match specific["permissionDecision"].as_str() {
+            Some("deny") => apply_block(
+                event,
+                specific["permissionDecisionReason"]
+                    .as_str()
+                    .unwrap_or("denied by hook")
+                    .into(),
+                outcome,
+            ),
+            Some("allow") => {
+                if let Some(args) = specific.get("updatedInput") {
+                    ensure!(args.is_object(), "updatedInput must be an object");
+                    outcome.updated_input = Some(args.clone());
+                }
+            }
+            None => ensure!(
+                specific.get("updatedInput").is_none(),
+                "updatedInput requires permissionDecision=allow"
+            ),
+            _ => anyhow::bail!("unsupported permissionDecision"),
+        }
+    }
+    if output["decision"] == "block" {
+        apply_block(
+            event,
+            output["reason"]
+                .as_str()
+                .unwrap_or("blocked by hook")
+                .into(),
+            outcome,
+        );
+    }
+    if output["continue"] == false
+        && !matches!(event, HookEvent::PreToolUse | HookEvent::SubagentStart)
+    {
+        let reason = output["stopReason"]
+            .as_str()
+            .unwrap_or("stopped by hook")
+            .to_owned();
+        if event == HookEvent::PostToolUse {
+            outcome.feedback = Some(reason);
+        } else {
+            outcome.halt = Some(reason);
+            outcome.continue_work = false;
+        }
+    }
+    Ok(())
 }

@@ -147,6 +147,9 @@ impl InputControl {
 }
 #[derive(Clone)]
 pub struct Options {
+    /// Stable UI session identity; direct Core callers may leave it unset.
+    pub session_id: Option<String>,
+    pub session_start: Option<String>,
     pub history: Vec<Message>,
     pub pinned: Option<Revision>,
     pub inquiry: bool,
@@ -173,6 +176,8 @@ pub struct Options {
 impl Default for Options {
     fn default() -> Self {
         Self {
+            session_id: None,
+            session_start: None,
             history: vec![],
             pinned: None,
             inquiry: false,

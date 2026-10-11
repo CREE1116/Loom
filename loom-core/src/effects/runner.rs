@@ -35,6 +35,12 @@ pub struct Runner {
     artifacts: FileArtifactStore,
     resources: Arc<ResourceGovernor>,
 }
+pub struct HookResult {
+    pub result: TestResult,
+    pub stdout: String,
+    pub stderr: String,
+    pub exit_code: Option<i32>,
+}
 
 // The reservation must outlive cleanup on I/O errors as well as normal exits.
 struct RunningChild {
@@ -108,7 +114,7 @@ impl Runner {
         target_dir: Option<&Path>,
         policy: super::ExecutionPolicy,
     ) -> Result<TestResult> {
-        self.run_command(directory, command, timeout, cancel, target_dir, policy, None)
+        self.run_command(directory, command, timeout, cancel, target_dir, policy, None).map(|output| output.result)
     }
 
     /// Hook stdin is data, never interpolated into shell source. Hooks use the
@@ -121,7 +127,7 @@ impl Runner {
         timeout: Duration,
         cancel: &AtomicBool,
         policy: super::ExecutionPolicy,
-    ) -> Result<TestResult> {
+    ) -> Result<HookResult> {
         anyhow::ensure!(!cancel.load(Ordering::Acquire), "hook cancelled before execution");
         anyhow::ensure!(!timeout.is_zero(), "hook deadline reached before execution");
         anyhow::ensure!(policy.sandbox != super::SandboxMode::ReadOnly || !super::sandbox::already_sandboxed(),
@@ -138,7 +144,7 @@ impl Runner {
         target_dir: Option<&Path>,
         policy: super::ExecutionPolicy,
         input: Option<&[u8]>,
-    ) -> Result<TestResult> {
+    ) -> Result<HookResult> {
         let started = Instant::now();
         let stdout = tempfile::NamedTempFile::new()?;
         let stderr = tempfile::NamedTempFile::new()?;
@@ -216,6 +222,7 @@ impl Runner {
                         Ok(())
                     }
                 });
+        let mut exit_code = None;
         let status = match reservation {
             Err(AdmissionError::Cancelled) => RunStatus::Cancelled,
             Err(AdmissionError::TimedOut) => RunStatus::TimedOut,
@@ -233,6 +240,7 @@ impl Runner {
                         break RunStatus::TimedOut;
                     }
                     if let Some(exit) = child.child.try_wait()? {
+                        exit_code = exit.code();
                         break if exit.success() {
                             RunStatus::Passed
                         } else {
@@ -246,11 +254,15 @@ impl Runner {
             }
         };
         let mut raw = Vec::new();
+        let mut streams = Vec::new();
         writeln!(raw, "$ {command}")?;
         if input.is_some() {
             use std::io::Read;
             for file in [&stdout, &stderr] {
-                file.reopen()?.take(64 * 1024).read_to_end(&mut raw)?;
+                let mut bytes = Vec::new();
+                file.reopen()?.take(64 * 1024).read_to_end(&mut bytes)?;
+                raw.extend_from_slice(&bytes);
+                streams.push(String::from_utf8_lossy(&bytes).into_owned());
             }
         } else {
             raw.extend_from_slice(&fs::read(stdout.path())?);
@@ -272,7 +284,7 @@ impl Runner {
         } else {
             status
         };
-        Ok(TestResult {
+        Ok(HookResult { result: TestResult {
             status,
             passed,
             failed,
@@ -280,7 +292,7 @@ impl Runner {
             first_error,
             artifact: self.artifacts.put(&raw)?,
             ms: started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
-        })
+        }, stdout: streams.first().cloned().unwrap_or_default(), stderr: streams.get(1).cloned().unwrap_or_default(), exit_code })
     }
 }
 

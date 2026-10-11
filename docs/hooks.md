@@ -1,124 +1,103 @@
 # Command hooks
 
-Loom Native supports opt-in command hooks in the workspace's `.loom/config.toml`.
-Without `hooks.enabled = true`, no hook commands run. Configuration is loaded once
-at the start of each task; changes take effect on the next task.
+Loom supports synchronous command hooks with Codex-style matcher groups and JSON
+input/output. Configuration is workspace-local and snapshotted before each task.
+The agent receives built-in hook instructions and the active hook list automatically.
 
-```toml
-[hooks]
-enabled = true
-
-[[hooks.PreToolUse]]
-name = "protect-deletes"
-matcher = "change"
-command = "python3 scripts/hooks/protect_deletes.py"
-timeout_ms = 1000
-
-[[hooks.PostToolUse]]
-name = "whitespace-check"
-matcher = "change|run"
-command = "git diff --check"
-timeout_ms = 5000
-
-[[hooks.TaskEnd]]
-name = "result"
-command = "python3 scripts/hooks/result.py"
-timeout_ms = 1000
-```
-
-Create the referenced scripts in your project before enabling this example. On
-Windows, use `python` if that is the installed Python command. Existing MCP and
-web configuration can remain in the same file.
-
-## Events
-
-| Event | When | Failure behavior |
-| --- | --- | --- |
-| `TaskStart` | Once, after creating the isolated workspace and before the model runs | Stops startup; the task is unresolved |
-| `PreToolUse` | Before each matching available tool, including MCP tools | Blocks the tool and returns the reason to the model |
-| `PostToolUse` | After the tool returns, including a tool failure | Records the hook failure and tells the model the tool already ran; no automatic replay or rollback |
-| `TaskEnd` | Once when the turn produces its final task result, including errors and cancellation | Records a notification failure without changing the task's result status |
-
-Matching hooks run in configuration order. `matcher` defaults to `*`; tool hooks
-accept glob patterns or alternatives such as `change|run|mcp_*`. Names are exact
-and case-sensitive. Task events do not use tool matchers. Each hook needs a unique
-`name` within its event, a `command`, and an optional `timeout_ms` (default 10000,
-range 1–60000). At most 32 hooks can be configured per event.
-
-`TaskEnd` reports statuses such as `Answered`, `Unresolved`, `Cancelled`,
-`AwaitingApproval` or `Applied`. A later manual approval does not run the hook
-again. Hook commands execute directly through the runtime, without model calls
-or recursive tool hooks. A nonzero exit code blocks `TaskStart`/`PreToolUse`;
-timeouts, cancellation and launch failures also count as hook failures.
-
-## JSON input and output
-
-Every command receives JSON on stdin. Command source is never constructed from
-the prompt, tool arguments or tool output. For example:
+Create `.loom/hooks.json`:
 
 ```json
-{
-  "hook_event_name": "PreToolUse",
-  "task_id": "task-...",
-  "run_id": "...",
-  "worker_id": "main",
-  "workspace": "/path/to/project",
-  "cwd": "/path/to/isolated-workspace",
-  "sandbox": "WorkspaceWrite",
-  "network": false,
-  "tool_name": "change",
-  "tool_input": {"op": "delete", "target": "src/example.py"}
-}
+{"hooks":{"PreToolUse":[{"matcher":"^Bash$","hooks":[{
+  "type":"command","command":"python3 scripts/hooks/policy.py","timeout":10
+}]}]}}
 ```
 
-`PostToolUse` additionally receives `tool_response` and `tool_failed`. Task events
-receive `prompt`; `TaskEnd` also receives `status` and `summary`.
+Equivalent `.loom/config.toml`:
 
-An example `scripts/hooks/protect_deletes.py`:
-
-```python
-import json
-import sys
-
-event = json.load(sys.stdin.buffer)
-if event.get("tool_input", {}).get("op") in {"delete", "move"}:
-    print("File deletion and moves are disabled by protect-deletes.", file=sys.stderr)
-    sys.exit(2)
+```toml
+[[hooks.PreToolUse]]
+matcher = "^Bash$"
+[[hooks.PreToolUse.hooks]]
+type = "command"
+command = "python3 scripts/hooks/policy.py"
+timeout = 10
 ```
 
-An example `scripts/hooks/result.py`:
+Both files are combined, TOML first. `[hooks] enabled = false` in TOML disables
+all hooks. Flat named handlers and `TaskStart`/`TaskEnd` are rejected.
+Put scripts in ordinary project directories: isolated workspaces exclude `.loom`.
 
-```python
-import json
-import sys
+## Events and decisions
 
-event = json.load(sys.stdin.buffer)
-print(f"{event['task_id']}: {event['status']}")
+| Event | Timing | Exit 2 / blocking output |
+| --- | --- | --- |
+| SessionStart | Before the first submitted turn after loading a session; source `startup` or `resume` | Notification |
+| UserPromptSubmit | Before the main worker calls the model | Rejects the prompt |
+| PreToolUse | Before a real tool call | Prevents execution |
+| PostToolUse | After a real tool call, including failures | Sends feedback; never replays the tool |
+| Stop | Before a normal main-worker answer or finish completes | Requests another model step |
+| SubagentStart | Before a delegated worker starts | Notification |
+| SubagentStop | Before a delegated worker normally finishes | Requests another worker step |
+| PreCompact / PostCompact | Around worker compaction and automatic/manual conversation summary | Notification |
+| Interrupt | After a task is cancelled | Notification |
+| SessionEnd | Actual backend shutdown, once | Notification |
+
+Matchers are regular expressions. Missing, empty or `*` matches everything.
+Tool matchers accept Loom names and aliases: `run` → `Bash`, `agent` → `Agent`.
+Other tools keep their names and arguments; `change` is not Codex `apply_patch`.
+Session events match `source`/`reason`, subagent events match `agent_type`, and
+compaction events match `trigger`. Stop, prompt and interrupt ignore matchers.
+
+Commands receive one JSON object on stdin, including `hook_event_name`, `session_id`,
+`turn_id`, `cwd`, `worker_id`, `model`, `permission_mode`, `sandbox`, and `network`.
+Tool events include `tool_name`, `loom_tool_name`, `tool_input`, and `tool_use_id`;
+PostToolUse also includes `tool_response` and `tool_failed`.
+Lifecycle events include `prompt`, `source`, `reason`, `trigger`, `agent_id`,
+`agent_type`, or `last_assistant_message` as applicable. `transcript_path` is null.
+
+Exit 0 succeeds. Exit 2 uses stderr as explicit rejection/feedback for the events
+listed above. Other exit codes, invalid JSON, timeouts and launch failures are
+reported as hook failures without silently denying a tool. Output and artifacts
+remain available for diagnosis. Shell commands come only from configuration;
+tool arguments are JSON data on stdin, never interpolated into shell source.
+
+Stdout should contain one JSON object. SessionStart also accepts plain context.
+A policy can rewrite a command:
+
+```json
+{"hookSpecificOutput":{
+  "hookEventName":"PreToolUse",
+  "permissionDecision":"allow",
+  "updatedInput":{"command":"cargo test"},
+  "additionalContext":"Run project checks before reporting success."
+}}
 ```
 
-Stdout and stderr are recorded as artifacts, with at most 64 KiB from each stream.
-Successful output is not injected as model instructions. Failed blocking hooks
-return a short diagnostic to the model. Hook names, execution state and failures
-appear in the terminal/browser activity trace and saved task events.
+`permissionDecision: "deny"` with `permissionDecisionReason` blocks a tool.
+`updatedInput` requires `allow` and an object; subsequent hooks see updated arguments.
+An allow decision cannot grant sandbox or network permissions.
+`hookSpecificOutput.additionalContext` becomes model context.
 
-## Workspaces, permissions and stopping
+Stop/SubagentStop can return `{"decision":"block","reason":"Check the result"}`
+to continue. `stop_hook_active` identifies a continuation. Loom permits at most
+three continuations and still enforces task step/time limits.
+`continue: false` with `stopReason` ends the worker. PostToolUse blocking feedback
+replaces the model-visible result with a reminder that the tool already ran.
 
-Start and tool hooks run in the isolated working copy. Put scripts in ordinary
-project paths, such as `scripts/hooks/`; `.loom` is runtime metadata and its
-contents are not copied into the isolated workspace. Formatter changes become
-part of the proposal, refresh the code index, and pass normal validation and
-approval before affecting the real workspace.
+## Limits
 
-Hooks inherit the task's network and filesystem policy. Read-only tasks and
-scoped child workers execute hooks with read-only filesystem access. For
-formatting delegated changes, match the parent's `agent` tool instead of a
-child's `change` tool. Hooks cannot grant additional execution permissions.
-If Loom itself is already inside a macOS sandbox, a read-only hook is rejected
-when the runtime cannot enforce that narrower policy.
+Only synchronous `type: "command"` handlers are supported. PermissionRequest,
+async, MCP, prompt and agent handlers fail configuration explicitly.
+This is a supported subset of Codex hooks, not full compatibility.
 
-`TaskEnd` runs in the real workspace with read-only filesystem access, so a
-notification cannot invalidate a validated or applied result. It has one shared
-three-second budget across all matching end hooks, including on cancellation.
-Other hooks share the task deadline; stopping the task terminates running hook
-processes and their descendants. Set `enabled = false` to disable hooks on the
-next task.
+`timeout` uses integer seconds: 1–600, default 600. SessionEnd/Interrupt default
+to 1 second, at most 3, with a shared 3-second event budget. Task deadlines may
+shorten these limits. Cancellation terminates hook process groups.
+`additionalContextLimit` defaults to 2500; Loom bounds positive values to 16384
+approximate tokens (four characters each). Unlimited context is unsupported.
+Diagnostic streams are independently bounded to 64 KiB.
+
+Start/tool hooks use the isolated worker copy. Delegated lifecycle hooks and
+terminal notifications run read-only; they cannot change an applied result.
+Hooks never recursively invoke tool hooks. SessionEnd diagnostics are appended
+to `.loom/hooks-session-events.jsonl`. Configuration edits affect the next task.

@@ -1,0 +1,14 @@
+Loom command hooks (built-in runtime knowledge)
+
+Configure workspace `.loom/hooks.json` using Codex-style matcher groups:
+{"hooks":{"PreToolUse":[{"matcher":"^Bash$","hooks":[{"type":"command","command":"python3 scripts/hooks/policy.py","timeout":10}]}]}}
+Equivalent TOML lives in `.loom/config.toml`: [[hooks.PreToolUse]], matcher="^Bash$", then [[hooks.PreToolUse.hooks]], type="command", command="...", timeout=10.
+Matchers in nested groups are regex; missing, empty or * matches all. Native run is exposed as Bash; agent as Agent. Other tools retain their native names and arguments; change is not Codex apply_patch. Preserve existing configuration. Never enable, disable or bypass hooks without the user's request.
+
+Supported synchronous command events: SessionStart, SessionEnd, UserPromptSubmit, PreToolUse, PostToolUse, Stop, Interrupt, SubagentStart, SubagentStop, PreCompact, PostCompact (worker compaction and automatic/manual conversation summaries). SessionStart runs before the first submitted turn (startup/resume); SessionEnd runs at actual backend shutdown, never after each turn. Old flat hooks and TaskStart/TaskEnd are rejected.
+
+Commands receive one JSON object on stdin: hook_event_name, session_id, turn_id, cwd, worker_id, model, permission_mode, plus Loom run_id/task_id/workspace/sandbox/network. transcript_path is null; no stable transcript format is promised. Tool events include tool_name/tool_input/tool_use_id; PostToolUse includes tool_response/tool_failed. Lifecycle events add prompt, source, trigger, agent_id/agent_type or last_assistant_message as appropriate.
+
+Compatible handlers: exit 0 succeeds; exit 2 with stderr explicitly blocks PreToolUse/UserPromptSubmit, supplies PostToolUse feedback, or requests Stop/SubagentStop continuation. Other failures are reported, not interpreted as denial. Stdout must be a JSON object (SessionStart also accepts plain context). hookSpecificOutput supports hookEventName and additionalContext. PreToolUse permissionDecision="deny" blocks, or "allow" with object updatedInput rewrites arguments. PostToolUse decision="block" or continue=false replaces model-visible feedback; the real tool already ran and must never be replayed automatically. Stop/SubagentStop decision="block" requests another model step, bounded by task limits; continue=false stops. Hook commands never recursively trigger hooks.
+
+Unsupported PermissionRequest, async, MCP/prompt/agent handlers fail configuration explicitly. Hooks cannot grant execution permissions. additionalContextLimit must be positive and is bounded by Loom; output artifacts retain diagnostics. Config is snapshotted per task; edits apply to the next task. Start/tool hooks run in the isolated copy; put scripts in ordinary project paths, not .loom metadata. Scoped child hooks are read-only. Terminal notification hooks have a shared three-second budget and cannot alter an applied result.

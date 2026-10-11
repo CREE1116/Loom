@@ -1298,10 +1298,12 @@ fn configured_pre_tool_hook_blocks_the_real_tool_and_reports_the_reason() {
 [hooks]
 enabled = true
 [[hooks.PreToolUse]]
+matcher = "^find$"
+[[hooks.PreToolUse.hooks]]
 name = "deny-find"
-matcher = "find"
-command = "echo blocked-by-hook && exit 2"
-timeout_ms = 1000
+type = "command"
+command = "echo blocked-by-hook >&2 && exit 2"
+timeout = 1
 "#).unwrap();
     let mut core = Core::open(d.path()).unwrap();
     let model = ScriptedModel::new([
@@ -1311,6 +1313,9 @@ timeout_ms = 1000
     let events = Mutex::new(Vec::new());
     let task = core.execute("inspect alpha", Intent::Inspect, options(), &model, cancel(), &|event| events.lock().unwrap().push(event)).unwrap();
     assert_eq!(task.status, Status::Unresolved);
+    let system = model.requests()[0].system.clone().unwrap();
+    assert!(system.contains("Loom command hooks") && system.contains("PreToolUse / deny-find"));
+    assert!(system.contains("next task") && system.contains("without the user's request"));
     assert!(model.requests()[1].messages.iter().flat_map(|m| &m.parts).any(|part|
         matches!(part, Part::ToolResult {output, is_error: true, ..} if output.contains("blocked-by-hook"))));
     assert!(events.into_inner().unwrap().iter().any(|event| event.detail["hook_event"] == "PreToolUse" && event.failed));
@@ -1325,9 +1330,11 @@ fn post_tool_hook_edits_are_isolated_indexed_and_failures_do_not_replay_the_tool
 [hooks]
 enabled = true
 [[hooks.PostToolUse]]
+matcher = "^Bash$"
+[[hooks.PostToolUse.hooks]]
 name = "format"
-matcher = "run"
-command = "printf 'pub fn formatted() -> u32 { 3 }\n' > src/a.rs; echo format-warning; exit 2"
+type = "command"
+command = "printf 'pub fn formatted() -> u32 { 3 }\n' > src/a.rs; echo format-warning >&2; exit 2"
 "#).unwrap();
     let mut core = Core::open(d.path()).unwrap();
     let model = ScriptedModel::new([
@@ -1341,7 +1348,7 @@ command = "printf 'pub fn formatted() -> u32 { 3 }\n' > src/a.rs; echo format-wa
     assert!(fs::read_to_string(d.path().join("src/a.rs")).unwrap().contains("alpha"));
     assert!(task.patch.files.iter().any(|file| file.path == PathBuf::from("src/a.rs")));
     assert!(model.requests()[1].messages.iter().flat_map(|m| &m.parts).any(|part|
-        matches!(part, Part::ToolResult {output, is_error: false, ..} if output.starts_with("\nPostToolUse hook failed") && output.contains("do not replay") && output.contains("format-warning"))));
+        matches!(part, Part::ToolResult {output, is_error: false, ..} if output.starts_with("PostToolUse feedback") && output.contains("do not replay") && output.contains("format-warning"))));
     assert!(model.requests()[2].messages.iter().flat_map(|m| &m.parts).any(|part|
         matches!(part, Part::ToolResult {output, ..} if output.contains("formatted"))));
     assert_eq!(events.into_inner().unwrap().iter().filter(|event| event.detail["tool"] == "run" && event.detail["started"] == true).count(), 1);
@@ -1349,20 +1356,13 @@ command = "printf 'pub fn formatted() -> u32 { 3 }\n' > src/a.rs; echo format-wa
 
 #[cfg(unix)]
 #[test]
-fn failed_start_hook_skips_the_model_but_end_hook_receives_the_final_result_once() {
+fn prompt_denial_skips_model_and_session_end_runs_only_on_shutdown() {
     use loom_core::base::{ArtifactStore, FileArtifactStore};
     let d = repo();
-    fs::create_dir_all(d.path().join(".loom")).unwrap();
-    fs::write(d.path().join(".loom/config.toml"), r#"
-[hooks]
-enabled = true
-[[hooks.TaskStart]]
-name = "startup"
-command = "echo startup-denied; exit 2"
-[[hooks.TaskEnd]]
-name = "notify"
-command = "cat"
-"#).unwrap();
+    compatible_config(d.path(), json!({
+        "UserPromptSubmit":[{"hooks":[{"type":"command","command":"echo startup-denied >&2; exit 2"}]}],
+        "SessionEnd":[{"hooks":[{"type":"command","command":"cat"}]}]
+    }));
     let mut core = Core::open(d.path()).unwrap();
     let model = ScriptedModel::new([]);
     let events = Mutex::new(Vec::new());
@@ -1370,44 +1370,112 @@ command = "cat"
     assert_eq!(task.status, Status::Unresolved);
     assert!(task.summary.contains("startup-denied"));
     assert!(model.requests().is_empty());
-    let events = events.into_inner().unwrap();
-    let ends: Vec<_> = events.iter().filter(|event| event.detail["hook_event"] == "TaskEnd" && event.detail["completed"] == true).collect();
-    assert_eq!(ends.len(), 1);
-    assert!(!ends[0].failed);
-    let reference = serde_json::from_value(ends[0].detail["result"]["artifact"].clone()).unwrap();
+    assert!(!events.into_inner().unwrap().iter().any(|event| event.detail["hook_event"] == "SessionEnd"));
+    loom_core::hooks::Hooks::end_session(d.path(), "stable-session", options().policy).unwrap();
+    let text = fs::read_to_string(d.path().join(".loom/hooks-session-events.jsonl")).unwrap();
+    let events:Vec<Value> = text.lines().map(|line|serde_json::from_str(line).unwrap()).collect();
+    let ends:Vec<_> = events.iter().filter(|event|event["detail"]["completed"] == true).collect();
+    assert_eq!(ends.len(),1);
+    let reference = serde_json::from_value(ends[0]["detail"]["result"]["artifact"].clone()).unwrap();
     let bytes = FileArtifactStore::open(d.path()).unwrap().get(&reference, None).unwrap();
     let output = String::from_utf8(bytes).unwrap();
-    assert!(output.contains(&task.id) && output.contains("Unresolved") && output.contains("startup-denied"));
+    assert!(output.contains("stable-session") && output.contains("SessionEnd") && output.contains("other"));
 }
 
 #[cfg(unix)]
 #[test]
-fn end_hook_runs_on_cancellation_but_cannot_modify_the_real_workspace() {
+fn interrupt_runs_on_cancellation_but_cannot_modify_the_real_workspace() {
     let d = repo();
-    fs::create_dir_all(d.path().join(".loom")).unwrap();
-    fs::write(d.path().join(".loom/config.toml"), r#"
-[hooks]
-enabled = true
-[[hooks.TaskStart]]
-name = "startup"
-command = "echo start"
-[[hooks.TaskEnd]]
-name = "notify"
-command = "echo CHANGED > src/a.rs"
-"#).unwrap();
+    compatible_config(d.path(),json!({
+        "UserPromptSubmit":[{"hooks":[{"type":"command","command":"echo '{}'"}]}],
+        "Interrupt":[{"hooks":[{"type":"command","command":"echo CHANGED > src/a.rs"}]}]
+    }));
     let mut core = Core::open(d.path()).unwrap();
     let model = ScriptedModel::new([]);
     let flag = cancel();
     let events = Mutex::new(Vec::new());
     let task = core.execute("inspect alpha", Intent::Inspect, options(), &model, flag.clone(), &|event| {
-        if event.detail["hook_event"] == "TaskStart" && event.detail["completed"] == true {
+        if event.detail["hook_event"] == "UserPromptSubmit" && event.detail["completed"] == true {
             flag.store(true, std::sync::atomic::Ordering::Release);
         }
         events.lock().unwrap().push(event);
     }).unwrap();
     assert_eq!(task.status, Status::Cancelled);
-    assert!(task.summary.contains("TaskEnd notification failed"));
     assert!(fs::read_to_string(d.path().join("src/a.rs")).unwrap().contains("alpha"));
-    assert!(events.into_inner().unwrap().iter().any(|event| event.detail["hook_event"] == "TaskEnd" && event.failed));
+    assert!(events.into_inner().unwrap().iter().any(|event| event.detail["hook_event"] == "Interrupt" && event.failed));
     assert!(model.requests().is_empty());
+}
+
+#[cfg(unix)]
+fn compatible_config(root: &std::path::Path, hooks: Value) {
+    fs::create_dir_all(root.join(".loom")).unwrap();
+    fs::write(root.join(".loom/hooks.json"), json!({"hooks":hooks}).to_string()).unwrap();
+}
+#[cfg(unix)]
+fn hook_json(output: Value) -> String { format!("printf '%s' '{}'",output.to_string().replace('\'', "'\\''")) }
+#[cfg(unix)]
+fn answer(text: &str) -> Response {
+    Response {parts:vec![Part::Text(text.into())],stop:Stop::EndTurn,..response(vec![])}
+}
+#[cfg(unix)]
+#[test]
+fn compatible_pre_hook_rewrites_real_command_and_adds_model_context() {
+    let d=repo();
+    compatible_config(d.path(),json!({"PreToolUse":[{"matcher":"^Bash$","hooks":[{"type":"command","command":hook_json(json!({"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"allow","updatedInput":{"command":"printf safe-output"},"additionalContext":"hook-policy-context"}}))}]}]}));
+    let model=ScriptedModel::new([response(vec![("run",json!({"command":"touch must-not-run"}))]),answer("done")]);
+    let mut core=Core::open(d.path()).unwrap();
+    let events=Mutex::new(Vec::new());
+    let task=core.execute("run command",Intent::Auto,options(),&model,cancel(),&|event|events.lock().unwrap().push(event)).unwrap();
+    assert_eq!(task.status,Status::Answered);
+    assert!(model.requests()[1].system.as_ref().unwrap().contains("hook-policy-context"));
+    assert!(model.requests()[1].messages.iter().flat_map(|m|&m.parts).any(|p|matches!(p,Part::ToolResult {output,..} if output.contains("safe-output"))));
+    assert!(events.into_inner().unwrap().iter().any(|e|e.detail["tool"]=="run" && e.detail["args"]["command"]=="printf safe-output"));
+    assert!(!d.path().join("must-not-run").exists());
+}
+#[cfg(unix)]
+#[test]
+fn compatible_prompt_denial_never_calls_model_and_post_feedback_never_replays_tools() {
+    let d=repo();
+    compatible_config(d.path(),json!({"UserPromptSubmit":[{"hooks":[{"type":"command","command":hook_json(json!({"decision":"block","reason":"prompt denied"}))}]}]}));
+    let model=ScriptedModel::new([]);
+    let mut core=Core::open(d.path()).unwrap();
+    let task=core.execute("blocked",Intent::Auto,options(),&model,cancel(),&|_|{}).unwrap();
+    assert_eq!(task.status,Status::Unresolved);
+    assert!(task.summary.contains("prompt denied") && model.requests().is_empty());
+    compatible_config(d.path(),json!({"PostToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":hook_json(json!({"decision":"block","reason":"checked feedback"}))}]}]}));
+    let model=ScriptedModel::new([response(vec![("run",json!({"command":"printf original-result"}))]),answer("reviewed")]);
+    let events=Mutex::new(Vec::new());
+    let task=core.execute("inspect",Intent::Auto,options(),&model,cancel(),&|e|events.lock().unwrap().push(e)).unwrap();
+    assert_eq!(task.status,Status::Answered);
+    assert!(model.requests()[1].messages.iter().flat_map(|m|&m.parts).any(|p|matches!(p,Part::ToolResult {output,is_error:false,..} if output.contains("checked feedback") && !output.contains("original-result"))));
+    assert_eq!(events.into_inner().unwrap().iter().filter(|e|e.detail["tool"]=="run" && e.detail["started"]==true).count(),1);
+}
+#[cfg(unix)]
+#[test]
+fn compatible_stop_requests_bounded_continuation_and_session_start_context_is_real() {
+    let d=repo();
+    let stop=r#"input=$(cat); case "$input" in *'"stop_hook_active":false'*) printf '%s' '{"decision":"block","reason":"perform another check"}';; *) printf '{}';; esac"#;
+    compatible_config(d.path(),json!({"Stop":[{"hooks":[{"type":"command","command":stop}]}],"SessionStart":[{"matcher":"^resume$","hooks":[{"type":"command","command":"printf session-knowledge"}]}]}));
+    let mut options=options(); options.session_id=Some("stable-session".into()); options.session_start=Some("resume".into());
+    let model=ScriptedModel::new([answer("first answer"),answer("checked answer")]);
+    let events=Mutex::new(Vec::new());
+    let task=Core::open(d.path()).unwrap().execute("inspect",Intent::Inspect,options,&model,cancel(),&|e|events.lock().unwrap().push(e)).unwrap();
+    assert_eq!(task.status,Status::Inspected);
+    assert_eq!(task.summary,"checked answer");
+    assert_eq!(model.requests().len(),2);
+    assert!(model.requests()[0].system.as_ref().unwrap().contains("session-knowledge"));
+    assert!(model.requests()[1].messages.iter().any(|m|m.text().contains("perform another check")));
+    assert_eq!(events.into_inner().unwrap().iter().filter(|e|e.detail["hook_event"]=="SessionStart" && e.detail["started"]==true).count(),1);
+}
+
+#[cfg(unix)]
+#[test]
+fn stop_hook_cannot_continue_forever() {
+    let d=repo();
+    compatible_config(d.path(),json!({"Stop":[{"hooks":[{"type":"command","command":hook_json(json!({"decision":"block","reason":"keep checking"}))}]}]}));
+    let model=ScriptedModel::new([answer("one"),answer("two"),answer("three"),answer("four")]);
+    let task=Core::open(d.path()).unwrap().execute("inspect",Intent::Inspect,options(),&model,cancel(),&|_|{}).unwrap();
+    assert_eq!(model.requests().len(),4);
+    assert_eq!(task.status,Status::Unresolved);
+    assert!(task.summary.contains("continuation limit"));
 }

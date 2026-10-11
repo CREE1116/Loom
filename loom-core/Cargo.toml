@@ -21,6 +21,7 @@ fs2 = "0.4"
 libc = "0.2"
 getrandom = "0.2"
 globset = "0.4"
+regex = "1"
 # Windows: plain paths for tools (git) that do not accept `\\?\` verbatim paths.
 dunce = "1"
 jsonwebtoken = "9"

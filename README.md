@@ -142,7 +142,7 @@ does the same on demand.
 ## Hooks
 
 Native command hooks can validate or block tool calls, run checks or formatters
-after tools, and report task start/end. They are opt-in through `[hooks]` in
+after tools, and handle session, prompt, stop, subagent and compaction events. Configure Codex-style command groups in `.loom/hooks.json` or `[hooks]` in
 `.loom/config.toml`, use JSON stdin, and follow the task's execution policy.
 See [hook configuration and examples](docs/hooks.md).
 

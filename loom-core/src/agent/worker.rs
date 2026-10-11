@@ -98,10 +98,12 @@ impl<'a> Shared<'a> {
     pub fn remaining(&self) -> Duration {
         Duration::from_secs(self.options.seconds).saturating_sub(self.started.elapsed())
     }
-    pub fn run_hooks(&self, event: crate::hooks::HookEvent, id: &str, overlay: &Overlay, mut input: Value, policy: crate::effects::ExecutionPolicy) -> Result<()> {
+    pub fn run_hooks(&self, event: crate::hooks::HookEvent, id: &str, overlay: &Overlay, mut input: Value, policy: crate::effects::ExecutionPolicy) -> Result<crate::hooks::HookOutcome> {
         input["run_id"] = json!(self.run_id);
         input["task_id"] = json!(self.task_id);
         input["workspace"] = json!(self.root);
+        input["session_id"] = json!(self.options.session_id.as_deref().unwrap_or(&self.run_id));
+        input["model"] = json!(self.options.model.as_deref().unwrap_or("auto"));
         self.hooks.run(crate::hooks::Invocation {
             event, worker: id, directory: overlay.dir(), input, policy,
             cancel: &self.cancel, remaining: self.worker_time(), observe: &|event| self.emit(event),
@@ -280,6 +282,7 @@ impl<'a> Shared<'a> {
 
 fn guidance(shared: &Shared<'_>, id: &str, goal: &str, instructions: &mut Instructions) -> Result<String> {
     let mut guidance = instructions.root_guidance()?;
+    guidance.push_str(&shared.hooks.guidance());
     // Skills: the main worker sees them; delegated children get their goal only.
     if id == "main" {
         guidance.push_str(&crate::instructions::skill_guidance(shared.root, goal, &shared.options.skills, "load each relevant skill with use_skill before following it")?);
@@ -314,7 +317,23 @@ pub fn run(
         || scope.as_ref().is_some_and(|s| s.is_empty());
     let child = scope.is_some();
     let mut instructions = Instructions::open(shared.root)?;
-    let guidance = guidance(shared, id, goal, &mut instructions)?;
+    let mut guidance = guidance(shared, id, goal, &mut instructions)?;
+    let mut lifecycle_policy = shared.options.policy;
+    if readonly || child { lifecycle_policy.sandbox = SandboxMode::ReadOnly; }
+    use crate::hooks::HookEvent;
+    let mut startup_events = Vec::new();
+    if child { startup_events.push((HookEvent::SubagentStart, json!({"agent_id":id,"agent_type":"worker","prompt":goal}))); }
+    else if !shared.options.inquiry {
+        if let Some(source) = &shared.options.session_start { startup_events.push((HookEvent::SessionStart,json!({"source":source}))); }
+        startup_events.push((HookEvent::UserPromptSubmit,json!({"prompt":goal})));
+    }
+    let mut startup_context = Vec::new();
+    for (event, input) in startup_events {
+        let outcome = shared.run_hooks(event,id,overlay,input,lifecycle_policy)?;
+        if let Some(reason) = outcome.halt { anyhow::bail!("{reason}"); }
+        startup_context.extend(outcome.context);
+    }
+    if !startup_context.is_empty() {guidance.push_str(&format!("\nHook context:\n{}",tools::clip(&startup_context.join("\n"),16000)));}
     shared.emit(Event::new(
         id,
         Stage::Direct,
@@ -424,6 +443,8 @@ pub fn run(
     let mut connection = None;
     let mut exploring = 0usize;
     let mut last_call = Duration::ZERO;
+    let mut stop_continuations = 0usize;
+    let mut hook_context = Vec::<String>::new();
     while !shared.stopped() {
         // Near a configured limit, ask for the answer instead of letting the next tool
         // call run out the budget and lose everything gathered so far.
@@ -446,7 +467,8 @@ pub fn run(
         let mut request = Request {
             model: shared.options.model.clone().unwrap_or_default(),
             system: Some(format!(
-                "{system}\nCurrent role: {}{}",
+                "{system}\nHook context:\n{}\nCurrent role: {}{}",
+                tools::clip(&hook_context.join("\n"),16000),
                 if host.orchestrating {
                     "orchestration; coordinate the DAG and its blockers"
                 } else if shared.options.inquiry {
@@ -506,6 +528,17 @@ pub fn run(
                 && !pending_failure
             {
                 summary = crate::agent::conversation::without_receipts(&response.text());
+                let outcome = stop_hooks(shared,id,host.overlay,&summary,stop_continuations > 0,child,lifecycle_policy)?;
+                hook_context.extend(outcome.context);
+                if let Some(reason) = outcome.halt { summary=reason; complete=false; break; }
+                if outcome.continue_work {
+                    if stop_continuations >= 3 { summary="Stop hook continuation limit reached".into(); break; }
+                    stop_continuations += 1;
+                    messages.push(Message {role:Role::Assistant,parts:response.parts});
+                    messages.push(Message::user(outcome.feedback.unwrap_or_else(|| "Continue as requested by the Stop hook.".into())));
+                    if lifecycle_policy.sandbox != SandboxMode::ReadOnly {host.refresh(&shared.cancel)?;}
+                    continue;
+                }
                 complete = true;
                 break;
             }
@@ -544,7 +577,7 @@ pub fn run(
         let mut results = Vec::new();
         let mut evidence = Vec::new();
         let mut failed = false;
-        for (cid, name, args) in calls {
+        for (cid, name, mut args) in calls {
             if shared.stopped() {
                 summary = "cancelled or deadline reached".into();
                 break;
@@ -556,24 +589,22 @@ pub fn run(
                 "agent" => Stage::Orchestrating,
                 _ => Stage::Run,
             };
-            let target = args["target"]
-                .as_str()
-                .or(args["query"].as_str())
-                .or(args["command"].as_str())
-                .unwrap_or(&name)
-                .to_owned();
             let available = request.tools.iter().any(|tool| tool.name == name);
-            let mut hook_policy = shared.options.policy;
-            if readonly || child { hook_policy.sandbox = SandboxMode::ReadOnly; }
-            let pre_hook = if available && shared.hooks.has(crate::hooks::HookEvent::PreToolUse, &name) {
-                shared.run_hooks(crate::hooks::HookEvent::PreToolUse, id, host.overlay,
-                    json!({"tool_name":name, "tool_input":args}), hook_policy)
-                    .and_then(|_| {
+            let hook_policy = lifecycle_policy;
+            let pre_hook = if available && shared.hooks.has(HookEvent::PreToolUse, &name) {
+                shared.run_hooks(HookEvent::PreToolUse, id, host.overlay,
+                    json!({"tool_name":name, "tool_input":args,"tool_use_id":cid}), hook_policy)
+                    .and_then(|outcome| {
+                        if let Some(reason) = outcome.halt { anyhow::bail!("{reason}"); }
+                        if let Some(updated) = outcome.updated_input { args = updated; }
+                        hook_context.extend(outcome.context);
                         if hook_policy.sandbox != SandboxMode::ReadOnly { host.refresh(&shared.cancel)?; }
                         Ok(())
                     })
             } else { Ok(()) };
             let allowed = available && pre_hook.is_ok();
+            let target = args["target"].as_str().or(args["query"].as_str())
+                .or(args["command"].as_str()).unwrap_or(&name).to_owned();
             shared.emit(Event::new(
                 id,
                 stage,
@@ -669,14 +700,18 @@ pub fn run(
             );
             event.failed = error;
             shared.emit(event);
-            let post_warning = if allowed && shared.hooks.has(crate::hooks::HookEvent::PostToolUse, &name) {
-                let warning = shared.run_hooks(crate::hooks::HookEvent::PostToolUse, id, host.overlay,
-                    json!({"tool_name":name, "tool_input":args, "tool_response":value, "tool_failed":error}), hook_policy).err();
+            let mut post_feedback = None;
+            let post_warning = if allowed && shared.hooks.has(HookEvent::PostToolUse, &name) {
+                let result = shared.run_hooks(HookEvent::PostToolUse, id, host.overlay,
+                    json!({"tool_name":name,"tool_input":args,"tool_use_id":cid,"tool_response":value,"tool_failed":error}),hook_policy);
                 if hook_policy.sandbox != SandboxMode::ReadOnly { host.refresh(&shared.cancel)?; }
-                warning.map(|error| format!("\nPostToolUse hook failed; the tool already ran, do not replay it: {error}"))
+                match result {
+                    Ok(outcome) => {hook_context.extend(outcome.context); post_feedback=outcome.feedback; None}
+                    Err(error) => Some(format!("\nPostToolUse hook failed; the tool already ran, do not replay it: {error}")),
+                }
             } else { None };
             evidence.push(repetition_output(&name, &value));
-            let output = value.to_string();
+            let output = post_feedback.map(|feedback| format!("PostToolUse feedback (tool already ran; do not replay): {feedback}")).unwrap_or_else(|| value.to_string());
             let output = post_warning.map(|warning| format!("{warning}\n{output}")).unwrap_or(output);
             results.push(Part::ToolResult {
                 call_id: cid,
@@ -728,11 +763,28 @@ pub fn run(
             parts: results,
         });
         if finished {
+            let outcome = stop_hooks(shared,id,host.overlay,&summary,stop_continuations > 0,child,lifecycle_policy)?;
+            hook_context.extend(outcome.context);
+            if let Some(reason) = outcome.halt {summary=reason; complete=false; break;}
+            if outcome.continue_work {
+                if stop_continuations >= 3 {summary="Stop hook continuation limit reached".into(); complete=false; break;}
+                stop_continuations += 1;
+                finished=false; complete=false;
+                messages.push(Message::user(outcome.feedback.unwrap_or_else(|| "Continue as requested by the Stop hook.".into())));
+                if lifecycle_policy.sandbox != SandboxMode::ReadOnly {host.refresh(&shared.cancel)?;}
+                continue;
+            }
             break;
         }
         if repeated >= 4 {
             summary = "repeated identical operations on unchanged revision".into();
             break;
+        }
+        let needs_compact = messages.len() > 5 && messages.iter().map(|m| m.text().len()+serde_json::to_vec(&m.parts).map_or(0,|b|b.len())).sum::<usize>() > shared.options.context_bytes;
+        if needs_compact {
+            let outcome = shared.run_hooks(HookEvent::PreCompact,id,host.overlay,json!({"trigger":"auto"}),lifecycle_policy)?;
+            if let Some(reason)=outcome.halt {summary=reason; break;}
+            hook_context.extend(outcome.context);
         }
         let mut compacted = false;
         // Keep the immutable goal and newest complete exchanges, preserving raw trace on disk.
@@ -752,6 +804,9 @@ pub fn run(
             }
         }
         if compacted {
+            let outcome=shared.run_hooks(HookEvent::PostCompact,id,host.overlay,json!({"trigger":"auto"}),lifecycle_policy)?;
+            if let Some(reason)=outcome.halt {summary=reason; break;}
+            hook_context.extend(outcome.context);
             let evidence = compact_receipts
                 .iter()
                 .rev()
@@ -784,6 +839,11 @@ pub fn run(
         complete,
         delegated,
     })
+}
+
+fn stop_hooks(shared: &Shared<'_>, id: &str, overlay: &Overlay, summary: &str, active: bool, child: bool, policy: crate::effects::ExecutionPolicy) -> Result<crate::hooks::HookOutcome> {
+    shared.run_hooks(if child {crate::hooks::HookEvent::SubagentStop} else {crate::hooks::HookEvent::Stop},id,overlay,
+        json!({"last_assistant_message":summary,"stop_hook_active":active,"agent_id":id,"agent_type":"worker"}),policy)
 }
 
 fn fit_context(request: &mut Request, mut goal_index: usize, limit: u64) {

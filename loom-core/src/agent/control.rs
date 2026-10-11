@@ -31,26 +31,23 @@ pub enum Intent {
     Edit,
 }
 
-// End notifications cannot rewrite a validated/applied proposal. They still run
-// on cancellation, with one bounded three-second budget for the whole event.
+// Interrupt notifications run after cancellation with a fresh, bounded token.
 fn finish_hooks(shared: &Shared<'_>, task: &mut Task) {
     use crate::hooks::{HookEvent, Invocation};
-    if !shared.hooks.has(HookEvent::TaskEnd, "") { return; }
+    if task.status != Status::Cancelled || !shared.hooks.has(HookEvent::Interrupt, "") { return; }
     let result = (|| -> Result<()> {
         let artifacts = FileArtifactStore::open(shared.root)?;
         let mut policy = task.policy;
         policy.sandbox = crate::effects::SandboxMode::ReadOnly;
         shared.hooks.run(Invocation {
-            event: HookEvent::TaskEnd, worker: "main", directory: shared.root,
-            input: json!({"run_id":shared.run_id, "task_id":task.id, "workspace":shared.root,
-                "prompt":task.goal, "status":task.status, "summary":task.summary}),
-            policy, cancel: &AtomicBool::new(false), remaining: Duration::from_secs(3),
-            observe: &|event| shared.emit(event),
-        }, &artifacts)?;
+            event:HookEvent::Interrupt, worker:"main", directory:shared.root,
+            input:json!({"session_id":shared.options.session_id.as_deref().unwrap_or(&shared.run_id),"model":shared.options.model,"run_id":shared.run_id,"task_id":task.id,"workspace":shared.root,"prompt":task.goal,"status":task.status,"summary":task.summary}),
+            policy,cancel:&AtomicBool::new(false),remaining:Duration::from_secs(3),observe:&|event|shared.emit(event),
+        },&artifacts)?;
         shared.flush()
     })();
     if let Err(error) = result {
-        task.summary.push_str(&format!("\nTaskEnd notification failed: {error}"));
+        task.summary.push_str(&format!("\nInterrupt notification failed: {error}"));
         let _ = shared.flush();
     }
     task.elapsed_ms = shared.started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
@@ -292,19 +289,10 @@ impl Core {
             goal,
             json!({}),
         ));
-        let mut hook_policy = options.policy;
-        if options.read_only { hook_policy.sandbox = crate::effects::SandboxMode::ReadOnly; }
-        let start = if shared.hooks.has(crate::hooks::HookEvent::TaskStart, "") {
-            shared.run_hooks(crate::hooks::HookEvent::TaskStart, "main", &overlay, json!({"prompt":goal}), hook_policy)
-        } else { Ok(()) };
-        let result = start.and_then(|_| worker::run(
-            &shared,
-            "main",
-            goal,
-            &mut overlay,
-            options.inquiry.then(Default::default),
-            options.plan,
-        ));
+        let result = worker::run(
+            &shared, "main", goal, &mut overlay,
+            options.inquiry.then(Default::default), options.plan,
+        );
         let complete = match result {
             Ok(proposal) => {
                 task.summary = proposal.summary;
@@ -431,7 +419,7 @@ impl Core {
                         blocked.summary.push_str(&format!("\nAutomatic apply blocked: {error}"));
                         self.save(&blocked)?;
                     }
-                    if shared.hooks.has(crate::hooks::HookEvent::TaskEnd, "") {
+                    if shared.hooks.has(crate::hooks::HookEvent::Interrupt, "") {
                         finish_hooks(&shared, &mut blocked);
                         self.save(&blocked)?;
                     }
@@ -439,7 +427,7 @@ impl Core {
                 }
             };
         }
-        if shared.hooks.has(crate::hooks::HookEvent::TaskEnd, "") {
+        if shared.hooks.has(crate::hooks::HookEvent::Interrupt, "") {
             finish_hooks(&shared, &mut task);
             self.save(&task)?;
         }

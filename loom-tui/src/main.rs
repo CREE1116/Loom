@@ -172,6 +172,8 @@ fn main() -> Result<()> {
         };
         let settings = Settings {
             plan: false,
+            hook_session_id: None,
+            hook_session_start: None,
             input_control: Default::default(),
                 history: vec![],
                 skills: vec![],
@@ -386,6 +388,8 @@ fn main() -> Result<()> {
                 args.script.as_deref(),
                 loom_tui::backend::version_core::Settings {
                     plan: false,
+                    hook_session_id: None,
+                    hook_session_start: None,
                     input_control: Default::default(),
                 history: vec![],
                 skills: vec![],

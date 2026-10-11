@@ -27,6 +27,8 @@ impl Version {
 }
 #[derive(Clone)]
 pub struct Settings {
+    pub hook_session_id: Option<String>,
+    pub hook_session_start: Option<String>,
     pub model: String,
     pub readonly: bool,
     pub review_model: String,
@@ -54,6 +56,8 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Self {
+            hook_session_id: None,
+            hook_session_start: None,
             model: "auto".into(),
             readonly: false,
             review_model: "auto".into(),
@@ -490,6 +494,8 @@ pub fn execute_with_index(
             Intent::Answer | Intent::Auto => loom_core::agent::Intent::Auto,
         },
         loom_core::agent::Options {
+            session_id: settings.hook_session_id.clone(),
+            session_start: settings.hook_session_start.clone(),
             history: settings.history.clone(),
             plan: settings.plan,
             read_only: settings.readonly,
