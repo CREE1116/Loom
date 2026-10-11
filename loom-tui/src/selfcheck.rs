@@ -2990,8 +2990,33 @@ fn skill_mentions(report: &mut Report) {
     report.dump(S, &canvas);
 }
 
+fn hooks_progress(report: &mut Report) {
+    const S: &str = "hook execution progress";
+    use loom_core::agent::events::{Event, Stage};
+    let mut projection = crate::backend::v5_projection::Projection::default();
+    let mut app = App::new(false);
+    app.busy = true;
+    projection.observe(&Event::new("main", Stage::Run, "hook · PreToolUse · validate", serde_json::json!({
+        "tool":"hook", "name":"validate", "hook_event":"PreToolUse", "started":true
+    })));
+    for entry in projection.entries("turn", false) { app.upsert_entry(entry); }
+    let canvas = app.render(80, 32);
+    report.check(S, "훅 실행 중 상태와 이름 표시", screen_text(&canvas).contains("훅 실행 중 · validate"), screen_text(&canvas));
+    report.dump(S, &canvas);
+    let mut event = Event::new("main", Stage::Run, "hook · PreToolUse · validate", serde_json::json!({
+        "tool":"hook", "name":"validate", "hook_event":"PreToolUse", "completed":true, "error":"blocked by validation"
+    }));
+    event.failed = true;
+    projection.observe(&event);
+    for entry in projection.entries("turn", false) { app.upsert_entry(entry); }
+    let canvas = app.render(80, 32);
+    report.check(S, "훅 실패 상태 표시", screen_text(&canvas).contains("훅 실패 · validate"), screen_text(&canvas));
+    report.dump(S, &canvas);
+}
+
 pub fn run() -> Report {
     let mut report = Report::default();
+    hooks_progress(&mut report);
     skill_mentions(&mut report);
     searchable_commands(&mut report);
     session_exit_notice(&mut report);

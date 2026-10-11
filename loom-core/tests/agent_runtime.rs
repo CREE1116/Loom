@@ -1289,3 +1289,125 @@ fn standalone_python_gets_independent_syntax_validation() {
         assert!(!d.path().join(target).exists(), "validation must keep the proposal isolated");
     }
 }
+
+#[test]
+fn configured_pre_tool_hook_blocks_the_real_tool_and_reports_the_reason() {
+    let d = repo();
+    fs::create_dir_all(d.path().join(".loom")).unwrap();
+    fs::write(d.path().join(".loom/config.toml"), r#"
+[hooks]
+enabled = true
+[[hooks.PreToolUse]]
+name = "deny-find"
+matcher = "find"
+command = "echo blocked-by-hook && exit 2"
+timeout_ms = 1000
+"#).unwrap();
+    let mut core = Core::open(d.path()).unwrap();
+    let model = ScriptedModel::new([
+        response(vec![("find", json!({"query":"alpha"}))]),
+        response(vec![("finish", json!({"summary":"hook denied the operation", "unresolved":true}))]),
+    ]);
+    let events = Mutex::new(Vec::new());
+    let task = core.execute("inspect alpha", Intent::Inspect, options(), &model, cancel(), &|event| events.lock().unwrap().push(event)).unwrap();
+    assert_eq!(task.status, Status::Unresolved);
+    assert!(model.requests()[1].messages.iter().flat_map(|m| &m.parts).any(|part|
+        matches!(part, Part::ToolResult {output, is_error: true, ..} if output.contains("blocked-by-hook"))));
+    assert!(events.into_inner().unwrap().iter().any(|event| event.detail["hook_event"] == "PreToolUse" && event.failed));
+}
+
+#[cfg(unix)]
+#[test]
+fn post_tool_hook_edits_are_isolated_indexed_and_failures_do_not_replay_the_tool() {
+    let d = repo();
+    fs::create_dir_all(d.path().join(".loom")).unwrap();
+    fs::write(d.path().join(".loom/config.toml"), r#"
+[hooks]
+enabled = true
+[[hooks.PostToolUse]]
+name = "format"
+matcher = "run"
+command = "printf 'pub fn formatted() -> u32 { 3 }\n' > src/a.rs; echo format-warning; exit 2"
+"#).unwrap();
+    let mut core = Core::open(d.path()).unwrap();
+    let model = ScriptedModel::new([
+        response(vec![("run", json!({"command":"echo tool-once"}))]),
+        response(vec![("find", json!({"query":"formatted", "kind":"symbol"}))]),
+        response(vec![("finish", json!({"summary":"formatted in the isolated proposal"}))]),
+    ]);
+    let events = Mutex::new(Vec::new());
+    let task = core.execute("format alpha", Intent::Edit, options(), &model, cancel(), &|event| events.lock().unwrap().push(event)).unwrap();
+    assert_eq!(task.status, Status::AwaitingApproval);
+    assert!(fs::read_to_string(d.path().join("src/a.rs")).unwrap().contains("alpha"));
+    assert!(task.patch.files.iter().any(|file| file.path == PathBuf::from("src/a.rs")));
+    assert!(model.requests()[1].messages.iter().flat_map(|m| &m.parts).any(|part|
+        matches!(part, Part::ToolResult {output, is_error: false, ..} if output.starts_with("\nPostToolUse hook failed") && output.contains("do not replay") && output.contains("format-warning"))));
+    assert!(model.requests()[2].messages.iter().flat_map(|m| &m.parts).any(|part|
+        matches!(part, Part::ToolResult {output, ..} if output.contains("formatted"))));
+    assert_eq!(events.into_inner().unwrap().iter().filter(|event| event.detail["tool"] == "run" && event.detail["started"] == true).count(), 1);
+}
+
+#[cfg(unix)]
+#[test]
+fn failed_start_hook_skips_the_model_but_end_hook_receives_the_final_result_once() {
+    use loom_core::base::{ArtifactStore, FileArtifactStore};
+    let d = repo();
+    fs::create_dir_all(d.path().join(".loom")).unwrap();
+    fs::write(d.path().join(".loom/config.toml"), r#"
+[hooks]
+enabled = true
+[[hooks.TaskStart]]
+name = "startup"
+command = "echo startup-denied; exit 2"
+[[hooks.TaskEnd]]
+name = "notify"
+command = "cat"
+"#).unwrap();
+    let mut core = Core::open(d.path()).unwrap();
+    let model = ScriptedModel::new([]);
+    let events = Mutex::new(Vec::new());
+    let task = core.execute("inspect alpha", Intent::Inspect, options(), &model, cancel(), &|event| events.lock().unwrap().push(event)).unwrap();
+    assert_eq!(task.status, Status::Unresolved);
+    assert!(task.summary.contains("startup-denied"));
+    assert!(model.requests().is_empty());
+    let events = events.into_inner().unwrap();
+    let ends: Vec<_> = events.iter().filter(|event| event.detail["hook_event"] == "TaskEnd" && event.detail["completed"] == true).collect();
+    assert_eq!(ends.len(), 1);
+    assert!(!ends[0].failed);
+    let reference = serde_json::from_value(ends[0].detail["result"]["artifact"].clone()).unwrap();
+    let bytes = FileArtifactStore::open(d.path()).unwrap().get(&reference, None).unwrap();
+    let output = String::from_utf8(bytes).unwrap();
+    assert!(output.contains(&task.id) && output.contains("Unresolved") && output.contains("startup-denied"));
+}
+
+#[cfg(unix)]
+#[test]
+fn end_hook_runs_on_cancellation_but_cannot_modify_the_real_workspace() {
+    let d = repo();
+    fs::create_dir_all(d.path().join(".loom")).unwrap();
+    fs::write(d.path().join(".loom/config.toml"), r#"
+[hooks]
+enabled = true
+[[hooks.TaskStart]]
+name = "startup"
+command = "echo start"
+[[hooks.TaskEnd]]
+name = "notify"
+command = "echo CHANGED > src/a.rs"
+"#).unwrap();
+    let mut core = Core::open(d.path()).unwrap();
+    let model = ScriptedModel::new([]);
+    let flag = cancel();
+    let events = Mutex::new(Vec::new());
+    let task = core.execute("inspect alpha", Intent::Inspect, options(), &model, flag.clone(), &|event| {
+        if event.detail["hook_event"] == "TaskStart" && event.detail["completed"] == true {
+            flag.store(true, std::sync::atomic::Ordering::Release);
+        }
+        events.lock().unwrap().push(event);
+    }).unwrap();
+    assert_eq!(task.status, Status::Cancelled);
+    assert!(task.summary.contains("TaskEnd notification failed"));
+    assert!(fs::read_to_string(d.path().join("src/a.rs")).unwrap().contains("alpha"));
+    assert!(events.into_inner().unwrap().iter().any(|event| event.detail["hook_event"] == "TaskEnd" && event.failed));
+    assert!(model.requests().is_empty());
+}

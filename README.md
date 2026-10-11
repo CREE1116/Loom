@@ -139,6 +139,13 @@ When earlier turns no longer fit the model's context (local models report theirs
 summarizes them before the next request and shows "compacting" while it does; `/compact`
 does the same on demand.
 
+## Hooks
+
+Native command hooks can validate or block tool calls, run checks or formatters
+after tools, and report task start/end. They are opt-in through `[hooks]` in
+`.loom/config.toml`, use JSON stdin, and follow the task's execution policy.
+See [hook configuration and examples](docs/hooks.md).
+
 ## Skills
 
 A skill is a folder with a `SKILL.md` (frontmatter `name` and `description`, then

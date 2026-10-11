@@ -12,3 +12,4 @@ pub mod world;
 pub mod instructions;
 pub mod sessions;
 pub mod extensions;
+pub mod hooks;

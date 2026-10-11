@@ -108,9 +108,45 @@ impl Runner {
         target_dir: Option<&Path>,
         policy: super::ExecutionPolicy,
     ) -> Result<TestResult> {
+        self.run_command(directory, command, timeout, cancel, target_dir, policy, None)
+    }
+
+    /// Hook stdin is data, never interpolated into shell source. Hooks use the
+    /// process exit status rather than test-output heuristics, with bounded logs.
+    pub fn run_hook(
+        &self,
+        directory: &Path,
+        command: &str,
+        input: &[u8],
+        timeout: Duration,
+        cancel: &AtomicBool,
+        policy: super::ExecutionPolicy,
+    ) -> Result<TestResult> {
+        anyhow::ensure!(!cancel.load(Ordering::Acquire), "hook cancelled before execution");
+        anyhow::ensure!(!timeout.is_zero(), "hook deadline reached before execution");
+        anyhow::ensure!(policy.sandbox != super::SandboxMode::ReadOnly || !super::sandbox::already_sandboxed(),
+            "cannot enforce a read-only hook inside an existing macOS sandbox");
+        self.run_command(directory, command, timeout, cancel, None, policy, Some(input))
+    }
+
+    fn run_command(
+        &self,
+        directory: &Path,
+        command: &str,
+        timeout: Duration,
+        cancel: &AtomicBool,
+        target_dir: Option<&Path>,
+        policy: super::ExecutionPolicy,
+        input: Option<&[u8]>,
+    ) -> Result<TestResult> {
         let started = Instant::now();
         let stdout = tempfile::NamedTempFile::new()?;
         let stderr = tempfile::NamedTempFile::new()?;
+        let stdin = if let Some(input) = input {
+            let mut file = tempfile::NamedTempFile::new()?;
+            file.write_all(input)?;
+            Some(file)
+        } else { None };
         #[cfg(unix)]
         let mut process = {
             let mut c = Command::new("sh");
@@ -127,6 +163,10 @@ impl Runner {
         process.current_dir(directory);
         let temporary = directory.join(".loom").join("tmp");
         fs::create_dir_all(&temporary)?;
+        if input.is_some() {
+            anyhow::ensure!(fs::canonicalize(&temporary)? == fs::canonicalize(directory)?.join(".loom/tmp"),
+                "hook temporary directory must not redirect writable access through symlinks");
+        }
         process
             .env("TMPDIR", &temporary)
             .env("TMP", &temporary)
@@ -154,7 +194,7 @@ impl Runner {
         policy.configure_command(&mut process, directory, &writable)?;
         process
             .current_dir(directory)
-            .stdin(Stdio::null())
+            .stdin(if let Some(file) = &stdin { Stdio::from(file.reopen()?) } else { Stdio::null() })
             .stdout(stdout.reopen()?)
             .stderr(stderr.reopen()?);
         if let Some(target) = target_dir {
@@ -207,19 +247,26 @@ impl Runner {
         };
         let mut raw = Vec::new();
         writeln!(raw, "$ {command}")?;
-        raw.extend_from_slice(&fs::read(stdout.path())?);
-        raw.extend_from_slice(&fs::read(stderr.path())?);
+        if input.is_some() {
+            use std::io::Read;
+            for file in [&stdout, &stderr] {
+                file.reopen()?.take(64 * 1024).read_to_end(&mut raw)?;
+            }
+        } else {
+            raw.extend_from_slice(&fs::read(stdout.path())?);
+            raw.extend_from_slice(&fs::read(stderr.path())?);
+        }
         let mut passed = 0;
         let mut failed = 0;
         let mut failing = BTreeSet::new();
         let mut first_error = None;
-        parse_check_output(
+        if input.is_none() { parse_check_output(
             &String::from_utf8_lossy(&raw),
             &mut passed,
             &mut failed,
             &mut failing,
             &mut first_error,
-        );
+        ); }
         let status = if status == RunStatus::Passed && failed > 0 {
             RunStatus::Failed
         } else {

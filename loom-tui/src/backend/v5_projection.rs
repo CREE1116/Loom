@@ -166,6 +166,11 @@ impl Projection {
             return;
         }
         let started = event.detail["started"] == true;
+        if event.detail["tool"] == "hook" {
+            self.model_waiting = false;
+            self.current = format!("{} · {}", if started { "훅 실행 중" } else if event.failed { "훅 실패" } else { "훅 완료" },
+                event.detail["name"].as_str().unwrap_or("hook"));
+        }
         let command = event.detail["tool"] == "run"
             || event.stage == Stage::Check && (started || event.detail.get("status").is_some());
         self.command = command.then(|| event.target.clone());
@@ -366,6 +371,10 @@ fn tool_heading(event: &Event, marker: &str) -> String {
     let Some(tool) = event.detail["tool"].as_str() else {
         return format!("{marker} {}", short_input(&event.target));
     };
+    if tool == "hook" {
+        return format!("{marker} {} · {}", if marker == "◌" { "훅 실행 중" } else if event.failed { "훅 실패" } else { "훅 완료" },
+            event.detail["name"].as_str().unwrap_or("hook"));
+    }
     let args = &event.detail["args"];
     let input = if tool == "agent" {
         format!("작업 {}개", args["units"].as_array().map_or(0, Vec::len))

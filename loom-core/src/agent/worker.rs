@@ -41,6 +41,8 @@ pub struct Proposal {
 }
 pub struct Shared<'a> {
     pub run_id: String,
+    pub task_id: String,
+    pub hooks: crate::hooks::Hooks,
     pub root: &'a std::path::Path,
     pub model: &'a dyn ModelPort,
     pub options: &'a Options,
@@ -64,6 +66,8 @@ impl<'a> Shared<'a> {
         log: File,
     ) -> Self {
         Self {
+            task_id: String::new(),
+            hooks: Default::default(),
             run_id: format!(
                 "{:x}",
                 std::time::SystemTime::now()
@@ -93,6 +97,15 @@ impl<'a> Shared<'a> {
     }
     pub fn remaining(&self) -> Duration {
         Duration::from_secs(self.options.seconds).saturating_sub(self.started.elapsed())
+    }
+    pub fn run_hooks(&self, event: crate::hooks::HookEvent, id: &str, overlay: &Overlay, mut input: Value, policy: crate::effects::ExecutionPolicy) -> Result<()> {
+        input["run_id"] = json!(self.run_id);
+        input["task_id"] = json!(self.task_id);
+        input["workspace"] = json!(self.root);
+        self.hooks.run(crate::hooks::Invocation {
+            event, worker: id, directory: overlay.dir(), input, policy,
+            cancel: &self.cancel, remaining: self.worker_time(), observe: &|event| self.emit(event),
+        }, overlay.artifacts())
     }
     pub fn worker_time(&self) -> Duration {
         self.remaining().saturating_sub(Duration::from_secs(
@@ -549,13 +562,27 @@ pub fn run(
                 .or(args["command"].as_str())
                 .unwrap_or(&name)
                 .to_owned();
+            let available = request.tools.iter().any(|tool| tool.name == name);
+            let mut hook_policy = shared.options.policy;
+            if readonly || child { hook_policy.sandbox = SandboxMode::ReadOnly; }
+            let pre_hook = if available && shared.hooks.has(crate::hooks::HookEvent::PreToolUse, &name) {
+                shared.run_hooks(crate::hooks::HookEvent::PreToolUse, id, host.overlay,
+                    json!({"tool_name":name, "tool_input":args}), hook_policy)
+                    .and_then(|_| {
+                        if hook_policy.sandbox != SandboxMode::ReadOnly { host.refresh(&shared.cancel)?; }
+                        Ok(())
+                    })
+            } else { Ok(()) };
+            let allowed = available && pre_hook.is_ok();
             shared.emit(Event::new(
                 id,
                 stage,
                 target.clone(),
                 json!({"tool":name,"args":args,"started":true}),
             ));
-            let result: Result<Value> = if !request.tools.iter().any(|t| t.name == name) {
+            let result: Result<Value> = if let Err(error) = pre_hook {
+                Err(error)
+            } else if !available {
                 Err(anyhow::anyhow!("unavailable tool {name}"))
             } else if name == "finish" {
                 if failed || pending_failure && !args["unresolved"].as_bool().unwrap_or(false) {
@@ -642,10 +669,18 @@ pub fn run(
             );
             event.failed = error;
             shared.emit(event);
+            let post_warning = if allowed && shared.hooks.has(crate::hooks::HookEvent::PostToolUse, &name) {
+                let warning = shared.run_hooks(crate::hooks::HookEvent::PostToolUse, id, host.overlay,
+                    json!({"tool_name":name, "tool_input":args, "tool_response":value, "tool_failed":error}), hook_policy).err();
+                if hook_policy.sandbox != SandboxMode::ReadOnly { host.refresh(&shared.cancel)?; }
+                warning.map(|error| format!("\nPostToolUse hook failed; the tool already ran, do not replay it: {error}"))
+            } else { None };
             evidence.push(repetition_output(&name, &value));
+            let output = value.to_string();
+            let output = post_warning.map(|warning| format!("{warning}\n{output}")).unwrap_or(output);
             results.push(Part::ToolResult {
                 call_id: cid,
-                output: tools::clip(&value.to_string(), 20000),
+                output: tools::clip(&output, 20000),
                 is_error: error,
             });
             if name == "finish" && !error {

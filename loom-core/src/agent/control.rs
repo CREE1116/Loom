@@ -7,7 +7,7 @@ use crate::agent::{
 use anyhow::{Context, Result, ensure};
 use fs2::FileExt;
 use crate::{
-    base::Revision,
+    base::{Revision, FileArtifactStore},
     effects::{Overlay, Patch, RunStatus, Runner, TestResult},
     models::{ModelPort, Usage},
 };
@@ -29,6 +29,31 @@ pub enum Intent {
     Auto,
     Inspect,
     Edit,
+}
+
+// End notifications cannot rewrite a validated/applied proposal. They still run
+// on cancellation, with one bounded three-second budget for the whole event.
+fn finish_hooks(shared: &Shared<'_>, task: &mut Task) {
+    use crate::hooks::{HookEvent, Invocation};
+    if !shared.hooks.has(HookEvent::TaskEnd, "") { return; }
+    let result = (|| -> Result<()> {
+        let artifacts = FileArtifactStore::open(shared.root)?;
+        let mut policy = task.policy;
+        policy.sandbox = crate::effects::SandboxMode::ReadOnly;
+        shared.hooks.run(Invocation {
+            event: HookEvent::TaskEnd, worker: "main", directory: shared.root,
+            input: json!({"run_id":shared.run_id, "task_id":task.id, "workspace":shared.root,
+                "prompt":task.goal, "status":task.status, "summary":task.summary}),
+            policy, cancel: &AtomicBool::new(false), remaining: Duration::from_secs(3),
+            observe: &|event| shared.emit(event),
+        }, &artifacts)?;
+        shared.flush()
+    })();
+    if let Err(error) = result {
+        task.summary.push_str(&format!("\nTaskEnd notification failed: {error}"));
+        let _ = shared.flush();
+    }
+    task.elapsed_ms = shared.started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Status {
@@ -175,6 +200,7 @@ impl Core {
             options.pinned.is_none() || options.read_only,
             "pinned inquiry is read-only"
         );
+        let hooks = crate::hooks::Hooks::open(&self.root)?;
         let inferred_checks = options.checks.is_empty();
         if options.checks.is_empty() {
             options.checks = crate::worker::default_checks(&self.root);
@@ -238,14 +264,15 @@ impl Core {
         let may_have_edits = AtomicBool::new(false);
         let worker_observer = |event: Event| {
             if event.detail["started"] == true
-                && matches!(event.detail["tool"].as_str(), Some("change" | "run" | "agent"))
+                && matches!(event.detail["tool"].as_str(), Some("change" | "run" | "agent" | "hook"))
             {
                 may_have_edits.store(true, Ordering::Release);
             }
             observe(event);
         };
-        let shared = Shared::new(
-            &self.root,
+        let run_root = self.root.clone();
+        let mut shared = Shared::new(
+            &run_root,
             model,
             &options,
             self.hub.clone(),
@@ -253,6 +280,8 @@ impl Core {
             &worker_observer,
             log,
         );
+        shared.task_id = id.clone();
+        shared.hooks = hooks;
         shared.emit(Event::new(
             "main",
             if options.plan {
@@ -263,14 +292,19 @@ impl Core {
             goal,
             json!({}),
         ));
-        let result = worker::run(
+        let mut hook_policy = options.policy;
+        if options.read_only { hook_policy.sandbox = crate::effects::SandboxMode::ReadOnly; }
+        let start = if shared.hooks.has(crate::hooks::HookEvent::TaskStart, "") {
+            shared.run_hooks(crate::hooks::HookEvent::TaskStart, "main", &overlay, json!({"prompt":goal}), hook_policy)
+        } else { Ok(()) };
+        let result = start.and_then(|_| worker::run(
             &shared,
             "main",
             goal,
             &mut overlay,
             options.inquiry.then(Default::default),
             options.plan,
-        );
+        ));
         let complete = match result {
             Ok(proposal) => {
                 task.summary = proposal.summary;
@@ -397,9 +431,17 @@ impl Core {
                         blocked.summary.push_str(&format!("\nAutomatic apply blocked: {error}"));
                         self.save(&blocked)?;
                     }
+                    if shared.hooks.has(crate::hooks::HookEvent::TaskEnd, "") {
+                        finish_hooks(&shared, &mut blocked);
+                        self.save(&blocked)?;
+                    }
                     return Err(error);
                 }
             };
+        }
+        if shared.hooks.has(crate::hooks::HookEvent::TaskEnd, "") {
+            finish_hooks(&shared, &mut task);
+            self.save(&task)?;
         }
         drop(lease);
         Ok(task)
