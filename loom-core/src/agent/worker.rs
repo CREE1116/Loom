@@ -269,7 +269,7 @@ fn guidance(shared: &Shared<'_>, id: &str, goal: &str, instructions: &mut Instru
     let mut guidance = instructions.root_guidance()?;
     // Skills: the main worker sees them; delegated children get their goal only.
     if id == "main" {
-        guidance.push_str(&crate::instructions::skill_guidance(shared.root, goal, &shared.options.skills, "load one with use_skill before following it")?);
+        guidance.push_str(&crate::instructions::skill_guidance(shared.root, goal, &shared.options.skills, "load each relevant skill with use_skill before following it")?);
     }
     for path in instructions.loaded_paths() {
         shared.emit(Event::new(

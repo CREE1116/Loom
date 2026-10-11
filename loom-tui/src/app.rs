@@ -1575,19 +1575,28 @@ impl App {
             Action::Command(command) => return self.command(&command),
             Action::Skill(path) if !self.readonly => {
                 if let Some(skill) = self.skills.iter().find(|skill| skill.path == path).cloned() {
+                    let keep_picker = self.view == View::Skills;
                     if !self.selected_skills.iter().any(|s| s.path == path) {
                         self.selected_skills.push(skill);
                     }
-                    if self.editor.text.starts_with('$')
-                        && !self.editor.text.contains(char::is_whitespace)
-                    {
-                        self.editor = Editor::default();
+                    if !self.menu_open && !keep_picker {
+                        if let Some(range) = loom_core::instructions::skill_mention_at(&self.editor.text, self.editor.cursor) {
+                            self.editor.anchor = None;
+                            self.editor.remove_range(range.start, range.end);
+                        }
                     }
                     self.menu_open = false;
                     self.menu_dismissed = true;
-                    self.switch_view(View::Chat);
-                    self.focus = None;
-                    self.notify("스킬 선택됨 · 지시를 입력하고 전송하세요");
+                    if keep_picker {
+                        self.focus = self.skills.iter()
+                            .find(|skill| !self.selected_skills.iter().any(|selected| selected.path == skill.path))
+                            .map(|skill| Action::Skill(skill.path.clone()));
+                        self.notify("스킬 추가됨 · 더 선택하거나 Esc로 돌아가세요");
+                    } else {
+                        self.switch_view(View::Chat);
+                        self.focus = None;
+                        self.notify("스킬 추가됨 · $로 더 추가하거나 지시를 전송하세요");
+                    }
                 }
             }
             Action::RemoveSkill(path) => self.selected_skills.retain(|skill| skill.path != path),
@@ -1757,6 +1766,16 @@ impl App {
                     self.notice_deadline = None;
                     self.notice_error = false;
                     let text = self.editor.take_text();
+                    let catalog: Vec<_> = self.skills.iter().map(|skill| loom_core::instructions::Skill {
+                        name: skill.name.clone(), path: skill.path.clone().into(), description: String::new(),
+                    }).collect();
+                    for mention in loom_core::instructions::mentioned_skills(&text, &catalog) {
+                        if let Some(skill) = self.skills.iter().find(|skill| skill.name == mention.name) {
+                            if !self.selected_skills.iter().any(|selected| selected.path == skill.path) {
+                                self.selected_skills.push(skill.clone());
+                            }
+                        }
+                    }
                     self.history_position = None;
                     if self.preferences.input_history == preferences::InputHistory::Keep
                         && !text.trim().is_empty()
@@ -2475,6 +2494,16 @@ impl App {
             }
             "/quit" => Some(Intent::Quit),
             _ => {
+                if let Some(skill) = self.skills.iter().find(|skill| skill.name.eq_ignore_ascii_case(name.trim_start_matches('/'))) {
+                    if self.readonly {
+                        self.error("열람 전용 창입니다. 메인 창에서 실행하세요.");
+                        return None;
+                    }
+                    let prompt = format!("${}{}{}", skill.name, if argument.is_empty() { "" } else { " " }, argument);
+                    self.editor = Editor::default();
+                    self.editor.insert(&prompt);
+                    return self.activate(Action::Send);
+                }
                 self.error("알 수 없는 명령입니다. /help 또는 /를 입력하세요.");
                 return None;
             }
@@ -2504,8 +2533,8 @@ impl App {
             return Vec::new();
         }
         let text = self.editor.text.trim();
-        if !self.menu_open && text.starts_with('$') && !text.contains(char::is_whitespace) {
-            let filter = text.trim_start_matches('$').to_lowercase();
+        if let Some(range) = (!self.menu_open).then(|| loom_core::instructions::skill_mention_at(&self.editor.text, self.editor.cursor)).flatten() {
+            let filter = self.editor.text[range.start + 1..self.editor.cursor].to_lowercase();
             return self
                 .skills
                 .iter()
@@ -3647,7 +3676,7 @@ impl App {
                     if self.view == View::Chat && (self.turn.is_some() || self.submitted.is_some() || (self.busy && self.status == "inProgress")) {
                         if self.preferences.language == Language::English { "Commands · type to search · Esc stop" } else { "명령 검색 · 입력해서 찾기 · Esc 중단" }
                     } else if self.preferences.language == Language::English { "Commands · type to search · Esc close" } else { "명령 검색 · 입력해서 찾기 · Esc 닫기" }
-                } else if self.editor.text.starts_with('$') {
+                } else if loom_core::instructions::skill_mention_at(&self.editor.text, self.editor.cursor).is_some() {
                     "스킬 · ↑↓ 선택 · Enter 추가"
                 } else {
                     "명령 · ↑↓ 선택 · Enter 입력"
@@ -7417,6 +7446,53 @@ mod tests {
         a.activate(Action::Skill("/tmp/review/SKILL.md".into()));
         assert!(a.selected_skills.is_empty());
     }
+    #[test]
+    fn skill_completion_preserves_cursor_suffix_and_allows_a_second_skill() {
+        let mut app = App::new(false);
+        app.thread = Some("main".into());
+        app.skills = ["review", "test"].into_iter().map(|name| Skill {
+            name: name.into(), path: format!("/tmp/{name}/SKILL.md"), description: String::new(),
+        }).collect();
+        app.editor.insert("앞 $rev 뒤");
+        app.editor.cursor = "앞 $rev".len();
+        let canvas = app.render(80, 24);
+        app.key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE), &canvas);
+        assert_eq!(app.editor.text, "앞  뒤");
+        assert_eq!(app.editor.cursor, "앞 ".len());
+        for c in "$test".chars() {
+            let canvas = app.render(80, 24);
+            app.key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE), &canvas);
+        }
+        let canvas = app.render(80, 24);
+        app.key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE), &canvas);
+        assert_eq!(app.selected_skills.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(), ["review", "test"]);
+        assert_eq!(app.editor.text, "앞  뒤");
+        app.editor.take_text();
+        app.editor.insert("$reviewer `$review` \\$test $HOME");
+        app.selected_skills.clear();
+        app.activate(Action::Send);
+        assert!(app.submitted_skills.is_empty());
+    }
+
+    #[test]
+    fn slash_skill_alias_preserves_builtin_priority_and_readonly_drafts() {
+        let mut app = App::new(false);
+        app.thread = Some("main".into());
+        app.skills = ["review", "help"].into_iter().map(|name| Skill {
+            name: name.into(), path: format!("/tmp/{name}/SKILL.md"), description: String::new(),
+        }).collect();
+        app.editor.insert("/help");
+        app.activate(Action::Send);
+        assert_eq!(app.view, View::Help);
+        assert!(app.submitted.is_none());
+        app.readonly = true;
+        app.editor.insert("/review 변경 검토");
+        let draft = app.editor.text.clone();
+        assert!(app.activate(Action::Send).is_none());
+        assert_eq!(app.editor.text, draft);
+        assert!(app.submitted_skills.is_empty());
+    }
+
     #[test]
     fn skills_view_groups_by_origin_and_keeps_selection_easy_to_find() {
         let skills = vec![

@@ -2953,8 +2953,46 @@ fn native_projection(report: &mut Report) {
     report.dump("native", &failed_screen);
 }
 
+fn skill_mentions(report: &mut Report) {
+    const S: &str = "multiple inline skills";
+    let mut app = App::new(false);
+    app.thread = Some("main".into());
+    app.skills = ["review", "test"].into_iter().map(|name| Skill {
+        name: name.into(), path: format!("/tmp/{name}/SKILL.md"), description: String::new(),
+    }).collect();
+    app.editor.insert("변경 검토 $rev");
+    let canvas = app.render(80, 30);
+    report.check(S, "문장 중간 스킬 자동완성", canvas.hits.iter().any(|h| h.action == Action::Skill("/tmp/review/SKILL.md".into())), screen_text(&canvas));
+    report.check(S, "문장 중간 자동완성도 스킬 메뉴로 표시", screen_text(&canvas).contains("스킬 ·"), screen_text(&canvas));
+    report.dump(S, &canvas);
+    app.activate(Action::Skill("/tmp/review/SKILL.md".into()));
+    report.check(S, "스킬 선택은 주변 문장을 보존", app.editor.text == "변경 검토 ", &app.editor.text);
+    app.editor.take_text();
+    app.editor.insert("$test $REVIEW $test 함께 적용해줘");
+    app.activate(Action::Send);
+    let names: Vec<_> = app.submitted_skills.iter().map(|skill| skill.name.as_str()).collect();
+    report.check(S, "직접 입력한 여러 스킬을 중복 없이 연결", names == ["review", "test"], format!("{names:?}"));
+    report.dump(S, &app.render(80, 30));
+    let mut slash = App::new(false);
+    slash.thread = Some("main".into());
+    slash.skills = app.skills.clone();
+    slash.editor.insert("/review 변경 검토");
+    let intent = slash.activate(Action::Send);
+    report.check(S, "슬래시 스킬 호출과 인자 전달", intent == Some(Intent::Submit("$review 변경 검토".into())), format!("{intent:?}"));
+    let mut picker = App::new(false);
+    picker.skills = app.skills.clone();
+    picker.view = View::Skills;
+    picker.editor.insert("유지할 지시");
+    picker.activate(Action::Skill("/tmp/review/SKILL.md".into()));
+    picker.activate(Action::Skill("/tmp/test/SKILL.md".into()));
+    let canvas = picker.render(80, 35);
+    report.check(S, "선택창을 유지하며 여러 스킬 추가", picker.view == View::Skills && picker.selected_skills.len() == 2 && picker.editor.text == "유지할 지시", screen_text(&canvas));
+    report.dump(S, &canvas);
+}
+
 pub fn run() -> Report {
     let mut report = Report::default();
+    skill_mentions(&mut report);
     searchable_commands(&mut report);
     session_exit_notice(&mut report);
     v5_plan_command(&mut report);

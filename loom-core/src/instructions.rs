@@ -222,7 +222,7 @@ pub fn load_skill(path: &Path) -> Result<String> {
 pub fn initial(root: &Path, goal: &str, selected: &[PathBuf]) -> Result<String> {
     let mut instructions = Instructions::open(root)?;
     let mut out = instructions.root_guidance()?;
-    out.push_str(&skill_guidance(root, goal, selected, "enable_tools skills, then use_skill to load one")?);
+    out.push_str(&skill_guidance(root, goal, selected, "enable_tools skills, then use_skill for each relevant skill")?);
     Ok(out)
 }
 
@@ -232,14 +232,67 @@ pub fn initial(root: &Path, goal: &str, selected: &[PathBuf]) -> Result<String> 
 /// Characters of skill descriptions shown per request; the most relevant skills come first.
 const SKILL_LIST_BUDGET: usize = 3500;
 
+/// Token ranges shared by completion and explicit skill loading. Code and escapes
+/// are literal text, and names must start at a word boundary.
+fn skill_mentions(text: &str) -> Vec<std::ops::Range<usize>> {
+    let mut ranges = Vec::new();
+    let mut at = 0;
+    let mut code_ticks = 0;
+    while at < text.len() {
+        let c = text[at..].chars().next().unwrap();
+        if c == '\\' {
+            at += 1;
+            if at < text.len() { at += text[at..].chars().next().unwrap().len_utf8(); }
+            continue;
+        }
+        if c == '`' {
+            let ticks = text[at..].bytes().take_while(|b| *b == b'`').count();
+            if code_ticks == 0 { code_ticks = ticks; }
+            else if code_ticks == ticks { code_ticks = 0; }
+            at += ticks;
+            continue;
+        }
+        let boundary = at == 0 || text[..at].chars().next_back()
+            .is_some_and(|c| c.is_whitespace() || matches!(c, '(' | '[' | '{' | ',' | ';'));
+        if c == '$' && code_ticks == 0 && boundary {
+            let start = at;
+            at += 1;
+            while at < text.len() {
+                let next = text[at..].chars().next().unwrap();
+                if !next.is_alphanumeric() && !matches!(next, '-' | '_' | ':' | '.') { break; }
+                at += next.len_utf8();
+            }
+            ranges.push(start..at);
+        } else { at += c.len_utf8(); }
+    }
+    ranges
+}
+
+pub fn skill_mention_at(text: &str, cursor: usize) -> Option<std::ops::Range<usize>> {
+    if !text.is_char_boundary(cursor) { return None; }
+    skill_mentions(text).into_iter().find(|range| range.start < cursor && cursor <= range.end)
+}
+
+/// Registered mentions in invocation order, without duplicate paths.
+pub fn mentioned_skills<'a>(text: &str, skills: &'a [Skill]) -> Vec<&'a Skill> {
+    let mut chosen: Vec<&Skill> = Vec::new();
+    for range in skill_mentions(text) {
+        let name = &text[range.start + 1..range.end];
+        if let Some(skill) = skills.iter().find(|skill| skill.name.eq_ignore_ascii_case(name)) {
+            if !chosen.iter().any(|old| old.path == skill.path) { chosen.push(skill); }
+        }
+    }
+    chosen
+}
+
 pub fn skill_guidance(root: &Path, goal: &str, selected: &[PathBuf], how: &str) -> Result<String> {
     let mut out = String::new();
     let skills = discover(root)?;
-    let mut chosen = selected.iter().cloned().collect::<BTreeSet<_>>();
-    for skill in &skills {
-        if goal.contains(&format!("${}", skill.name)) {
-            chosen.insert(skill.path.clone());
-        }
+    let mentions = mentioned_skills(goal, &skills);
+    let mut chosen = Vec::new();
+    for path in selected.iter().chain(mentions.iter().map(|skill| &skill.path)) {
+        let path = path.canonicalize().unwrap_or_else(|_| path.clone());
+        if !chosen.contains(&path) { chosen.push(path); }
     }
     if !skills.is_empty() {
         // A model only reaches for a skill it can recognise as relevant, so every skill
@@ -260,7 +313,10 @@ pub fn skill_guidance(root: &Path, goal: &str, selected: &[PathBuf], how: &str) 
         ranked.sort_by_key(|s| std::cmp::Reverse(score(s)));
         out.push_str(&format!(
             "\nSkills ({how}). Before starting, check this list: when a skill's description fits \
-             the request, call use_skill with its name first and follow it.\n"
+             the request, call use_skill for each relevant name before following it.\n\
+             Multiple selected skills apply together. Respect the user request, assign each skill \
+             its relevant scope, and sequence dependent steps. Parallelize independent work only \
+             when the user authorizes delegation.\n"
         ));
         let mut used = 0;
         let mut rest = Vec::new();
@@ -362,6 +418,36 @@ mod tests {
         assert_eq!(skills.iter().filter(|s| s.name == "review").count(), 1);
     }
 
+    #[test]
+    fn explicit_mentions_are_exact_ordered_and_ignore_code() {
+        let skills = ["review", "reviewer", "plugin:test"].map(|name| Skill {
+            name: name.into(), path: PathBuf::from(name), description: String::new(),
+        });
+        let names: Vec<_> = mentioned_skills("$REVIEWER, $plugin:test $reviewer ` $review ` \\$review", &skills)
+            .into_iter().map(|skill| skill.name.as_str()).collect();
+        assert_eq!(names, ["reviewer", "plugin:test"]);
+        assert!(mentioned_skills("$reviewing $HOME foo$review", &skills).is_empty());
+        let text = "검토 $rev 다음";
+        assert_eq!(skill_mention_at(text, "검토 $rev".len()), Some("검토 ".len().."검토 $rev".len()));
+        assert!(skill_mention_at("`$review`", 8).is_none());
+    }
+
+    #[test]
+    fn guidance_loads_multiple_mentions_in_order_and_only_exact_names() {
+        let root = tempfile::tempdir().unwrap();
+        for name in ["review", "reviewer", "test"] {
+            let dir = root.path().join(".loom/skills").join(name);
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join("SKILL.md"), format!("---\nname: {name}\n---\nBODY_{name}_END")).unwrap();
+        }
+        let selected = root.path().join(".loom/skills/test/SKILL.md");
+        let out = skill_guidance(root.path(), "$REVIEWER $test $reviewer", &[selected.clone(), selected], "test").unwrap();
+        assert!(!out.contains("BODY_review_END"));
+        assert_eq!(out.matches("BODY_reviewer_END").count(), 1);
+        assert_eq!(out.matches("BODY_test_END").count(), 1);
+        assert!(out.find("BODY_test_END").unwrap() < out.find("BODY_reviewer_END").unwrap());
+    }
+
     /// Lists what this machine has installed. `cargo test --lib installed_skills -- --ignored --nocapture`
     #[test]
     #[ignore]
@@ -401,7 +487,7 @@ mod print_guidance {
     #[ignore]
     fn print_skill_guidance() {
         let root = std::env::current_dir().unwrap();
-        let text = super::skill_guidance(&root, "MCP 서버를 Loom에 붙이고 싶어", &[], "load one with use_skill before following it").unwrap();
+        let text = super::skill_guidance(&root, "MCP 서버를 Loom에 붙이고 싶어", &[], "load each relevant skill with use_skill before following it").unwrap();
         eprintln!("{} chars\n{text}", text.len());
     }
 }

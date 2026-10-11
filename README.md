@@ -143,11 +143,18 @@ does the same on demand.
 
 A skill is a folder with a `SKILL.md` (frontmatter `name` and `description`, then
 instructions). Loom reads skills from `.loom/skills`, `.agents/skills`, `.codex/skills`
-and `.claude/skills` in the repository and in your home directory, and from Claude Code
-and Codex plugin caches. Mention one as `$name` in a request or pick it with `/skills`;
-the model can also load one when it needs it.
+and `.claude/skills` in the repository and in your home directory. Set `LOOM_PLUGIN_SKILLS`
+to also include Claude Code and Codex plugin caches. Mention skills anywhere in a request, for example
+`$loom-review $loom-debug investigate this change`. `$` completion follows the cursor;
+selecting a suggestion adds a skill without erasing the surrounding draft. Multiple
+skills apply together, in selection/invocation order, with duplicates removed. Names
+match exactly (ignoring ASCII case); escaped mentions and mentions in code stay literal.
+You can also invoke `/loom-review investigate this change`, or pick skills with `/skills`.
+The picker stays open while you add or remove skills; press Esc to return to your draft.
+Built-in slash commands take priority over skill names. The model can load each relevant
+skill as needed; independent delegated work follows the user's authorization.
 
-Three skills ship with Loom: `loom-guide` (how Loom itself works and how to fix common
+Six skills ship with Loom: `loom-guide` (how Loom itself works and how to fix common
 problems), `skill-builder` (writing skills), `loom-extension` (adding tools),
 `loom-plan` (implementation planning), `loom-debug` (reproduction and diagnosis),
 and `loom-review` (evidence-based code review). Press `Ctrl+P` to search commands
