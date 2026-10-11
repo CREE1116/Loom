@@ -5758,7 +5758,7 @@ fn append_entries(
                         rows.push((
                             format!(
                                 "$ {}",
-                                document::command_summary(&entry.title, width.saturating_sub(3))
+                                document::command_summary(entry.title.strip_prefix("run · ").unwrap_or(&entry.title), width.saturating_sub(3))
                             ),
                             Tone::Muted,
                             None,

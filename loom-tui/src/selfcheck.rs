@@ -3014,8 +3014,33 @@ fn hooks_progress(report: &mut Report) {
     report.dump(S, &canvas);
 }
 
+fn command_output_disclosure(report: &mut Report) {
+    const S: &str = "command output disclosure";
+    use loom_core::agent::events::{Event, Stage};
+    let command = "uv run python -c \"import numpy; print('numpy', numpy.__version__)\"";
+    for (failed, output) in [(false, "numpy 2.5.2"), (true, "ModuleNotFoundError: No module named 'numpy'")] {
+        let mut projection = crate::backend::v5_projection::Projection::default();
+        let mut event = Event::new("main", Stage::Run, "import numpy", serde_json::json!({
+            "tool":"run", "args":{"command":command}, "completed":true,
+            "result":{"status":if failed {"Failed"} else {"Passed"}, "artifact_target":"artifact:internal-hash", "output":format!("$ {command}\n{output}\n")}
+        }));
+        event.failed = failed;
+        projection.observe(&event);
+        let mut app = App::new(false);
+        let entries = projection.entries("turn", true);
+        report.check(S, "전체 명령과 실제 출력 제공", entries.iter().any(|entry| entry.title.contains(command) && entry.body.contains(output)), format!("{entries:?}"));
+        report.check(S, "내부 결과 핸들 숨김", entries.iter().all(|entry| !entry.body.contains("artifact:") && !entry.body.contains("status=")), format!("{entries:?}"));
+        for mut entry in entries { entry.expanded = true; app.upsert_entry(entry); }
+        let canvas = app.render(100, 32);
+        report.check(S, "실행 프로그램과 환경을 제목에 유지", screen_text(&canvas).contains("$ uv run python -c"), screen_text(&canvas));
+        report.check(S, "펼친 화면에 출력 표시", screen_text(&canvas).contains(output), screen_text(&canvas));
+        report.dump(S, &canvas);
+    }
+}
+
 pub fn run() -> Report {
     let mut report = Report::default();
+    command_output_disclosure(&mut report);
     hooks_progress(&mut report);
     skill_mentions(&mut report);
     searchable_commands(&mut report);

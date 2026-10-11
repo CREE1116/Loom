@@ -376,6 +376,11 @@ fn tool_heading(event: &Event, marker: &str) -> String {
             event.detail["name"].as_str().unwrap_or("hook"));
     }
     let args = &event.detail["args"];
+    if tool == "run" {
+        if let Some(command) = args["command"].as_str() {
+            return format!("{marker} run · {}", command.replace('\n', " ↵ "));
+        }
+    }
     let input = if tool == "agent" {
         format!("작업 {}개", args["units"].as_array().map_or(0, Vec::len))
     } else {
@@ -422,7 +427,7 @@ fn compact_tool_detail(event: &Event) -> String {
                 .as_str()
                 .map(str::to_owned)
                 .unwrap_or_else(|| value.to_string());
-            let text = if text.chars().count() > 120 {
+            let text = if key != "command" && text.chars().count() > 120 {
                 format!("{}…", text.chars().take(120).collect::<String>())
             } else {
                 text
@@ -451,7 +456,7 @@ fn compact_tool_detail(event: &Event) -> String {
         });
     if let Some(object) = object {
         let mut summary = Vec::new();
-        for key in ["status", "count", "set", "artifact_target"] {
+        for key in ["count", "set"] {
             let Some(value) = object.get(key) else { continue; };
             let value = value
                 .as_str()
@@ -461,6 +466,22 @@ fn compact_tool_detail(event: &Event) -> String {
         }
         if !summary.is_empty() {
             parts.push(format!("결과 · {}", summary.join(" · ")));
+        }
+    }
+    for object in result.into_iter().flat_map(|value| {
+        if let Some(values) = value.as_array() { values.iter().collect::<Vec<_>>() }
+        else { vec![value] }
+    }) {
+        if let Some(output) = object["output"].as_str() {
+            let output = if output.starts_with("$ ") {
+                output.split_once('\n').map_or(output, |(_, rest)| rest)
+            } else { output };
+            if !output.trim().is_empty() {
+                parts.push(format!("출력\n{}", output.trim_end()));
+            }
+            if object["output_truncated"] == true {
+                parts.push("출력 일부만 표시됨".into());
+            }
         }
     }
     parts.join("\n")

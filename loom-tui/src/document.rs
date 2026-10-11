@@ -544,12 +544,14 @@ pub fn paint(canvas: &mut Canvas, text: &str, tone: Tone) {
 
 /// The full command remains available on expansion; the summary fits one row.
 pub fn command_summary(command: &str, width: usize) -> String {
-    let command = command
+    let shell = command.split_whitespace().next().unwrap_or("")
+        .rsplit('/').next().unwrap_or("");
+    let command = if matches!(shell, "sh" | "bash" | "zsh" | "dash" | "ksh") { command
         .split_once(" -lc ")
         .or_else(|| command.split_once(" -c "))
         .map_or(command, |(_, script)| {
             script.trim().trim_matches(['\'', '"'])
-        });
+        }) } else { command };
     if UnicodeWidthStr::width(command) <= width {
         return command.into();
     }
