@@ -36,6 +36,12 @@ pub(super) fn bad_request_help(detail: &str) -> &'static str {
 
 /// Task.summary retains canonical stop reasons, including saved sessions.
 pub fn failure_summary(summary: &str) -> Option<&'static str> {
+    if summary == "observed token budget exhausted" {
+        return Some("Loom에 설정한 누적 토큰 한도에 도달해 작업을 멈췄습니다. 진행 기록은 보존되어 있습니다. ‘이어서 시도’를 누르면 계속할 수 있습니다.");
+    }
+    if summary.starts_with("Plan coverage review failed:") {
+        return Some("실행 계획의 검증에 실패했습니다. 자세한 원인은 작업 기록에서 확인할 수 있습니다.");
+    }
     if summary == "repeated identical operations on unchanged revision" {
         return Some("같은 도구 요청을 반복해 진전이 없어 멈췄습니다.");
     }

@@ -23,6 +23,7 @@ def baseline(files, command, verify):
             (ROOT / name).write_bytes(source)
         result = run(command)
         assert result.returncode != 0, "regression checks incorrectly accept v0.1.3"
+        assert result.stdout.strip(), result.stderr[-12000:]
         verify(result.stdout)
     finally:
         for name, content in saved.items():
@@ -52,6 +53,15 @@ def image_failure(output):
     print(f"Expected baseline failure: {name}")
 
 
+def stop_reason_failure(output):
+    report = json.loads(output)
+    failures = [check for check in report["checks"] if not check["pass"]]
+    assert any("실제 중단 사유 observed token budget exhausted" in check["name"] for check in failures), failures
+    assert any("실행 기록이 없으면 계획 단계로 추정하지 않음" == check["name"] for check in failures), failures
+    for check in failures:
+        print(f"Expected baseline failure: {check['name']}")
+
+
 subprocess.run(["git", "fetch", "--depth", "1", "origin", "tag", BASE], cwd=ROOT, check=True)
 baseline(["loom-core/src/agent/mod.rs", "loom-core/src/agent/worker.rs",
           "loom-core/src/agent/query.rs", "loom-core/src/agent/tools.rs",
@@ -61,6 +71,9 @@ baseline(["loom-core/src/agent/mod.rs", "loom-core/src/agent/worker.rs",
 baseline(["loom-tui/src/app/events.rs"],
          ["cargo", "run", "--locked", "--quiet", "--manifest-path", "loom-tui/Cargo.toml",
           "--", "--self-check", "--json"], ui_failure)
+baseline(["loom-tui/src/backend/versions.rs", "loom-tui/src/backend/v5_projection.rs"],
+         ["cargo", "run", "--locked", "--quiet", "--manifest-path", "loom-tui/Cargo.toml",
+          "--", "--self-check", "--json"], stop_reason_failure)
 baseline(["loom-tui/src/backend/versions.rs"],
          ["cargo", "test", "--locked", "--manifest-path", "loom-tui/Cargo.toml",
           "--test", "versions", "loom_accepts_clipboard_images", "--", "--test-threads=1"], image_failure)

@@ -1016,9 +1016,9 @@ impl VersionBackend {
             };
             return reason.into();
         }
-        let stage = if o.events.iter().any(|e| e.worker == "validation") {
+        let stage = if !o.validation.is_empty() || o.events.iter().any(|e| e.worker == "validation") {
             "작업 결과를 확인하다 멈췄습니다."
-        } else if o.events.iter().any(|e| {
+        } else if o.model_calls.iter().any(|call| call.tool_calls > 0) || o.events.iter().any(|e| {
             matches!(
                 e.kind,
                 crate::backend::activity_events::EventKind::ToolStarted
@@ -1027,13 +1027,6 @@ impl VersionBackend {
             )
         }) {
             "작업을 진행했지만 끝까지 마무리하지 못했습니다."
-        } else if o.calls > 0
-            && !o.events.iter().any(|e| {
-                e.worker != "coordinator"
-                    && e.kind == crate::backend::activity_events::EventKind::Started
-            })
-        {
-            "실행 계획을 준비하다 멈췄습니다."
         } else {
             "작업을 마무리하지 못했습니다."
         };

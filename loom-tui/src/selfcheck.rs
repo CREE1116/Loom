@@ -3577,7 +3577,7 @@ fn native_readable_results(report: &mut Report) {
                 format!("{status} {width}: 사람에게 결과 설명"),
                 match status {
                     "Unresolved" => {
-                        body.contains("계획을 준비하다") && !text.contains("tool assertion")
+                        body.contains("실행 계획의 검증에 실패") && !text.contains("tool assertion")
                     }
                     "AwaitingApproval" => body.contains("승인하면"),
                     "Cancelled" => {
@@ -3624,6 +3624,31 @@ fn native_readable_results(report: &mut Report) {
         report.check(S, format!("{width}: 반복 중단 사유가 화면에 보임"), text.contains("반복"), &text);
         report.dump("native_repeated_tools", &screen);
     }
+
+    outcome.model_calls = vec![serde_json::from_value(serde_json::json!({
+        "requested":"openrouter/openrouter/free", "served":null,"input":null,"output":null,
+        "cached":null,"ms":10,"error":null,"tool_calls":1
+    })).unwrap()];
+    for (reason, expected) in [
+        ("observed token budget exhausted", "Loom에 설정한 누적 토큰 한도"),
+        ("worker did not finish", "작업을 진행했지만"),
+    ] {
+        outcome.summary = reason.into();
+        for width in [40, 80, 140] {
+            let body = VersionBackend::report(&outcome);
+            let screen = app_with([message("stop-reason", &body)]).render(width, 40);
+            let text = screen_text(&screen);
+            report.check(S, format!("{width}: 실제 중단 사유 {reason}"),
+                body.contains(expected) && !body.contains("계획을 준비하다"), &body);
+            report.check(S, format!("{width}: 중단 안내가 화면에 표시 {reason}"),
+                text.contains("한도") || text.contains("마무리"), &text);
+            report.dump("native_stop_reason", &screen);
+        }
+    }
+    outcome.model_calls.clear();
+    let body = VersionBackend::report(&outcome);
+    report.check(S, "실행 기록이 없으면 계획 단계로 추정하지 않음",
+        !body.contains("계획") && body.contains("작업을 마무리하지 못했습니다"), &body);
 
     let mut conversation = crate::backend::version_conversation::Conversation::default();
     let mut read = Event::new("worker-1", EventKind::ToolSucceeded, "1: contents");
