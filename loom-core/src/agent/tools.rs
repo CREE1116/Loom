@@ -409,9 +409,9 @@ impl Host<'_> {
                             continue;
                         }
                     }
-                    let a = start.map_or(from, |n| n as usize);
+                    let a = start.map_or(from, |n| n as usize).max(from);
                     let b = end.map_or_else(|| if start.is_some() { a.saturating_add(200).min(s.end) } else { s.end }, |n| n as usize);
-                    ensure!(a >= from && a < s.end && b >= a, "symbol range must start within [{from}, {}) and be ordered", s.end);
+                    ensure!(a < s.end && b >= a && start.zip(end).is_none_or(|(a,b)| a <= b), "symbol range must overlap [{from}, {}) and be ordered", s.end);
                     (Some(a), Some(b.min(s.end)))
                 }
                 _ if start.is_some() || end.is_some() => {

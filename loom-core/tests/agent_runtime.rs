@@ -223,7 +223,7 @@ fn assistant_commentary_precedes_tools_and_question_cancel_is_not_an_answer() {
 #[test]
 fn large_ast_types_open_as_members_and_explicit_ranges_read_only_that_slice() {
     let d = repo();
-    let mut source = String::from("public class Sample {\n");
+    let mut source = String::from("package fixtures;\n\npublic class Sample {\n");
     for method in 0..12 {
         source.push_str(&format!("  public int method{method}() {{\n"));
         for line in 0..10 { source.push_str(&format!("    // method{method} evidence line {line} with enough content to make a full class expensive\n")); }
@@ -239,6 +239,7 @@ fn large_ast_types_open_as_members_and_explicit_ranges_read_only_that_slice() {
         response(vec![("find",json!({"kind":"symbol","query":"method0"}))]),
         response(vec![("open",json!({"target":class}))]),
         response(vec![("open",json!({"target":class,"start":30,"end":36}))]),
+        response(vec![("open",json!({"target":class,"start":0,"end":8}))]),
         response(vec![("open",json!({"target":method}))]),
         response(vec![("finish",json!({"summary":"inspected methods"}))]),
     ]);
@@ -258,7 +259,11 @@ fn large_ast_types_open_as_members_and_explicit_ranges_read_only_that_slice() {
     assert_eq!(slice["start"], 30);
     assert_eq!(slice["end"], 36);
     assert_eq!(slice["source"], source.lines().skip(30).take(6).collect::<Vec<_>>().join("\n"));
-    let leaf = events[3].detail["result"][0]["source"].as_str().unwrap();
+    let intersection = &events[3].detail["result"][0];
+    assert_eq!(intersection["start"], 2);
+    assert_eq!(intersection["end"], 8);
+    assert_eq!(intersection["source"], source.lines().skip(2).take(6).collect::<Vec<_>>().join("\n"));
+    let leaf = events[4].detail["result"][0]["source"].as_str().unwrap();
     assert!(leaf.contains("method0") && !leaf.contains("method1"));
 }
 

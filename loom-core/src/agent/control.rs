@@ -172,7 +172,7 @@ impl Core {
         ensure!(!cancel.load(Ordering::Acquire), "execution cancelled");
         ensure!(!goal.trim().is_empty(), "goal required");
         ensure!(
-            options.steps > 0 && options.seconds > 0 && options.tokens > 0,
+            options.steps > 0 && options.seconds > 0,
             "positive execution budget required"
         );
         ensure!(
