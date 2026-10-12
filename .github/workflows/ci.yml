@@ -53,7 +53,7 @@ jobs:
       - name: TUI tests
         run: cargo test --locked --manifest-path loom-tui/Cargo.toml -- --test-threads=1
       - name: Self-check (headless UI scenarios)
-        run: cargo run --locked --quiet --manifest-path loom-tui/Cargo.toml -- --self-check
+        run: cargo run --locked --quiet --manifest-path loom-tui/Cargo.toml -- --self-check --screens
       - name: Remote control through the real TUI (demo, no model)
         if: runner.os != 'Windows'
         run: python3 loom-tui/tests/remote_smoke.py
