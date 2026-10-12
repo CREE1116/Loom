@@ -12,7 +12,7 @@ and pass the test suite in CI; CUDA builds are not yet verified on hardware.
 
 ## Install
 
-One command (Apple silicon Macs get the prebuilt release; other systems build from
+One command (Apple silicon Macs and Linux x86_64 get the prebuilt release; other systems build from
 source with the requirements below):
 
 ```sh
@@ -20,7 +20,19 @@ curl -fsSL https://raw.githubusercontent.com/CREE1116/Loom/main/scripts/get.sh |
 ```
 
 Options: `LOOM_PREFIX` (default `~/.local`), `LOOM_VERSION`, `LOOM_FROM_SOURCE=1`,
-`LOOM_CUDA=1`. Run it again to update.
+`LOOM_CUDA=1`. Run it again to update. Linux binaries require glibc 2.39 or newer;
+older distributions can use `LOOM_FROM_SOURCE=1`.
+
+Windows x86_64: download [get.ps1](https://raw.githubusercontent.com/CREE1116/Loom/main/scripts/get.ps1)
+and run `powershell -File .\get.ps1`. Close existing Loom windows before reinstalling.
+
+Installed releases check for updates in the background once a day. Downloads are
+verified with SHA-256 before installation. Restart Loom after the update notice;
+Windows applies the verified update after Loom exits. Use `loom update` to update
+immediately, `loom update --check` to check without installing, or set
+`LOOM_AUTO_UPDATE=0` to disable automatic updates. Development builds outside
+`PREFIX/bin`, custom CUDA builds, and unsupported architectures are not replaced. Existing versions
+before v0.1.3 need one manual reinstall to receive the updater.
 
 ### From a checkout
 

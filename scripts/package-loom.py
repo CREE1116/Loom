@@ -77,6 +77,7 @@ def main():
         packaged = Path(directory) / package_name / "bin" / name
         subprocess.run([str(packaged), "--version"], check=True)
         subprocess.run([str(packaged), "provider", "--help"], check=True, stdout=subprocess.DEVNULL)
+        subprocess.run([str(packaged), "update", "--help"], check=True, stdout=subprocess.DEVNULL)
         subprocess.run([str(packaged), "--self-check"], check=True, stdout=subprocess.DEVNULL)
     if args.install and platform.system() == "Darwin":
         print("On macOS install with scripts/install.sh, which places the MLX library beside loom.")

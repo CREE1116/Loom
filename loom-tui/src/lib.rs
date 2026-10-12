@@ -13,3 +13,4 @@ pub mod preferences;
 pub mod product_cli;
 pub mod local_models;
 pub mod remote;
+pub mod update;

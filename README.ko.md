@@ -12,7 +12,7 @@ Loom은 터미널 코딩 에이전트입니다. 저장소의 격리된 사본에
 
 ## 설치
 
-명령 한 줄로 설치합니다. Apple silicon 맥은 릴리즈 바이너리를 받고, 다른 시스템은 아래
+명령 한 줄로 설치합니다. Apple silicon 맥과 Linux x86_64는 릴리즈 바이너리를 받고, 다른 시스템은 아래
 준비물로 소스에서 빌드합니다.
 
 ```sh
@@ -20,7 +20,18 @@ curl -fsSL https://raw.githubusercontent.com/CREE1116/Loom/main/scripts/get.sh |
 ```
 
 옵션: `LOOM_PREFIX`(기본 `~/.local`), `LOOM_VERSION`, `LOOM_FROM_SOURCE=1`, `LOOM_CUDA=1`.
-다시 실행하면 업데이트됩니다.
+다시 실행하면 업데이트됩니다. Linux 바이너리는 glibc 2.39 이상이 필요하며,
+이전 배포판에서는 `LOOM_FROM_SOURCE=1`로 직접 빌드할 수 있습니다.
+
+Windows x86_64에서는 [get.ps1](https://raw.githubusercontent.com/CREE1116/Loom/main/scripts/get.ps1)을
+저장하고 `powershell -File .\get.ps1`로 설치합니다. 재설치 전에는 Loom 창을 닫아주세요.
+
+설치된 릴리즈는 하루 한 번 백그라운드에서 업데이트를 확인하고, SHA-256 검증을 마친 뒤
+설치합니다. 안내가 나오면 Loom을 다시 실행하세요. Windows는 Loom 종료 후 교체합니다.
+`loom update`로 즉시 업데이트하고, `loom update --check`로 설치 없이 확인할 수 있습니다.
+`LOOM_AUTO_UPDATE=0`을 설정하면 자동 업데이트를 끕니다. `PREFIX/bin` 밖의 개발 빌드,
+CUDA 직접 빌드, 지원하지 않는 아키텍처는 자동 교체하지 않습니다.
+v0.1.3 이전 사용자는 설치 명령을 한 번 다시 실행해야 자동 업데이트를 받을 수 있습니다.
 
 ### 소스에서
 

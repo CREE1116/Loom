@@ -3040,6 +3040,7 @@ fn command_output_disclosure(report: &mut Report) {
 
 pub fn run() -> Report {
     let mut report = Report::default();
+    update_notice(&mut report);
     command_output_disclosure(&mut report);
     hooks_progress(&mut report);
     skill_mentions(&mut report);
@@ -3095,6 +3096,18 @@ pub fn run() -> Report {
     input_images_and_model_hierarchy(&mut report);
     tour(&mut report);
     report
+}
+
+fn update_notice(report: &mut Report) {
+    const S: &str = "update_notice";
+    let mut app = App::new(false);
+    app.editor.insert("작성 중인 요청");
+    app.notify(crate::update::completion_message("v0.1.3", false));
+    let canvas = app.render(100, 24);
+    let text = screen_text(&canvas);
+    report.check(S, "업데이트 버전과 재시작 안내 표시", text.contains("v0.1.3") && text.contains("Ctrl+Q"), &text);
+    report.check(S, "작성 중인 요청 유지", app.editor.text == "작성 중인 요청", &text);
+    report.dump(S, &canvas);
 }
 
 fn searchable_commands(report: &mut Report) {

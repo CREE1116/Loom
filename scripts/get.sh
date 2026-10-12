@@ -3,7 +3,7 @@
 #
 #   curl -fsSL https://raw.githubusercontent.com/CREE1116/Loom/main/scripts/get.sh | sh
 #
-# Apple silicon Macs get the prebuilt release; other systems build from source with
+# Apple silicon Macs and x86_64 Linux get the prebuilt release; other systems build from source with
 # scripts/install.sh (needs Rust, git, CMake and a C/C++ compiler).
 # Options (environment): LOOM_PREFIX (default ~/.local), LOOM_VERSION (default latest),
 # LOOM_FROM_SOURCE=1 to always build, LOOM_CUDA=1 to build with CUDA.
@@ -38,17 +38,30 @@ fetch_asset() {
 }
 
 install_prebuilt() {
-    package=loom-darwin-aarch64
+    package=$1
     fetch_asset "$package.tar.gz" || return 1
     fetch_asset "$package.tar.gz.sha256" || return 1
-    (cd "$work" && shasum -a 256 -c "$package.tar.gz.sha256" >/dev/null) || {
-        say "checksum mismatch for $package.tar.gz"
+    checksum_tool=shasum
+    have sha256sum && checksum_tool=sha256sum
+    if [ "$checksum_tool" = sha256sum ]; then
+        (cd "$work" && sha256sum -c "$package.tar.gz.sha256" >/dev/null) || return 1
+    else
+        (cd "$work" && shasum -a 256 -c "$package.tar.gz.sha256" >/dev/null) || return 1
+    fi
+    if ! tar -xzf "$work/$package.tar.gz" -C "$work"; then
+        say "could not extract $package.tar.gz"
+        return 1
+    fi
+    "$work/$package/bin/loom" --version >/dev/null || {
+        say "downloaded Loom could not run; existing installation kept"
         return 1
     }
-    tar -xzf "$work/$package.tar.gz" -C "$work"
-    mkdir -p "$prefix/bin" "$prefix/lib"
-    rm -rf "$prefix/lib/loom"
-    cp -R "$work/$package/lib/loom" "$prefix/lib/loom"
+    mkdir -p "$prefix/bin"
+    if [ -d "$work/$package/lib/loom" ]; then
+        mkdir -p "$prefix/lib"
+        rm -rf "$prefix/lib/loom"
+        cp -R "$work/$package/lib/loom" "$prefix/lib/loom"
+    fi
     cp "$work/$package/bin/loom" "$prefix/bin/.loom.$$"
     mv -f "$prefix/bin/.loom.$$" "$prefix/bin/loom"
     # Downloaded files are quarantined; this build is unsigned.
@@ -81,10 +94,13 @@ install_from_source() {
 
 os=$(uname -s)
 arch=$(uname -m)
-if [ "${LOOM_FROM_SOURCE:-0}" != 1 ] && [ "$os" = Darwin ] && [ "$arch" = arm64 ] && install_prebuilt; then
+package=
+if [ "$os" = Darwin ] && [ "$arch" = arm64 ]; then package=loom-darwin-aarch64; fi
+if [ "$os" = Linux ] && [ "$arch" = x86_64 ]; then package=loom-linux-x86_64; fi
+if [ "${LOOM_FROM_SOURCE:-0}" != 1 ] && [ "${LOOM_CUDA:-0}" != 1 ] && [ -n "$package" ] && install_prebuilt "$package"; then
     say "Installed $prefix/bin/loom"
 else
-    [ "$os" = Darwin ] && [ "$arch" = arm64 ] && [ "${LOOM_FROM_SOURCE:-0}" != 1 ] &&
+    [ -n "$package" ] && [ "${LOOM_FROM_SOURCE:-0}" != 1 ] &&
         say "No prebuilt package could be fetched; building from source."
     install_from_source
 fi

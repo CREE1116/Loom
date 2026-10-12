@@ -1,6 +1,6 @@
 [package]
 name = "loom-core"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2024"
 license = "Apache-2.0"
 description = "Revision-pinned resources and control for Loom workers, independent of the UI"

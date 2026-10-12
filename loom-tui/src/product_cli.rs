@@ -18,6 +18,7 @@ pub fn dispatch(args: Vec<OsString>) -> Result<Option<i32>> {
         return loom_core::surfaces::cli_from(args).map(Some);
     }
     match command {
+        "update" => crate::update::cli(&args[2..]).map(|()| Some(0)),
         "provider" => loom_core::models::provider_cli::execute(args[2..].iter().map(|arg| arg.to_string_lossy().into_owned())).map(|()| Some(0)),
         "runtime" => runtime(&args[2..]).map(|()| Some(0)),
         "model" => model(&args[2..]).map(|()| Some(0)),

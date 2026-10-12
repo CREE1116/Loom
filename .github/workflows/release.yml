@@ -1,0 +1,101 @@
+name: Publish Loom release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    uses: ./.github/workflows/ci.yml
+  package:
+    name: Package ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15, ubuntu-24.04, windows-2022]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install stable Rust
+        run: rustup update stable --no-self-update && rustup default stable
+      - name: Install test tools (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ripgrep bubblewrap
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+      - name: Install test tools (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          command -v rg || brew install ripgrep
+          scripts/fetch-mlx
+      - name: Install test tools (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if (Get-Command rg -ErrorAction SilentlyContinue) { exit 0 }
+          for ($attempt = 1; $attempt -le 3; $attempt++) {
+            choco install ripgrep -y --no-progress
+            if ($LASTEXITCODE -eq 0 -and (Get-Command rg -ErrorAction SilentlyContinue)) { exit 0 }
+            Start-Sleep -Seconds 5
+          }
+          throw 'ripgrep installation failed'
+      - name: Build release executable
+        run: cargo build --release --locked --manifest-path loom-tui/Cargo.toml --bin loom
+      - name: Check Windows installer syntax
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $tokens = $null
+          $errors = $null
+          [System.Management.Automation.Language.Parser]::ParseFile((Join-Path $PWD 'scripts/get.ps1'), [ref]$tokens, [ref]$errors) | Out-Null
+          if ($errors.Count) { throw ($errors | Out-String) }
+      - name: Check package version matches tag
+        shell: python
+        run: |
+          import os, pathlib, tomllib
+          version = tomllib.loads(pathlib.Path('loom-tui/Cargo.toml').read_text())['package']['version']
+          assert os.environ['GITHUB_REF_NAME'] == 'v' + version, 'release tag does not match package version'
+      - name: Package and verify release
+        run: python scripts/package-loom.py --no-build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: loom-assets-${{ matrix.os }}
+          path: dist/*.tar.gz*
+          if-no-files-found: error
+
+  publish:
+    needs: [verify, package]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: loom-assets-*
+          path: dist
+          merge-multiple: true
+      - name: Require all three platform archives and checksums
+        shell: bash
+        run: |
+          for platform in darwin-aarch64 linux-x86_64 windows-x86_64; do
+            test -s "dist/loom-$platform.tar.gz"
+            test -s "dist/loom-$platform.tar.gz.sha256"
+            (cd dist && sha256sum -c "loom-$platform.tar.gz.sha256")
+          done
+      - name: Publish verified release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/*.tar.gz dist/*.sha256 \
+            --repo "$GITHUB_REPOSITORY" --verify-tag --title "Loom $GITHUB_REF_NAME" \
+            --notes-file "docs/releases/$GITHUB_REF_NAME.md"

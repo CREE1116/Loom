@@ -464,6 +464,7 @@ fn main() -> Result<()> {
     let mut terminal = Terminal::enter()?;
     let mut initial_model_recorded = false;
     let (job_tx, job_rx) = mpsc::channel::<Result<String, String>>();
+    let update_rx = if args.demo { None } else { loom_tui::update::auto_check() };
     let (provider_tx, provider_rx) = mpsc::channel::<(Result<String, String>, bool, Option<String>)>();
     let mut provider_job_active = false;
     let (paste_tx, paste_rx) = mpsc::channel::<Result<window::ClipboardContent, String>>();
@@ -518,6 +519,12 @@ fn main() -> Result<()> {
                 Err(error) => app.error(error),
             }
             dirty = true;
+        }
+        if let Some(rx) = &update_rx {
+            if let Ok(Some(message)) = rx.try_recv() {
+                app.notify(message);
+                dirty = true;
+            }
         }
         while let Ok((result, reload, selection)) = provider_rx.try_recv() {
             provider_job_active = false;
