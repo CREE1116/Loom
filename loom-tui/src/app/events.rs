@@ -249,7 +249,13 @@ impl App {
                     ));
                 }
                 self.apply_permissions(permissions, false);
-                if let Some(model) = model {
+                // Loom sessions store conversation history, not model selection.
+                // The backend only learns a UI choice when a turn is submitted;
+                // its last submitted model must not overwrite a newer choice.
+                // Native runtimes still own their per-session model settings.
+                if let Some(model) = model
+                    && (starting || self.model_engine.as_deref() != Some("loom"))
+                {
                     self.model = model;
                     self.reconcile_effort();
                 }

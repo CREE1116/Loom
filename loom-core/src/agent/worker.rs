@@ -160,7 +160,7 @@ impl<'a> Shared<'a> {
             ensure!(!self.stopped(), "cancelled or deadline reached");
             let m = self.metrics();
             ensure!(
-                m.usage
+                self.options.tokens == 0 || m.usage
                     .input
                     .unwrap_or(0)
                     .saturating_add(m.usage.output.unwrap_or(0))
@@ -402,7 +402,7 @@ pub fn run(
         .collect();
     let representatives = host.sets.store(&host.view, symbols)?;
     let system = format!(
-        "You are Loom, a helpful assistant. Answer the latest user request in the user's language. A direct conversational answer ends the turn. Use tools only when needed to fulfill that request. Do not invent tasks, explore the repository without a reason, or resume older failed work unless asked.\n\nFor repository work, your role is {}. Follow project instructions. Use representative target names to navigate; do not request or reconstruct AST dumps. find/expand/combine operate on complete sets; open only code needed to decide edits. Handles expire after writes. File/AST/reference indexes are internal runtime mechanisms. Reference edges are approximate, so inspect source before deciding behavior. Submit real scoped changes with finish; Core decides validation and apply. Tool failures never imply success. No reviewer/planner model is required. {}\n{guidance}",
+        "You are Loom, a helpful assistant. Answer the latest user request in the user's language. A direct conversational answer ends the turn. Use tools only when needed to fulfill that request. Do not invent tasks, explore the repository without a reason, or resume older failed work unless asked.\n\nFor repository work, your role is {}. Follow project instructions. Use representative target names to navigate; do not request or reconstruct AST dumps. find/expand/combine operate on complete sets. For known code owners use find kind=symbol, then open the needed method/function. Large classes open as paged AST members; do not fetch whole classes to inspect one method. Explicit start/end are absolute file lines, even for symbols. Reuse source already observed on the same revision; open only code needed to decide edits. Handles expire after writes. File/AST/reference indexes are internal runtime mechanisms. Reference edges are approximate, so inspect source before deciding behavior. Submit real scoped changes with finish; Core decides validation and apply. Tool failures never imply success. No reviewer/planner model is required. {}\n{guidance}",
         if plan_mode { "orchestrator" } else { "worker" },
         if child {
             "You cannot delegate or ask the user. Read any needed source, write only leased files, submit your proposal without whole-task validation."
@@ -428,7 +428,13 @@ pub fn run(
     };
     let mut goal_index = messages.len();
     messages.push(Message::user(goal));
+    if !child || shared.options.inquiry {
+        ensure!(shared.options.images.iter().all(|part| matches!(part, Part::Image { .. })), "attachments must be image parts");
+        messages[goal_index].parts.extend(shared.options.images.clone());
+    }
     let original_goal = messages[goal_index].text();
+    let original_images = messages[goal_index].parts.iter()
+        .filter(|part| matches!(part, Part::Image { .. })).cloned().collect::<Vec<_>>();
     let mut compact_receipts = std::collections::VecDeque::new();
     let mut pending_failure = false;
     let mut complete = false;
@@ -684,11 +690,15 @@ pub fn run(
             if name != "finish" {
                 pending_failure = error;
             }
-            compact_receipts.push_back(format!(
+            let receipt = format!(
                 "{name} · {target} · {} · {}",
                 if error { "failed" } else { "observed" },
                 tools::clip(&value.to_string(), 1200)
-            ));
+            );
+            if name == "open" && !error {
+                compact_receipts.retain(|previous| previous != &receipt);
+            }
+            compact_receipts.push_back(receipt);
             while compact_receipts.len() > 32 {
                 compact_receipts.pop_front();
             }
@@ -711,8 +721,23 @@ pub fn run(
                 }
             } else { None };
             evidence.push(repetition_output(&name, &value));
+            let deduplicate_source = name == "open" && !error && post_feedback.is_none() && post_warning.is_none();
             let output = post_feedback.map(|feedback| format!("PostToolUse feedback (tool already ran; do not replay): {feedback}")).unwrap_or_else(|| value.to_string());
             let output = post_warning.map(|warning| format!("{warning}\n{output}")).unwrap_or(output);
+            // Preserve full durable events above, but keep only the latest identical
+            // source result in model context. Repeated open calls must not multiply
+            // the same source in every later input. The newest copy remains verbatim.
+            if deduplicate_source {
+                for message in &mut messages {
+                    for part in &mut message.parts {
+                        if let Part::ToolResult { output: previous, .. } = part
+                            && (previous == &output || previous.strip_prefix("[same call as a recent step on an unchanged repository; the result is identical. Use it, try a different query or range, or finish.]\n") == Some(output.as_str()))
+                        {
+                            *previous = format!("Identical source is retained in the latest open result ({cid}).");
+                        }
+                    }
+                }
+            }
             results.push(Part::ToolResult {
                 call_id: cid,
                 output: tools::clip(&output, 20000),
@@ -780,7 +805,7 @@ pub fn run(
             summary = "repeated identical operations on unchanged revision".into();
             break;
         }
-        let needs_compact = messages.len() > 5 && messages.iter().map(|m| m.text().len()+serde_json::to_vec(&m.parts).map_or(0,|b|b.len())).sum::<usize>() > shared.options.context_bytes;
+        let needs_compact = messages.len() > 5 && messages.iter().map(context_bytes).sum::<usize>() > shared.options.context_bytes;
         if needs_compact {
             let outcome = shared.run_hooks(HookEvent::PreCompact,id,host.overlay,json!({"trigger":"auto"}),lifecycle_policy)?;
             if let Some(reason)=outcome.halt {summary=reason; break;}
@@ -791,7 +816,7 @@ pub fn run(
         while messages.len() > 5
             && messages
                 .iter()
-                .map(|m| m.text().len() + serde_json::to_vec(&m.parts).map_or(0, |b| b.len()))
+                .map(context_bytes)
                 .sum::<usize>()
                 > shared.options.context_bytes
         {
@@ -817,6 +842,7 @@ pub fn run(
                 "{original_goal}\nCompacted observations for this objective (historical evidence; reopen current source as needed):\n{}",
                 tools::clip(&evidence, 8000)
             ));
+            messages[goal_index].parts.extend(original_images.clone());
         }
     }
     if shared.stopped() {
@@ -844,6 +870,14 @@ pub fn run(
 fn stop_hooks(shared: &Shared<'_>, id: &str, overlay: &Overlay, summary: &str, active: bool, child: bool, policy: crate::effects::ExecutionPolicy) -> Result<crate::hooks::HookOutcome> {
     shared.run_hooks(if child {crate::hooks::HookEvent::SubagentStop} else {crate::hooks::HookEvent::Stop},id,overlay,
         json!({"last_assistant_message":summary,"stop_hook_active":active,"agent_id":id,"agent_type":"worker"}),policy)
+}
+
+// Base64 size is transport overhead, not textual model context. Vision token use
+// is reported by the provider; do not compact away evidence because a PNG is large.
+fn context_bytes(message: &Message) -> usize {
+    message.text().len() + message.parts.iter()
+        .filter(|part| !matches!(part, Part::Image { .. }))
+        .map(|part| serde_json::to_vec(part).map_or(0, |bytes| bytes.len())).sum::<usize>()
 }
 
 fn fit_context(request: &mut Request, mut goal_index: usize, limit: u64) {

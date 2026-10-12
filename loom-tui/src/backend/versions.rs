@@ -1129,6 +1129,9 @@ impl VersionBackend {
             !self.active && self.pending.is_none(),
             "먼저 실행 중인 작업 또는 변경 승인을 마무리해주세요"
         );
+        let text = if text.trim().is_empty() && !self.settings.images.is_empty() {
+            "첨부 이미지를 확인해주세요.".into()
+        } else { text };
         let (intent, goal) = core::parse(&text);
         ensure!(!goal.is_empty(), "empty request");
         ensure!(
@@ -1201,6 +1204,7 @@ impl VersionBackend {
         }));
         let root = self.root.clone();
         let mut settings = self.settings.clone();
+        self.settings.images.clear();
         self.settings.hook_session_start = None;
         settings.readonly |= !self.trusted;
         settings.context_bytes = budgets.worker;
@@ -1419,7 +1423,11 @@ impl AgentBackend for VersionBackend {
                 skills,
                 effort,
             } => {
-                ensure!(images.is_empty(), "현재 Loom 실행 경로는 첨부 이미지를 지원하지 않습니다");
+                // Encode while the attachment lease is alive; a clipboard temp
+                // file may disappear as soon as this command is dropped.
+                self.settings.images = images.iter()
+                    .map(|image| models::image_part(image.path()))
+                    .collect::<Result<Vec<_>>>()?;
                 self.settings.skills = skills.into_iter().map(|skill| PathBuf::from(skill.path)).collect();
                 self.settings.effort = effort;
                 self.submit(text, model)?;
@@ -1542,9 +1550,10 @@ impl AgentBackend for VersionBackend {
                     let _ = tx.send(Message::Compacted { session, through, result: result.map_err(|error| error.to_string()), auto: false });
                 });
             }
-            AgentCommand::Fork { turn_id, .. } => {
+            AgentCommand::Fork { turn_id, model } => {
                 ensure!(!self.active && self.pending.is_none(), "실행 중에는 대화를 되돌릴 수 없습니다");
                 let branch = self.branch_session(&turn_id)?;
+                self.settings.model = model;
                 self.load_session(&branch)?;
                 self.emit(AgentUpdate::Notice("대화를 되돌렸습니다. 이전 대화는 세션 목록에 남아 있습니다.".into()));
             }
@@ -1560,12 +1569,13 @@ impl AgentBackend for VersionBackend {
                 };
                 self.emit(AgentUpdate::RewindPreview { turn_id, files, added, removed, blocked });
             }
-            AgentCommand::Rewind { turn_id, .. } => {
+            AgentCommand::Rewind { turn_id, model } => {
                 ensure!(!self.active && self.pending.is_none(), "실행 중에는 대화를 되돌릴 수 없습니다");
                 ensure!(!self.settings.readonly && self.trusted, "쓰기 권한이 있어야 코드를 되돌릴 수 있습니다");
                 let patch = self.code_rewind(&turn_id)?;
                 patch.apply(&self.root)?;
                 let branch = self.branch_session(&turn_id)?;
+                self.settings.model = model;
                 self.load_session(&branch)?;
                 self.emit(AgentUpdate::Notice("대화와 코드를 되돌렸습니다.".into()));
             }
@@ -1581,11 +1591,12 @@ impl AgentBackend for VersionBackend {
                 self.emit(AgentUpdate::Notice("대화를 삭제했습니다.".into()));
                 self.refresh_sessions();
             }
-            AgentCommand::OpenSession { id, .. } => {
+            AgentCommand::OpenSession { id, model } => {
                 ensure!(
                     !self.active && !self.inquiry_active && self.pending.is_none(),
                     "먼저 실행 중인 작업 또는 변경 승인을 마무리해주세요"
                 );
+                self.settings.model = model;
                 match id {
                     Some(id) => { let _ = self.load_session(&id)?; },
                     None => {

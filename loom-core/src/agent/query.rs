@@ -88,7 +88,7 @@ impl Sets {
     }
     pub fn find(&mut self, view: &View, args: Find) -> Result<Value> {
         ensure!(!args.query.trim().is_empty(), "query must not be empty");
-        let scope = args.scope.as_deref().unwrap_or(".");
+        let scope = args.scope.as_deref().filter(|scope| !scope.is_empty()).unwrap_or(".");
         if scope != "." {
             view.resolve(scope)?;
         }
@@ -218,7 +218,7 @@ impl Sets {
             .map(|node| match node {
                 Node::Symbol(id) => {
                     let s = view.world.graph.get(id).unwrap();
-                    json!({"target":id,"name":s.name})
+                    json!({"target":id,"name":s.name,"kind":s.kind,"start":s.start.saturating_sub(1),"end":s.end})
                 }
                 Node::File(path) | Node::Directory(path) => json!({"target":path}),
             })

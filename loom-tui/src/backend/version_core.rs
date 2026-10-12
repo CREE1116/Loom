@@ -29,6 +29,7 @@ impl Version {
 pub struct Settings {
     pub hook_session_id: Option<String>,
     pub hook_session_start: Option<String>,
+    pub images: Vec<m::Part>,
     pub model: String,
     pub readonly: bool,
     pub review_model: String,
@@ -58,6 +59,7 @@ impl Default for Settings {
         Self {
             hook_session_id: None,
             hook_session_start: None,
+            images: vec![],
             model: "auto".into(),
             readonly: false,
             review_model: "auto".into(),
@@ -497,6 +499,7 @@ pub fn execute_with_index(
             session_id: settings.hook_session_id.clone(),
             session_start: settings.hook_session_start.clone(),
             history: settings.history.clone(),
+            images: settings.images.clone(),
             plan: settings.plan,
             read_only: settings.readonly,
             checks: settings.checks.clone(),

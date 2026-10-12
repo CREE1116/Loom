@@ -3834,6 +3834,27 @@ fn escape_stops_active_turn(report: &mut Report) {
 }
 
 fn response_model_details(report: &mut Report) {
+    let mut choice = App::new(false);
+    choice.configure_model_memory("loom", None);
+    choice.apply_event(loaded("first", "First"));
+    choice.models = vec!["auto".into(), "chatgpt/gpt-6.1-sol".into()];
+    choice.activate(Action::Model("chatgpt/gpt-6.1-sol".into()));
+    choice.editor.insert("모델과 함께 유지할 초안");
+    for session in ["new", "resumed", "branched"] {
+        let mut event = loaded(session, "Conversation");
+        if let AgentUpdate::SessionLoaded { model, .. } = &mut event.update {
+            *model = Some("auto".into());
+        }
+        choice.apply_event(event);
+        report.check("models", format!("{session}: 대화 전환이 직접 선택한 모델을 덮어쓰지 않음"),
+            choice.model == "chatgpt/gpt-6.1-sol" && choice.editor.text == "모델과 함께 유지할 초안",
+            format!("model={}", choice.model));
+        choice.activate(Action::Command("/model".into()));
+        let screen = choice.render(80, 35);
+        report.check("models", format!("{session}: 모델 목록에 직접 선택한 모델 표시"),
+            screen_text(&screen).contains("선택한 모델 · gpt-6.1-sol"), screen_text(&screen));
+        report.dump("models", &screen);
+    }
     let mut app = App::new(false);
     app.apply_event(loaded("model-session", "Models"));
     app.apply_event(AgentEvent::global(AgentUpdate::ModelsLoaded(vec![

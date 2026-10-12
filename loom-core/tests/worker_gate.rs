@@ -1176,14 +1176,14 @@ fn worker_checks_share_one_deadline_and_do_not_start_late_commands() {
     task.budget.seconds = if cfg!(windows) { 2 } else { 1 };
     task.checks = if cfg!(windows) {
         vec![
-            "ping -n 2 127.0.0.1 >nul".into(),
-            "ping -n 3 127.0.0.1 >nul".into(),
+            "echo first-check".into(),
+            "ping -n 5 127.0.0.1 >nul".into(),
             "echo should-not-run > late-check.txt".into(),
         ]
     } else {
         vec![
-            "sleep 0.6".into(),
-            "sleep 0.6".into(),
+            "true".into(),
+            "sleep 2".into(),
             "printf should-not-run > late-check.txt".into(),
         ]
     };

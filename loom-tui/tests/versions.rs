@@ -111,6 +111,60 @@ fn settings(state: &tempfile::TempDir) -> Settings {
 }
 
 #[test]
+fn loom_accepts_clipboard_images_with_text_and_image_only_without_leaking_to_next_turn() -> Result<()> {
+    let root = fixture()?;
+    let state = tempfile::tempdir()?;
+    let image = loom_tui::attachment::ImageAttachment::from_clipboard(arboard::ImageData {
+        width: 1, height: 1, bytes: vec![255, 0, 0, 255].into(),
+    })?;
+    let expected = m::image_part(image.path())?;
+    let reply = || m::Response {
+        parts: vec![m::Part::Text("image received".into())], usage:Default::default(),
+        stop:m::Stop::EndTurn, model:"fixture-model".into(), latency:Duration::ZERO,
+        route:None, gateway_connection:None, gateway_upstream_ms:None,
+    };
+    let model = Arc::new(m::ScriptedModel::new([reply(),reply(),reply()]));
+    let mut backend = VersionBackend::with_model(Version::Loom, root.path(), model.clone(), settings(&state))?;
+    for text in ["Describe this red pixel", ""] {
+        backend.command(AgentCommand::Submit { text:text.into(), model:"fixture-model".into(),
+            effort:None, skills:vec![], images:vec![image.clone()] })?;
+        wait(&mut backend, |update| matches!(update, AgentUpdate::TurnCompleted { .. }))?;
+    }
+    backend.command(AgentCommand::Submit { text:"text only".into(), model:"fixture-model".into(),
+        effort:None, skills:vec![], images:vec![] })?;
+    wait(&mut backend, |update| matches!(update, AgentUpdate::TurnCompleted { .. }))?;
+    let requests = model.requests();
+    assert_eq!(requests.len(), 3);
+    for request in &requests[..2] {
+        assert!(request.messages.iter().flat_map(|message| &message.parts).any(|part| part == &expected));
+    }
+    assert!(requests[0].messages.iter().any(|message| message.text() == "Describe this red pixel"));
+    assert!(requests[1].messages.iter().any(|message| message.text() == "첨부 이미지를 확인해주세요."));
+    assert!(!requests[2].messages.iter().flat_map(|message| &message.parts).any(|part| matches!(part,m::Part::Image {..})));
+    backend.shutdown()?;
+    Ok(())
+}
+
+#[test]
+fn new_and_resumed_sessions_confirm_the_model_passed_by_the_ui() -> Result<()> {
+    let root = fixture()?;
+    let state = tempfile::tempdir()?;
+    let mut backend = VersionBackend::with_model(Version::Loom,root.path(),
+        Arc::new(m::ScriptedModel::new([])),settings(&state))?;
+    while backend.poll()?.is_some() {}
+    backend.command(AgentCommand::OpenSession { id:None, model:"chatgpt/gpt-6.1-sol".into() })?;
+    let opened = wait(&mut backend,|update|matches!(update,AgentUpdate::SessionLoaded { .. }))?;
+    let AgentUpdate::SessionLoaded { snapshot, model, .. } = opened.update else { unreachable!() };
+    assert_eq!(model.as_deref(),Some("chatgpt/gpt-6.1-sol"));
+    backend.command(AgentCommand::OpenSession { id:Some(snapshot.id), model:"chatgpt/gpt-6.1-sol".into() })?;
+    let resumed = wait(&mut backend,|update|matches!(update,AgentUpdate::SessionLoaded { .. }))?;
+    let AgentUpdate::SessionLoaded { model, .. } = resumed.update else { unreachable!() };
+    assert_eq!(model.as_deref(),Some("chatgpt/gpt-6.1-sol"));
+    backend.shutdown()?;
+    Ok(())
+}
+
+#[test]
 fn loom_projects_diff_into_chat_and_restores_it() -> Result<()> {
     let root = fixture()?;
     let state = tempfile::tempdir()?;

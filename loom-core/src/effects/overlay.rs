@@ -383,11 +383,13 @@ impl Overlay {
             let symbols = graph::extract(&path.to_string_lossy(), text).unwrap_or_default();
             json!({"path": path, "lines": all.len(), "outline": symbols.iter().map(|s| json!({"id":s.id, "start":s.start, "end":s.end})).collect::<Vec<_>>()})
         } else {
-            let range = lines.unwrap_or(0..all.len());
-            if range.start > range.end || range.end > all.len() || range.len() > 400 {
-                bail!("read range must fit the file and at most 400 lines (zero based)");
+            let mut range = lines.unwrap_or(0..all.len());
+            if range.start > range.end || range.start > all.len() || range.len() > 400 {
+                bail!("read range must start within the file ({0} lines), be ordered and contain at most 400 lines (zero based, end exclusive)", all.len());
             }
-            json!({"path":path, "start":range.start, "end":range.end, "text":all[range].join("\n"), "digest": format!("{:x}", Sha256::digest(&bytes))})
+            // A model need not know the file's length before opening it.
+            range.end = range.end.min(all.len());
+            json!({"path":path, "start":range.start, "end":range.end, "lines":all.len(), "text":all[range].join("\n"), "digest": format!("{:x}", Sha256::digest(&bytes))})
         };
         let output = Output::record(
             &self.artifacts,

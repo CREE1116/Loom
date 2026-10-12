@@ -23,7 +23,7 @@ pub fn specs(delegate: bool, readonly: bool) -> Vec<ToolSpec> {
     let mut tools = vec![
         spec(
             "find",
-            "Find targets by symbol name, path substring, or literal text. Set kind explicitly to symbol, path, or text. scope is an optional repository path or symbol target, never the search kind. Returns a complete set handle and a few representative names. No natural-language intent inference.",
+            "Find targets by symbol name, path substring, or literal text. Set kind explicitly to symbol, path, or text. scope is an optional repository path or symbol target, never the search kind. An omitted or empty scope searches the repository. Returns a complete set handle and a few representative names. No natural-language intent inference.",
             json!({"query":{"type":"string"},"kind":{"type":"string","enum":["symbol","path","text"]},"scope":{"type":"string"}}),
             &["query", "kind"],
         ),
@@ -47,7 +47,7 @@ pub fn specs(delegate: bool, readonly: bool) -> Vec<ToolSpec> {
         ),
         spec(
             "open",
-            "Read actual source for a target or small set. Directory targets show representative children. Command results return artifact_target; pass that value here unchanged to read durable output. artifact:<hash> and a returned raw artifact hash are both accepted. Large files require a zero-based line range. Handles are revision-pinned; refresh after changes.",
+            "Read source for a specific method/function or small set. Directories show representative children; large classes/types show paged AST members by default, so open the relevant member instead of the whole class. To read a slice, start/end are absolute zero-based FILE lines, end exclusive, at most 400 lines; symbol slices stay inside the symbol. File ranges clamp end to EOF and report actual start/end and total lines. A start without end reads up to 200 lines. Command results return artifact_target; pass it unchanged to read durable output. artifact:<hash> and raw artifact hashes are accepted. Handles are revision-pinned; refresh after changes.",
             json!({"target":{"type":"string"},"start":{"type":"integer","minimum":0},"end":{"type":"integer","minimum":0}}),
             &["target"],
         ),
@@ -390,9 +390,35 @@ impl Host<'_> {
             let (a, b) = match &node {
                 Node::Symbol(id) => {
                     let s = self.view.world.graph.get(id).context("symbol missing")?;
-                    (Some(s.start.saturating_sub(1)), Some(s.end))
+                    let from = s.start.saturating_sub(1);
+                    if start.is_none() && end.is_none() && s.lines() > 80
+                        && matches!(s.kind, crate::world::SymbolKind::Struct | crate::world::SymbolKind::Enum
+                            | crate::world::SymbolKind::Trait | crate::world::SymbolKind::Impl
+                            | crate::world::SymbolKind::Mod | crate::world::SymbolKind::Union)
+                    {
+                        let span = (from, s.end);
+                        let members = self.view.nodes.iter().filter(|child| {
+                            matches!(child, Node::Symbol(_)) && self.view.owner(child).as_ref() == Some(&node)
+                        }).cloned().collect::<BTreeSet<_>>();
+                        if !members.is_empty() {
+                            // Read through the overlay to retain the read-before-write contract.
+                            self.overlay.read(&file, Some(from..(from + 1).min(span.1)))?;
+                            results.push(json!({"target":node.id(),"view":"outline","start":span.0,"end":span.1,
+                                "instructions":guidance,"select":self.sets.store(&self.view,members)?,
+                                "hint":"Open a member target, or pass absolute file start/end for source."}));
+                            continue;
+                        }
+                    }
+                    let a = start.map_or(from, |n| n as usize);
+                    let b = end.map_or_else(|| if start.is_some() { a.saturating_add(200).min(s.end) } else { s.end }, |n| n as usize);
+                    ensure!(a >= from && a < s.end && b >= a, "symbol range must start within [{from}, {}) and be ordered", s.end);
+                    (Some(a), Some(b.min(s.end)))
                 }
-                _ => (start.map(|n| n as usize), end.map(|n| n as usize)),
+                _ if start.is_some() || end.is_some() => {
+                    let a = start.unwrap_or(0) as usize;
+                    (Some(a), Some(end.map_or_else(|| a.saturating_add(200), |n| n as usize)))
+                }
+                _ => (None, None),
             };
             if let (Some(a), Some(b)) = (a, b) {
                 ensure!(
@@ -408,7 +434,7 @@ impl Host<'_> {
                 let text = read.structured["text"].as_str().unwrap_or("");
                 let displayed = clip(text, budget.min(8000));
                 budget = budget.saturating_sub(displayed.len());
-                results.push(json!({"target":node.id(),"instructions":guidance,"source":displayed,"start":a.unwrap_or(0),"revision":self.view.revision()}));
+                results.push(json!({"target":node.id(),"instructions":guidance,"source":displayed,"start":read.structured["start"],"end":read.structured["end"],"lines":read.structured["lines"],"revision":self.view.revision()}));
             }
         }
         Ok(json!(results))

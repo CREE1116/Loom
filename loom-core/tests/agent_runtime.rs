@@ -99,6 +99,101 @@ fn cancel() -> Arc<AtomicBool> {
     Arc::new(AtomicBool::new(false))
 }
 #[test]
+fn default_token_budget_allows_progress_after_160k_and_explicit_budget_still_stops() {
+    let d = repo();
+    let mut first = response(vec![("open", json!({"target":"src/a.rs"}))]);
+    first.usage.input = Some(164809);
+    first.usage.output = Some(2317);
+    first.usage.cached_input = Some(55424);
+    for (tokens, expected) in [(Options::default().tokens, Status::Inspected), (160000, Status::Unresolved)] {
+        let mut core = Core::open(d.path()).unwrap();
+        let model = ScriptedModel::new([
+            first.clone(),
+            response(vec![("finish", json!({"summary":"source inspected"}))]),
+        ]);
+        let task = core.execute("inspect alpha", Intent::Inspect,
+            Options { tokens, ..options() }, &model, cancel(), &|_| {}).unwrap();
+        assert_eq!(task.status, expected, "{}", task.summary);
+        assert_eq!(task.calls, if expected == Status::Inspected { 2 } else { 1 });
+        assert!(task.usage.input.unwrap() >= 164809);
+        if expected == Status::Unresolved {
+            assert_eq!(task.summary, "observed token budget exhausted");
+        }
+    }
+}
+
+#[test]
+fn task_compaction_preserves_attached_image_and_current_objective() {
+    let d = repo();
+    let image = Part::Image { mime_type:"image/png".into(), data:"base64-image-fixture".repeat(2000) };
+    let model = ScriptedModel::new([
+        response(vec![("open",json!({"target":"src/a.rs"}))]),
+        response(vec![("open",json!({"target":"src/b.rs"}))]),
+        response(vec![("open",json!({"target":"Cargo.toml"}))]),
+        response(vec![("finish",json!({"summary":"inspected image and code"}))]),
+    ]);
+    let mut core = Core::open(d.path()).unwrap();
+    let task = core.execute("explain this image",Intent::Inspect,
+        Options { images:vec![image.clone()], context_bytes:500, ..options() },
+        &model,cancel(),&|_| {}).unwrap();
+    assert_eq!(task.status,Status::Inspected,"{}",task.summary);
+    for request in model.requests() {
+        assert!(request.messages.iter().flat_map(|message| &message.parts).any(|part| part == &image));
+        assert!(request.messages.iter().any(|message| message.text().contains("explain this image")));
+    }
+    assert!(model.requests()[3].messages.iter().any(|message| message.text().contains("Compacted observations")));
+}
+
+#[test]
+fn empty_search_scope_means_repository_and_named_scope_stays_restricted() {
+    let d = repo();
+    let view = WorldHub::default().view(d.path()).unwrap();
+    let mut sets = Sets::default();
+    for kind in [FindKind::Path, FindKind::Symbol, FindKind::Text] {
+        let query = if matches!(kind, FindKind::Path) { "src/a.rs" } else { "alpha" };
+        let baseline = sets.find(&view, Find { query:query.into(), kind, scope:None }).unwrap();
+        let empty = sets.find(&view, Find { query:query.into(), kind, scope:Some(String::new()) }).unwrap();
+        assert_eq!(empty, baseline);
+        let excluded = sets.find(&view, Find { query:query.into(), kind, scope:Some("src/b.rs".into()) }).unwrap();
+        assert_eq!(excluded["count"], 0);
+    }
+    assert!(sets.find(&view, Find { query:"alpha".into(), kind:FindKind::Symbol,
+        scope:Some("missing".into()) }).is_err());
+}
+
+#[test]
+fn opening_short_files_clamps_end_and_reports_actual_range() {
+    let d = repo();
+    fs::write(d.path().join("README.md"), "first\nsecond\nthird\n").unwrap();
+    let mut core = Core::open(d.path()).unwrap();
+    let model = ScriptedModel::new([
+        response(vec![("open", json!({"target":"README.md","start":0,"end":300}))]),
+        response(vec![("open", json!({"target":"README.md","start":1}))]),
+        response(vec![("open", json!({"target":"README.md","end":2}))]),
+        response(vec![("open", json!({"target":"README.md","start":4,"end":5}))]),
+        response(vec![("open", json!({"target":"README.md","start":2,"end":1}))]),
+        response(vec![("open", json!({"target":"README.md","start":0,"end":401}))]),
+        response(vec![("finish", json!({"summary":"inspected"}))]),
+    ]);
+    let events = Mutex::new(Vec::new());
+    core.execute("inspect read ranges", Intent::Inspect, options(), &model, cancel(),
+        &|e| { if e.detail["tool"] == "open" && e.detail["completed"] == true {
+            events.lock().unwrap().push(e);
+        } }).unwrap();
+    let events = events.into_inner().unwrap();
+    assert_eq!(events.len(), 6);
+    for (index, start, end, source) in [(0,0,3,"first\nsecond\nthird"), (1,1,3,"second\nthird"), (2,0,2,"first\nsecond")] {
+        assert!(!events[index].failed, "{:?}", events[index]);
+        let result = &events[index].detail["result"][0];
+        assert_eq!(result["start"], start);
+        assert_eq!(result["end"], end);
+        assert_eq!(result["lines"], 3);
+        assert_eq!(result["source"], source);
+    }
+    assert!(events[3..].iter().all(|event| event.failed));
+}
+
+#[test]
 fn assistant_commentary_precedes_tools_and_question_cancel_is_not_an_answer() {
     let d = repo();
     let mut core = Core::open(d.path()).unwrap();
@@ -123,6 +218,86 @@ fn assistant_commentary_precedes_tools_and_question_cancel_is_not_an_answer() {
     assert!(events[comment].detail["text"].as_str().unwrap().contains("핵심 함수"));
     assert!(model.requests()[2].messages.iter().flat_map(|m| &m.parts).any(|part|
         matches!(part, Part::ToolResult {output, ..} if output.contains("cancelled") && !output.contains("\"answer\""))));
+}
+
+#[test]
+fn large_ast_types_open_as_members_and_explicit_ranges_read_only_that_slice() {
+    let d = repo();
+    let mut source = String::from("public class Sample {\n");
+    for method in 0..12 {
+        source.push_str(&format!("  public int method{method}() {{\n"));
+        for line in 0..10 { source.push_str(&format!("    // method{method} evidence line {line} with enough content to make a full class expensive\n")); }
+        source.push_str(&format!("    return {method};\n  }}\n"));
+    }
+    source.push_str("}\n");
+    fs::write(d.path().join("Sample.java"), &source).unwrap();
+    let view = WorldHub::default().view(d.path()).unwrap();
+    let class = view.world.graph.symbols().iter().find(|s| s.name == "Sample").unwrap().id.clone();
+    let method = view.world.graph.symbols().iter().find(|s| s.name == "method0").unwrap().id.clone();
+    let mut core = Core::open(d.path()).unwrap();
+    let model = ScriptedModel::new([
+        response(vec![("find",json!({"kind":"symbol","query":"method0"}))]),
+        response(vec![("open",json!({"target":class}))]),
+        response(vec![("open",json!({"target":class,"start":30,"end":36}))]),
+        response(vec![("open",json!({"target":method}))]),
+        response(vec![("finish",json!({"summary":"inspected methods"}))]),
+    ]);
+    let events = Mutex::new(Vec::new());
+    core.execute("inspect Sample",Intent::Inspect,options(),&model,cancel(),&|event| {
+        if event.detail["completed"] == true { events.lock().unwrap().push(event); }
+    }).unwrap();
+    let events = events.into_inner().unwrap();
+    let target = &events[0].detail["result"]["representatives"][0];
+    assert!(target["start"].is_number() && target["end"].is_number());
+    let outline = &events[1].detail["result"][0];
+    assert_eq!(outline["view"], "outline");
+    assert!(outline.get("source").is_none());
+    assert_eq!(outline["select"]["count"], 12);
+    assert!(outline.to_string().len() * 3 < source.len(), "outline should be smaller than a third of the class");
+    let slice = &events[2].detail["result"][0];
+    assert_eq!(slice["start"], 30);
+    assert_eq!(slice["end"], 36);
+    assert_eq!(slice["source"], source.lines().skip(30).take(6).collect::<Vec<_>>().join("\n"));
+    let leaf = events[3].detail["result"][0]["source"].as_str().unwrap();
+    assert!(leaf.contains("method0") && !leaf.contains("method1"));
+}
+
+#[test]
+fn repeated_source_keeps_one_copy_in_model_context_and_complete_durable_events() {
+    let d = repo();
+    let source = format!("pub fn alpha() -> u32 {{\n{}1\n}}", "// Current source evidence must remain available without repeated copies in model inputs.\n".repeat(40));
+    fs::write(d.path().join("src/a.rs"), &source).unwrap();
+    let model = ScriptedModel::new([
+        response(vec![("open",json!({"target":"src/a.rs"}))]),
+        response(vec![("open",json!({"target":"src/a.rs"}))]),
+        response(vec![("finish",json!({"summary":"inspected alpha"}))]),
+    ]);
+    let mut core = Core::open(d.path()).unwrap();
+    let events = Mutex::new(Vec::new());
+    core.execute("inspect alpha",Intent::Inspect,options(),&model,cancel(),&|event| {
+        if event.detail["tool"] == "open" && event.detail["completed"] == true {
+            events.lock().unwrap().push(event);
+        }
+    }).unwrap();
+    let requests = model.requests();
+    let encoded_source = serde_json::to_string(&source).unwrap();
+    let count = requests[2].messages.iter().flat_map(|message| &message.parts)
+        .filter(|part| matches!(part,Part::ToolResult {output,..} if output.contains(&encoded_source))).count();
+    assert_eq!(count, 1, "duplicate source must not be billed again in each later request");
+    let events = events.into_inner().unwrap();
+    assert_eq!(events.len(), 2);
+    assert!(events.iter().all(|event| event.detail["result"][0]["source"] == source));
+    let mut duplicated = requests[2].clone();
+    for part in duplicated.messages.iter_mut().flat_map(|message| &mut message.parts) {
+        if let Part::ToolResult {output,..} = part
+            && output.starts_with("Identical source is retained")
+        {
+            *output = events[0].detail["result"].to_string();
+        }
+    }
+    let actual = models::router::estimate_tokens(&requests[2]);
+    let repeated = models::router::estimate_tokens(&duplicated);
+    assert!(actual + 500 < repeated, "expected to avoid at least 500 estimated input tokens: {actual} vs {repeated}");
 }
 #[test]
 fn query_sets_are_complete_and_revision_pinned() {

@@ -52,12 +52,34 @@ From a shell (`loom` is the installed binary; in the source tree `scripts/loom`)
 
 ## Models
 
+- In Loom, an explicit model choice stays selected when creating, resuming or branching
+  a conversation. Automatic selection may choose another model; inspect the requested
+  and served model in `.loom/surface/<task>.json` (`outcome.model_calls`).
+- The default task has no cumulative input/output token cap. `/settings` controls
+  request counts and task time; provider usage quotas and model context limits remain.
+- Images attached by paste, drag or `/image PATH` reach the selected model. Use a
+  vision-capable model; a provider can reject image input it does not support.
+
 - A downloaded GGUF is converted to LMX when "받은 GGUF를 LMX로 변환" is on in `/runtime`;
   "변환 후 원본 GGUF 보관" decides whether the GGUF stays. Each model is listed once.
 - LMX v2 files run on Loom's own engine (Qwen3.5/3.6 and LFM2/LFM2.5, dense or MoE); others run
   through the bundled llama.cpp (Metal or CUDA when present) or MLX.
 - Native engine settings are automatic; overrides: `LOOM_LMX_EXPERT_MB`, `LOOM_LMX_CONTEXT`,
   `LOOM_LMX_KV` (`q8_0`, `q4_0`, `f16`), `LOOM_LMX_GPU=0`.
+
+
+## Efficient repository tools
+
+- Use `find kind=symbol` for a known code owner and `kind=path/text` for paths or prose.
+  Omit `scope` or use an empty string to search the repository. Representatives include
+  zero-based start/end ranges; `end` is exclusive.
+- `open` on a large class/type returns paged AST members. Open the relevant method;
+  use `expand relation=references/referenced_by` only for necessary dependencies.
+- Explicit `open start/end` ranges are absolute file lines, also for symbol targets.
+  Do not replay a large class to fetch another region. Prefer a member target or the
+  intended range. File ends are clamped; invalid starts and ranges over 400 lines fail.
+- Repeated identical source is kept once in model context, with complete execution
+  records on disk. Reuse the source already read on the same revision.
 
 ## Skills
 

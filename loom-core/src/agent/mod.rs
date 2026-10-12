@@ -151,6 +151,8 @@ pub struct Options {
     pub session_id: Option<String>,
     pub session_start: Option<String>,
     pub history: Vec<Message>,
+    /// Images explicitly attached to this request, already encoded by the front end.
+    pub images: Vec<crate::models::Part>,
     pub pinned: Option<Revision>,
     pub inquiry: bool,
     pub read_only: bool,
@@ -158,6 +160,7 @@ pub struct Options {
     pub checks: Vec<String>,
     pub steps: usize,
     pub seconds: u64,
+    /// Cumulative observed input + output budget; 0 disables this optional limit.
     pub tokens: u64,
     pub call_seconds: u64,
     /// Total attempts for one logical model request, including the initial call.
@@ -179,6 +182,7 @@ impl Default for Options {
             session_id: None,
             session_start: None,
             history: vec![],
+            images: vec![],
             pinned: None,
             inquiry: false,
             read_only: false,
@@ -186,7 +190,7 @@ impl Default for Options {
             checks: vec![],
             steps: 32,
             seconds: 300,
-            tokens: 160000,
+            tokens: 0,
             call_seconds: 60,
             model_attempts: 3,
             context_bytes: 96000,
