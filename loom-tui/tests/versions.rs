@@ -84,12 +84,15 @@ fn wait(
             if predicate(&event.update) {
                 return Ok(event);
             }
+            // The real TUI drains queued events in batches. Sleeping after every
+            // existing event adds artificial latency to interruption acknowledgements.
+        } else {
+            std::thread::sleep(Duration::from_millis(5));
         }
         ensure!(
             Instant::now() < until,
             "backend timed out waiting for expected event"
         );
-        std::thread::sleep(Duration::from_millis(5));
     }
 }
 fn settings(state: &tempfile::TempDir) -> Settings {
