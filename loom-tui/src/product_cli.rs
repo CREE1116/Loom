@@ -20,6 +20,16 @@ pub fn dispatch(args: Vec<OsString>) -> Result<Option<i32>> {
     match command {
         "update" => crate::update::cli(&args[2..]).map(|()| Some(0)),
         "provider" => loom_core::models::provider_cli::execute(args[2..].iter().map(|arg| arg.to_string_lossy().into_owned())).map(|()| Some(0)),
+        "mcp" => {
+            let args: Vec<String> = args[2..].iter().map(|arg| arg.to_string_lossy().into_owned()).collect();
+            let root = std::env::current_dir()?;
+            loom_core::mcp_oauth::cli(&args, &root, &mut |url| {
+                println!("Continue in your browser:\n{url}");
+                let _ = crate::window::open_link(url);
+                Ok(())
+            })
+            .map(|()| Some(0))
+        }
         "runtime" => runtime(&args[2..]).map(|()| Some(0)),
         "model" => model(&args[2..]).map(|()| Some(0)),
         _ => Ok(None),

@@ -3077,6 +3077,7 @@ pub fn run() -> Report {
     ui_hierarchy(&mut report);
     tool_timeline(&mut report);
     provider_connections(&mut report);
+    mcp_servers(&mut report);
     App::activity_label_selfcheck(&mut report);
     App::activity_model_retention_selfcheck(&mut report);
     App::question_hover_selfcheck(&mut report);
@@ -4971,6 +4972,32 @@ mod provider_checks {
         assert!(app.input_forms[0].request.questions.iter().any(|q| q.secret));
         assert_eq!(app.editor.text, "draft stays");
         assert!(app.entries.is_empty());
+    }
+}
+
+fn mcp_servers(report: &mut Report) {
+    const S: &str = "mcp servers";
+    let mut app = App::new(false);
+    app.editor.insert("작성 중");
+    let intent = app.activate(Action::Command("/mcp".into()));
+    report.check(S, "/mcp는 화면을 열고 상태 조회를 요청", app.view == View::Mcp && intent == Some(Intent::Mcp(String::new())), "");
+    app.set_mcp_servers(Ok(vec![
+        crate::app::McpServer { name: "atlassian".into(), target: "https://mcp.atlassian.com/v1/mcp".into(), oauth: true, signed_in: true, status: Ok(32) },
+        crate::app::McpServer { name: "github".into(), target: "https://api.example/mcp".into(), oauth: true, signed_in: false, status: Ok(0) },
+        crate::app::McpServer { name: "local".into(), target: "my-mcp".into(), oauth: false, signed_in: false, status: Err("HTTP status 500".into()) },
+    ]));
+    for width in [48, 100] {
+        let screen = app.render(width, 40);
+        let text = screen_text(&screen);
+        report.check(S, format!("{width}: 서버별 상태·로그인 동작"),
+            text.contains("도구 32개") && text.contains("로그인 필요") && text.contains("HTTP status 500")
+                && screen.hits.iter().any(|hit| hit.action == Action::Command("/mcp login github".into()))
+                && screen.hits.iter().any(|hit| hit.action == Action::Command("/mcp logout atlassian".into()))
+                && app.editor.text == "작성 중", &text);
+        report.check(S, format!("{width}: 미설정 기본 서버만 추가 버튼"),
+            screen.hits.iter().any(|hit| hit.action == Action::Command("/mcp add gitlab".into()))
+                && !screen.hits.iter().any(|hit| hit.action == Action::Command("/mcp add atlassian".into())), &text);
+        report.dump(S, &screen);
     }
 }
 

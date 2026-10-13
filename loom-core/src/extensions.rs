@@ -76,6 +76,16 @@ struct ServerConfig {
     url: Option<String>,
     #[serde(default, alias = "http_headers")]
     headers: BTreeMap<String, String>,
+    /// Sign in with `loom mcp login <name>`; see `mcp_oauth`.
+    #[serde(default)]
+    oauth: bool,
+    /// Set for servers from the user's global config: they get network even when the
+    /// task sandbox denies it (the user chose them; a cloned repo's config cannot).
+    #[serde(skip)]
+    trusted: bool,
+    /// Global config only: argv whose stdout is the bearer token (e.g. `gh auth token`).
+    #[serde(default)]
+    bearer_command: Vec<String>,
     #[serde(default = "enabled")]
     enabled: bool,
 }
@@ -145,6 +155,151 @@ struct Route {
     read_only: bool,
 }
 
+/// MCP server of a published tool name (`mcp__<server>__<tool>`).
+pub fn mcp_server_of(tool: &str) -> Option<&str> {
+    tool.strip_prefix("mcp__")?.split("__").next()
+}
+
+/// Servers a request names directly (Jira/Confluence count as Atlassian), so their
+/// tools can be listed up front instead of waiting for the model to ask.
+pub fn servers_mentioned<'a>(
+    goal: &str,
+    servers: impl IntoIterator<Item = &'a str>,
+) -> Vec<&'a str> {
+    let goal = goal.to_lowercase();
+    servers
+        .into_iter()
+        .filter(|server| {
+            goal.contains(&server.to_lowercase())
+                || (*server == "atlassian"
+                    && ["jira", "confluence", "지라", "컨플루언스"]
+                        .iter()
+                        .any(|w| goal.contains(w)))
+        })
+        .collect()
+}
+
+/// User-wide config, merged under every workspace's `.loom/config.toml`.
+pub fn global_config_path() -> Option<PathBuf> {
+    crate::models::state_dir().map(|dir| dir.join("config.toml"))
+}
+
+fn read_config(path: &Path) -> Result<Option<Config>> {
+    match fs::read_to_string(path) {
+        Ok(text) => Ok(Some(
+            toml::from_str(&text).with_context(|| format!("parse {}", path.display()))?,
+        )),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e).with_context(|| format!("read {}", path.display())),
+    }
+}
+
+/// Global config overlaid by the workspace one (same-named servers replace).
+fn load_config(root: &Path) -> Result<Config> {
+    let workspace_path = root.join(".loom/config.toml");
+    let global_path = global_config_path();
+    let same = global_path.as_ref().is_some_and(|g| {
+        g.canonicalize()
+            .ok()
+            .is_some_and(|g| workspace_path.canonicalize().ok() == Some(g))
+    });
+    let mut config = match &global_path {
+        Some(path) => read_config(path)?.unwrap_or_default(),
+        None => Config::default(),
+    };
+    for server in config.mcp_servers.values_mut() {
+        server.trusted = true;
+    }
+    if !same && let Some(workspace) = read_config(&workspace_path)? {
+        for (name, server) in &workspace.mcp_servers {
+            // Commands run unsandboxed in Loom's process; a cloned repo must not supply one.
+            ensure!(
+                server.bearer_command.is_empty(),
+                "MCP server {name}: bearer_command is only allowed in the global config"
+            );
+        }
+        config.mcp_servers.extend(workspace.mcp_servers);
+        if workspace.web_search.is_some() {
+            config.web_search = workspace.web_search;
+        }
+    }
+    Ok(config)
+}
+
+/// Built-in servers offered by `/mcp`: (name, url, oauth, bearer_command).
+pub const PRESETS: &[(&str, &str, bool, &[&str])] = &[
+    ("atlassian", "https://mcp.atlassian.com/v1/mcp", true, &[]),
+    (
+        "github",
+        "https://api.githubcopilot.com/mcp/",
+        false,
+        &["gh", "auth", "token"],
+    ),
+    ("gitlab", "https://gitlab.com/api/v4/mcp", true, &[]),
+];
+
+/// Append a preset to the global config. `url` overrides the preset URL
+/// (e.g. a self-hosted GitLab's `https://host/api/v4/mcp`).
+pub fn add_preset(name: &str, url: Option<&str>) -> Result<()> {
+    let (_, default_url, oauth, command) = PRESETS
+        .iter()
+        .find(|(preset, ..)| *preset == name)
+        .ok_or_else(|| anyhow!("unknown MCP preset {name}"))?;
+    let url = url.unwrap_or(default_url);
+    validate_url(url)?;
+    let path = global_config_path().context("Loom state directory unavailable")?;
+    let existing = fs::read_to_string(&path).unwrap_or_default();
+    let config: Config =
+        toml::from_str(&existing).with_context(|| format!("parse {}", path.display()))?;
+    ensure!(
+        !config.mcp_servers.contains_key(name),
+        "MCP server {name} is already configured"
+    );
+    let q = |s: &str| toml::Value::String(s.into()).to_string();
+    let mut block = format!("\n\n[mcp_servers.{name}]\nurl = {}\n", q(url));
+    if *oauth {
+        block.push_str("oauth = true\n");
+    }
+    if !command.is_empty() {
+        let args: Vec<_> = command.iter().map(|a| q(a)).collect();
+        block.push_str(&format!("bearer_command = [{}]\n", args.join(", ")));
+    }
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir)?;
+    }
+    fs::write(
+        &path,
+        format!("{}{block}", existing.trim_end_matches('\n')).trim_start(),
+    )
+    .with_context(|| format!("write {}", path.display()))
+}
+
+/// Configured MCP servers (global + workspace): (name, url or command, oauth).
+pub fn configured_servers(root: &Path) -> Result<Vec<(String, String, bool)>> {
+    Ok(load_config(root)?
+        .mcp_servers
+        .into_iter()
+        .filter(|(_, s)| s.enabled)
+        .map(|(name, s)| (name, s.url.or(s.command).unwrap_or_default(), s.oauth))
+        .collect())
+}
+
+/// URL of an `oauth = true` server (global + workspace config).
+pub fn oauth_url(root: &Path, name: &str) -> Result<String> {
+    let config = load_config(root)?;
+    let server = config
+        .mcp_servers
+        .get(name)
+        .ok_or_else(|| anyhow!("MCP server {name} is not configured"))?;
+    ensure!(server.oauth, "MCP server {name} does not set oauth = true");
+    let url = server
+        .url
+        .clone()
+        .ok_or_else(|| anyhow!("MCP server {name}: oauth requires HTTP url"))?;
+    validate_url(&url)?;
+    Ok(url)
+}
+
 impl Extensions {
     pub fn open(root: &Path) -> Result<Self> {
         Self::open_for_workspace(
@@ -170,14 +325,7 @@ impl Extensions {
         let execution_root = execution_root
             .canonicalize()
             .context("opening MCP execution workspace")?;
-        let path = config_root.join(".loom/config.toml");
-        let config: Config = match fs::read_to_string(&path) {
-            Ok(text) => {
-                toml::from_str(&text).with_context(|| format!("parse {}", path.display()))?
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Config::default(),
-            Err(e) => return Err(e).with_context(|| format!("read {}", path.display())),
-        };
+        let config = load_config(&config_root)?;
         for (name, server) in &config.mcp_servers {
             if !server.enabled {
                 continue;
@@ -204,6 +352,14 @@ impl Extensions {
                     "MCP server {name}: args/env require stdio command"
                 );
             }
+            ensure!(
+                !server.oauth || server.url.is_some(),
+                "MCP server {name}: oauth requires HTTP url"
+            );
+            ensure!(
+                server.bearer_command.is_empty() || (server.url.is_some() && !server.oauth),
+                "MCP server {name}: bearer_command requires HTTP url and excludes oauth"
+            );
             validate_headers(&server.headers)?;
             for (key, value) in &server.env {
                 ensure!(
@@ -276,15 +432,42 @@ impl Extensions {
         self.specs_with_network(true)
     }
 
+    /// Per-server discovery outcome for status screens: tool count or failure reason.
+    pub fn server_status(&self) -> Vec<(String, std::result::Result<usize, String>)> {
+        self.specs();
+        let cancel = AtomicBool::new(false);
+        let Ok(state) = self.lock(&cancel, Instant::now() + DISCOVERY_TIMEOUT) else {
+            return Vec::new();
+        };
+        state
+            .servers
+            .keys()
+            .map(|name| {
+                let prefix = format!("MCP server {name} discovery failed: ");
+                let failure = state
+                    .diagnostics
+                    .iter()
+                    .find_map(|d| d.strip_prefix(&prefix));
+                let tools = state.routes.values().filter(|r| &r.server == name).count();
+                let status = match failure {
+                    Some(reason) if tools == 0 => Err(reason.to_owned()),
+                    _ => Ok(tools),
+                };
+                (name.clone(), status)
+            })
+            .collect()
+    }
+
     /// Adds a per-discovery network restriction. It cannot override the stored
     /// execution policy; stdio servers always inherit the stored OS policy.
     pub fn specs_with_network(&self, allow_network: bool) -> Vec<ToolSpec> {
+        let requested = allow_network;
         let allow_network = allow_network && self.execution.policy.network;
         let cancel = AtomicBool::new(false);
         let deadline = Instant::now() + DISCOVERY_TIMEOUT;
         match self.lock(&cancel, deadline) {
             Ok(mut state) => {
-                if let Err(e) = self.discover(&mut state, &cancel, deadline, allow_network) {
+                if let Err(e) = self.discover(&mut state, &cancel, deadline, requested) {
                     state.diagnostics.push(format!("MCP discovery: {e:#}"));
                 }
                 let mut specs = builtin_specs();
@@ -297,7 +480,8 @@ impl Extensions {
                                 || state.routes.get(&spec.name).is_some_and(|r| r.read_only))
                                 && (allow_network
                                     || state.routes.get(&spec.name).is_some_and(|r| {
-                                        state.servers[&r.server].config.url.is_none()
+                                        let config = &state.servers[&r.server].config;
+                                        config.url.is_none() || (requested && config.trusted)
                                     }))
                         })
                         .cloned(),
@@ -357,9 +541,10 @@ impl Extensions {
             .try_lock()
             .ok()
             .and_then(|s| {
-                s.routes
-                    .get(name)
-                    .map(|r| s.servers[&r.server].config.url.is_some())
+                s.routes.get(name).map(|r| {
+                    let config = &s.servers[&r.server].config;
+                    config.url.is_some() && !config.trusted
+                })
             })
             .unwrap_or(true)
     }
@@ -409,7 +594,7 @@ impl Extensions {
             .get_mut(&route.server)
             .ok_or_else(|| anyhow!("missing MCP server {}", route.server))?;
         ensure!(
-            server.config.url.is_none() || self.execution.policy.network,
+            server.config.url.is_none() || server.config.trusted || self.execution.policy.network,
             "MCP HTTP network access is disabled by execution policy"
         );
         let params = match route.method {
@@ -462,7 +647,7 @@ impl Extensions {
         deadline: Instant,
         allow_network: bool,
     ) -> Result<()> {
-        let allow_network = allow_network && self.execution.policy.network;
+        let policy_network = self.execution.policy.network;
         if state.discovered {
             return Ok(());
         }
@@ -474,13 +659,67 @@ impl Extensions {
             DIAGNOSTICS.to_string(),
         ]);
         used.extend(state.routes.keys().cloned());
-        for name in names {
-            check(cancel, deadline)?;
-            let server = state.servers.get_mut(&name).unwrap();
-            if server.discovered || (!allow_network && server.config.url.is_some()) {
-                continue;
+        check(cancel, deadline)?;
+        // Servers are independent, so connect them concurrently (a slow one no longer
+        // adds to the others), then publish routes in name order as before.
+        let ready: Vec<String> = names
+            .into_iter()
+            .filter(|name| {
+                let server = &state.servers[name];
+                let network = allow_network && (policy_network || server.config.trusted);
+                !server.discovered && (network || server.config.url.is_none())
+            })
+            .collect();
+        let pending: Vec<(String, Server)> = ready
+            .into_iter()
+            .map(|name| {
+                let server = state.servers.remove(&name).unwrap();
+                (name, server)
+            })
+            .collect();
+        let execution = &self.execution;
+        let discover = |name: &str, server: &mut Server| {
+            let key = cache_key(name, &server.config);
+            match cache_load(&key) {
+                Some(tools) => Ok(tools),
+                None => server
+                    .discover(execution, cancel, deadline)
+                    .inspect(|tools| cache_save(&key, tools)),
             }
-            let discovered = server.discover(&self.execution, cancel, deadline);
+        };
+        // HTTP servers are connected concurrently (a slow one no longer adds to the
+        // others). Stdio servers stay on this thread: the sandbox's die-with-parent
+        // signal fires when the spawning *thread* exits, which would kill them.
+        let (http, stdio): (Vec<_>, Vec<_>) = pending
+            .into_iter()
+            .partition(|(_, server)| server.config.url.is_some());
+        let mut results: Vec<_> = thread::scope(|scope| {
+            let workers: Vec<_> = http
+                .into_iter()
+                .map(|(name, mut server)| {
+                    scope.spawn(move || {
+                        let discovered = discover(&name, &mut server);
+                        (name, server, discovered)
+                    })
+                })
+                .collect();
+            let mut results: Vec<_> = stdio
+                .into_iter()
+                .map(|(name, mut server)| {
+                    let discovered = discover(&name, &mut server);
+                    (name, server, discovered)
+                })
+                .collect();
+            results.extend(
+                workers
+                    .into_iter()
+                    .map(|worker| worker.join().expect("MCP discovery worker panicked")),
+            );
+            results
+        });
+        results.sort_by(|a, b| a.0.cmp(&b.0));
+        let mut cancelled = None;
+        for (name, mut server, discovered) in results {
             server.discovered = true;
             match discovered {
                 Ok(tools) => {
@@ -509,10 +748,14 @@ impl Extensions {
                         .diagnostics
                         .push(format!("MCP server {name} discovery failed: {e:#}"));
                     if cancel.load(Ordering::Relaxed) {
-                        return Err(e);
+                        cancelled.get_or_insert(e);
                     }
                 }
             }
+            state.servers.insert(name, server);
+        }
+        if let Some(e) = cancelled {
+            return Err(e);
         }
         state.discovered = state.servers.values().all(|s| s.discovered);
         Ok(())
@@ -614,6 +857,77 @@ impl Extensions {
 }
 
 type DiscoveredTool = (String, String, Value, &'static str, Option<String>, bool);
+
+/// Tool lists are cached so a task does not wait on every server's round trips
+/// (GitHub's list alone is ~2.5s); calls still connect on demand. `/mcp` refresh clears it.
+const CACHE_TTL: Duration = Duration::from_secs(24 * 3600);
+fn cache_dir() -> Option<PathBuf> {
+    crate::models::state_dir().map(|dir| dir.join("mcp-cache"))
+}
+fn cache_key(name: &str, c: &ServerConfig) -> String {
+    use sha2::{Digest, Sha256};
+    let identity = format!(
+        "{name}\n{:?}\n{:?}\n{:?}\n{:?}\n{}\n{:?}",
+        c.url, c.command, c.args, c.env, c.oauth, c.bearer_command
+    );
+    Sha256::digest(identity.as_bytes())[..12]
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+fn cache_load(key: &str) -> Option<Vec<DiscoveredTool>> {
+    let path = cache_dir()?.join(format!("{key}.json"));
+    let age = fs::metadata(&path).ok()?.modified().ok()?.elapsed().ok()?;
+    if age > CACHE_TTL {
+        return None;
+    }
+    let entries: Vec<Value> = serde_json::from_slice(&fs::read(&path).ok()?).ok()?;
+    entries
+        .into_iter()
+        .map(|e| {
+            let method = match e["method"].as_str()? {
+                "tools/call" => "tools/call",
+                "resources/list" => "resources/list",
+                "resources/read" => "resources/read",
+                "resources/templates/list" => "resources/templates/list",
+                "prompts/list" => "prompts/list",
+                "prompts/get" => "prompts/get",
+                _ => return None,
+            };
+            Some((
+                e["name"].as_str()?.to_owned(),
+                e["description"].as_str()?.to_owned(),
+                e["parameters"].clone(),
+                method,
+                e["tool"].as_str().map(str::to_owned),
+                e["read_only"].as_bool()?,
+            ))
+        })
+        .collect()
+}
+fn cache_save(key: &str, tools: &[DiscoveredTool]) {
+    let Some(dir) = cache_dir() else { return };
+    let entries: Vec<Value> = tools
+        .iter()
+        .map(|(name, description, parameters, method, tool, read_only)| {
+            json!({"name": name, "description": description, "parameters": parameters,
+                   "method": method, "tool": tool, "read_only": read_only})
+        })
+        .collect();
+    // Best effort: a cache that cannot be written only costs the next discovery.
+    let _ = fs::create_dir_all(&dir).and_then(|()| {
+        fs::write(
+            dir.join(format!("{key}.json")),
+            serde_json::to_vec(&entries).unwrap_or_default(),
+        )
+    });
+}
+/// Forget cached tool lists (after config, sign-in, or an explicit refresh).
+pub fn clear_discovery_cache() {
+    if let Some(dir) = cache_dir() {
+        let _ = fs::remove_dir_all(dir);
+    }
+}
 impl Server {
     fn start(
         &mut self,
@@ -828,6 +1142,29 @@ impl Server {
                 if let Some(session) = session.as_deref() {
                     set_header(&mut headers, "Mcp-Session-Id", session);
                 }
+                if self.config.oauth {
+                    // ponytail: refresh is a blocking request outside cancel/deadline (bounded by its own 15s timeout).
+                    let token = crate::mcp_oauth::bearer(self.config.url.as_deref().unwrap())?;
+                    set_header(&mut headers, "Authorization", &format!("Bearer {token}"));
+                }
+                if let Some((program, args)) = self.config.bearer_command.split_first() {
+                    // ponytail: runs per request (~20ms for gh); cache if a slow command shows up.
+                    let output = Command::new(program)
+                        .args(args)
+                        .stdin(Stdio::null())
+                        .stderr(Stdio::null())
+                        .output()
+                        .with_context(|| format!("run bearer_command {program}"))?;
+                    let token = String::from_utf8(output.stdout).unwrap_or_default();
+                    let token = token.trim();
+                    ensure!(
+                        output.status.success()
+                            && !token.is_empty()
+                            && token.bytes().all(|b| (0x21..=0x7e).contains(&b)),
+                        "bearer_command {program} did not print a token"
+                    );
+                    set_header(&mut headers, "Authorization", &format!("Bearer {token}"));
+                }
                 if message.get("method").and_then(Value::as_str) != Some("initialize") {
                     set_header(&mut headers, "MCP-Protocol-Version", &self.protocol);
                 }
@@ -896,8 +1233,9 @@ impl Process {
             .env("TEMP", temporary.path())
             .env("CARGO_TARGET_DIR", &target)
             .env("PYTHONDONTWRITEBYTECODE", "1");
-        execution
-            .policy
+        let mut policy = execution.policy;
+        policy.network |= config.trusted;
+        policy
             .configure_command(
                 &mut command,
                 &execution.root,

@@ -1,6 +1,16 @@
 // Path import keeps this gate runnable before the main agent exports the module.
 mod models {
     pub use loom_core::models::ToolSpec;
+    thread_local! {
+        /// Per-test state dir (global config, discovery cache); unset disables both.
+        pub static STATE_DIR: std::cell::RefCell<Option<std::path::PathBuf>> = const { std::cell::RefCell::new(None) };
+    }
+    pub fn state_dir() -> Option<std::path::PathBuf> {
+        STATE_DIR.with(|dir| dir.borrow().clone())
+    }
+}
+mod mcp_oauth {
+    pub use loom_core::mcp_oauth::*;
 }
 mod effects {
     pub use loom_core::effects::{ExecutionPolicy, SandboxMode};
@@ -955,4 +965,77 @@ fn workspace_network_policy_denies_stdio_os_network_and_builtin_http_calls() {
             }
         }
     }
+}
+
+#[test]
+fn global_servers_get_network_but_workspace_servers_stay_gated() {
+    let http = Http::new(|_, _, _| ("503 Unavailable".into(), String::new(), String::new()));
+    let global = TempDir::new().unwrap();
+    fs::write(
+        global.path().join("config.toml"),
+        format!("[mcp_servers.mine]\nurl='{}/mine'\n", http.url),
+    )
+    .unwrap();
+    models::STATE_DIR.with(|dir| *dir.borrow_mut() = Some(global.path().to_owned()));
+    let workspace = config(&format!("[mcp_servers.repo]\nurl='{}/repo'\n", http.url));
+    let policy = ExecutionPolicy {
+        sandbox: SandboxMode::FullAccess,
+        network: false,
+    };
+    let ext = Extensions::open_for_workspace(workspace.path(), workspace.path(), policy).unwrap();
+    ext.specs();
+    let paths = http.requests.lock().unwrap().join("\n");
+    assert!(
+        paths.contains("/mine"),
+        "global server must be discovered without sandbox network: {paths}"
+    );
+    assert!(
+        !paths.contains("/repo"),
+        "workspace server must stay behind the network policy: {paths}"
+    );
+
+    // A cloned repo must not be able to run an unsandboxed token command.
+    let hostile = config(&format!(
+        "[mcp_servers.repo]\nurl='{}/repo'\nbearer_command=['sh','-c','exit 0']\n",
+        http.url
+    ));
+    assert!(Extensions::open(hostile.path()).is_err());
+    models::STATE_DIR.with(|dir| *dir.borrow_mut() = None);
+}
+
+#[cfg(unix)]
+#[test]
+fn cached_tool_lists_skip_server_startup_until_a_call() {
+    let state = TempDir::new().unwrap();
+    models::STATE_DIR.with(|dir| *dir.borrow_mut() = Some(state.path().to_owned()));
+    let dir = stdio("");
+    let started = dir.path().join("started");
+    let first = Extensions::open(dir.path()).unwrap().specs();
+    assert!(started.exists(), "first discovery starts the server");
+    fs::remove_file(&started).unwrap();
+
+    let ext = Extensions::open(dir.path()).unwrap();
+    let cached = ext.specs();
+    let names = |specs: &[loom_core::models::ToolSpec]| {
+        specs.iter().map(|s| s.name.clone()).collect::<Vec<_>>()
+    };
+    assert_eq!(names(&cached), names(&first));
+    assert!(!started.exists(), "a cached list must not start the server");
+    let echo = &cached
+        .iter()
+        .find(|s| s.name.starts_with("mcp__fixture__echo"))
+        .unwrap()
+        .name;
+    assert!(
+        ext.call(
+            echo,
+            &json!({"text":"lazy"}),
+            &AtomicBool::new(false),
+            TIMEOUT
+        )
+        .unwrap()
+        .contains("lazy")
+    );
+    assert!(started.exists(), "a call connects on demand");
+    models::STATE_DIR.with(|dir| *dir.borrow_mut() = None);
 }

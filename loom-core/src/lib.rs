@@ -12,4 +12,5 @@ pub mod world;
 pub mod instructions;
 pub mod sessions;
 pub mod extensions;
+pub mod mcp_oauth;
 pub mod hooks;

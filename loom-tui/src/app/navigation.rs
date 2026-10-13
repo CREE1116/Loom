@@ -8,7 +8,7 @@ impl App {
         )
     }
     fn in_environment(&self) -> bool {
-        matches!(self.view, View::Models | View::Providers | View::Routing | View::Runtime | View::Skills | View::Permissions)
+        matches!(self.view, View::Models | View::Providers | View::Routing | View::Runtime | View::Skills | View::Mcp | View::Permissions)
     }
     pub(super) fn root_tabs(&self) -> Vec<(String, Action, bool)> {
         let work = if self.approvals.is_empty() {
@@ -71,6 +71,7 @@ impl App {
                     Action::Command("/skills".into()),
                     self.view == View::Skills,
                 ),
+                ("MCP", Action::Command("/mcp".into()), self.view == View::Mcp),
                 (
                     "권한",
                     Action::Command("/permissions".into()),

@@ -506,6 +506,15 @@ fn run_scoped<'scope, 'env>(
     if !task.skills.is_empty() {
         enabled_groups.insert("skills");
     }
+    // MCP servers by name (from `mcp__<server>__<tool>`), so the hidden group says what it holds.
+    let mcp_servers: BTreeSet<&str> = specs
+        .iter()
+        .filter_map(|spec| crate::extensions::mcp_server_of(&spec.name))
+        .collect();
+    // A request that names a configured service needs its tools up front.
+    if !crate::extensions::servers_mentioned(&task.goal, mcp_servers.iter().copied()).is_empty() {
+        enabled_groups.insert("extensions");
+    }
     let visible = |enabled: &BTreeSet<&'static str>| -> Vec<crate::models::ToolSpec> {
         let mut out: Vec<_> = specs
             .iter()
@@ -526,7 +535,17 @@ fn run_scoped<'scope, 'env>(
                 name: "enable_tools".into(),
                 description: format!(
                     "Add tool groups when the core tools are not enough: {}.",
-                    hidden.iter().map(|(g, d)| format!("{g} ({d})")).collect::<Vec<_>>().join("; ")
+                    hidden
+                        .iter()
+                        .map(|(g, d)| match *g {
+                            "extensions" if !mcp_servers.is_empty() => format!(
+                                "{g} ({d}; MCP servers: {})",
+                                mcp_servers.iter().copied().collect::<Vec<_>>().join(", ")
+                            ),
+                            _ => format!("{g} ({d})"),
+                        })
+                        .collect::<Vec<_>>()
+                        .join("; ")
                 ),
                 parameters: json!({"type":"object","required":["groups"],"properties":{"groups":{"type":"array","items":{"type":"string","enum":hidden.iter().map(|(g, _)| *g).collect::<Vec<_>>()}}}}),
             });
