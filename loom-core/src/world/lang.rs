@@ -142,6 +142,16 @@ struct Definition {
     refs: BTreeSet<String>,
 }
 
+/// 1-based line of a byte offset. Tag offsets can fall inside a multibyte char
+/// (e.g. Korean comments), so count newline bytes instead of slicing the str.
+fn line_at(source: &str, byte: usize) -> usize {
+    source.as_bytes()[..byte.min(source.len())]
+        .iter()
+        .filter(|&&b| b == b'\n')
+        .count()
+        + 1
+}
+
 fn tags(language: Language, file: &str, source: &str) -> Result<Vec<Symbol>, String> {
     let config = configuration(language)
         .ok_or_else(|| format!("no {} symbol extractor", language.name()))?;
@@ -149,7 +159,7 @@ fn tags(language: Language, file: &str, source: &str) -> Result<Vec<Symbol>, Str
     let (tags, _) = context
         .generate_tags(config, source.as_bytes(), None)
         .map_err(|e| format!("{e:?}"))?;
-    let line_of = |byte: usize| source[..byte.min(source.len())].matches('\n').count() + 1;
+    let line_of = |byte: usize| line_at(source, byte);
     let mut definitions: Vec<Definition> = Vec::new();
     let mut references: Vec<(String, usize)> = Vec::new();
     for tag in tags {
@@ -242,6 +252,15 @@ mod tests {
             .into_iter()
             .map(|s| s.id)
             .collect()
+    }
+
+    #[test]
+    fn line_numbers_accept_offsets_inside_multibyte_chars() {
+        let source = "# 한글 주석\ndef f():\n    return 1\n";
+        // Byte 3 is inside '한' (bytes 2..5); slicing the str there used to panic.
+        assert_eq!(line_at(source, 3), 1);
+        assert_eq!(line_at(source, source.find("def").unwrap()), 2);
+        assert_eq!(line_at(source, usize::MAX), 4);
     }
 
     #[test]
