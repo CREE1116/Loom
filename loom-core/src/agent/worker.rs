@@ -360,8 +360,10 @@ pub fn run(
         extensions: None,
         mcp_enabled: BTreeSet::new(),
     };
-    // Extensions are configured per workspace; without a config there is nothing to start.
-    if shared.root.join(".loom/config.toml").is_file() {
+    // Extensions come from the global config and/or the workspace one; without either there is nothing to start.
+    if shared.root.join(".loom/config.toml").is_file()
+        || crate::extensions::global_config_path().is_some_and(|path| path.is_file())
+    {
         host.extensions = crate::extensions::Extensions::open_for_workspace(shared.root, host.overlay.dir(), shared.options.policy).ok();
         if let Some(extensions) = &host.extensions {
             let specs = extensions.specs();

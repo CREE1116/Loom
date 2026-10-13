@@ -469,6 +469,8 @@ fn main() -> Result<()> {
     let update_rx = if args.demo { None } else { loom_tui::update::auto_check() };
     let (provider_tx, provider_rx) = mpsc::channel::<(Result<String, String>, bool, Option<String>)>();
     let mut provider_job_active = false;
+    let (mcp_tx, mcp_rx) = mpsc::channel::<(Result<Vec<loom_tui::app::McpServer>, String>, Option<Result<String, String>>)>();
+    let mcp_root = args.cwd.clone();
     let (paste_tx, paste_rx) = mpsc::channel::<Result<window::ClipboardContent, String>>();
     let mut dirty = true;
     let mut canvas = app.render(80, 24);
@@ -534,6 +536,11 @@ fn main() -> Result<()> {
             app.refresh_providers();
             if let Some(id) = selection { app.open_provider_models(&id); }
             if reload { if let Err(error) = backend.reload_providers() { app.error(error.to_string()); } }
+            dirty = true;
+        }
+        while let Ok((servers, message)) = mcp_rx.try_recv() {
+            match message { Some(Ok(message)) => app.notify(message), Some(Err(error)) => app.error(error), None => {} }
+            app.set_mcp_servers(servers);
             dirty = true;
         }
         while let Ok(result) = paste_rx.try_recv() {
@@ -689,6 +696,34 @@ fn main() -> Result<()> {
                         Ok(()) => { if let Err(error) = backend.reload_providers() { app.error(error.to_string()); } }
                         Err(error) => app.input_reply_failed(id, &error.to_string()),
                     }
+                }
+                Intent::Mcp(argument) => {
+                    let (root, tx, argument) = (mcp_root.clone(), mcp_tx.clone(), argument.clone());
+                    if argument.starts_with("login ") || argument.starts_with("add ") { app.notify("브라우저에서 MCP 로그인을 계속하세요."); }
+                    std::thread::spawn(move || {
+                        // /mcp always shows live state: refresh, add, login and logout re-discover.
+                        loom_core::extensions::clear_discovery_cache();
+                        let words: Vec<_> = argument.split_whitespace().collect();
+                        let message = match words.as_slice() {
+                            ["add", name, rest @ ..] => Some((|| {
+                                loom_core::extensions::add_preset(name, rest.first().copied())?;
+                                // OAuth presets go straight to the browser; token presets are ready.
+                                if let Ok(url) = loom_core::extensions::oauth_url(&root, name) {
+                                    loom_core::mcp_oauth::login(&url, &mut |link| window::open_link(link))?;
+                                }
+                                Ok(format!("{name} 추가 완료"))
+                            })()),
+                            ["login", name] => Some(loom_core::extensions::oauth_url(&root, name)
+                                .and_then(|url| loom_core::mcp_oauth::login(&url, &mut |link| window::open_link(link)))
+                                .map(|()| format!("{name} 로그인 완료"))),
+                            ["logout", name] => Some(loom_core::extensions::oauth_url(&root, name)
+                                .and_then(|url| loom_core::mcp_oauth::logout(&url))
+                                .map(|_| format!("{name} 로그아웃 완료"))),
+                            _ => None,
+                        }.map(|r| r.map_err(|e| format!("{e:#}")));
+                        let servers = loom_tui::app::load_mcp_servers(&root).map_err(|e| format!("{e:#}"));
+                        let _ = tx.send((servers, message));
+                    });
                 }
                 Intent::Provider(argument) => {
                     let words: Vec<_> = argument.split_whitespace().collect();

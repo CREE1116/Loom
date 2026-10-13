@@ -12,6 +12,8 @@ mod command_palette;
 mod doctor;
 mod events;
 mod images;
+mod mcp;
+pub use mcp::{McpServer, load_servers as load_mcp_servers};
 mod meter;
 mod models;
 mod model_catalog;
@@ -472,6 +474,7 @@ pub enum View {
     Approvals,
     Help,
     Skills,
+    Mcp,
     Models,
     Providers,
     Routing,
@@ -500,6 +503,7 @@ const COMMANDS: &[(&str, &str)] = &[
     ("/context", "현재 세션 참조 파일 및 컨텍스트 현황: /context"),
     ("/settings", "UI 언어·악센트 색상·작업 패널"),
     ("/skills", "설치된 스킬 선택"),
+    ("/mcp", "MCP 서버 연결 상태·로그인"),
     (
         "/permissions",
         "권한 확인/변경: /permissions sandbox MODE | approval MODE | confirm | cancel",
@@ -568,6 +572,7 @@ pub enum Intent {
     Copy(String),
     Quit,
     RefreshSkills,
+    Mcp(String),
     RefreshModels,
     Provider(String),
     Session(Option<String>),
@@ -742,6 +747,8 @@ pub struct App {
     model_price_groups: bool,
     model_free_only: bool,
     pub provider_accounts: Vec<loom_core::models::registry::Summary>,
+    pub mcp_servers: Vec<McpServer>,
+    pub mcp_loading: bool,
     pub routing_max_cost: loom_core::models::CostClass,
     pub local_models: crate::local_models::Manager,
     pub runtime_checkpoints: Vec<loom_core::models::checkpoints::Checkpoint>,
@@ -892,6 +899,8 @@ impl App {
             model_price_groups: true,
             model_free_only: false,
             provider_accounts: Vec::new(),
+            mcp_servers: Vec::new(),
+            mcp_loading: false,
             routing_max_cost: loom_core::models::COST_CEILING,
             local_models: Default::default(),
             runtime_checkpoints: Vec::new(),
@@ -2139,6 +2148,7 @@ impl App {
                 Some(Intent::RefreshSkills)
             }
             "/provider" | "/providers" => self.provider_command(argument),
+            "/mcp" => self.mcp_command(argument),
             "/routing" => {
                 self.refresh_providers(); self.switch_view(View::Routing); self.panel_open = true;
                 None
@@ -4089,6 +4099,7 @@ impl App {
             View::Rewind => "되돌리기",
             View::Help => "도움말",
             View::Skills => "스킬 선택",
+            View::Mcp => "MCP 서버",
             View::Models => "모델 선택",
             View::Providers => "공급자 연결",
             View::Routing => "자동 라우팅 설정",
@@ -4479,6 +4490,7 @@ impl App {
                     rows.push((line, Tone::Normal, None));
                 }
             }
+            View::Mcp => rows.extend(self.mcp_rows(width)),
             View::Skills => {
                 rows.extend(skill_rows(
                     &self.skills,
