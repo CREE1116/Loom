@@ -117,13 +117,86 @@ pub fn write_launcher(directory: &Path, command: &str) -> Result<std::path::Path
     writeln!(file, "#!/bin/sh\nexec {command}")?;
     Ok(path)
 }
+/// Linux/BSD clipboard writers, tried in order; Wayland's own tool first.
+#[cfg(not(any(target_os = "macos", windows)))]
+const COPY_TOOLS: &[(&str, &[&str])] = &[
+    ("wl-copy", &[]),
+    ("xclip", &["-selection", "clipboard"]),
+    ("xsel", &["--clipboard", "--input"]),
+];
+
+/// With no helper installed, arboard writes to the display server directly. One
+/// instance lives for the whole process: on X11 the owner must stay alive to serve
+/// pastes, and a clipboard manager (e.g. Klipper) takes the contents over at exit.
+#[cfg(not(any(target_os = "macos", windows)))]
+fn native_clipboard() -> Result<std::sync::MutexGuard<'static, arboard::Clipboard>> {
+    static CLIPBOARD: std::sync::OnceLock<std::sync::Mutex<arboard::Clipboard>> =
+        std::sync::OnceLock::new();
+    if CLIPBOARD.get().is_none() {
+        let clipboard = arboard::Clipboard::new().context("Clipboard unavailable")?;
+        let _ = CLIPBOARD.set(std::sync::Mutex::new(clipboard));
+    }
+    CLIPBOARD
+        .get()
+        .unwrap()
+        .lock()
+        .map_err(|_| anyhow::anyhow!("Clipboard unavailable"))
+}
+
+/// Writes with the first installed helper. `Ok(false)` means none is installed.
+#[cfg(not(any(target_os = "macos", windows)))]
+fn copy_with_tool(text: &str) -> Result<bool> {
+    for (program, args) in COPY_TOOLS {
+        // wl-copy needs a Wayland session; under X11 it fails rather than falls through.
+        if program.starts_with("wl-") && std::env::var_os("WAYLAND_DISPLAY").is_none() {
+            continue;
+        }
+        let mut child = match Command::new(program)
+            .args(*args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+        {
+            Ok(child) => child,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e).context("Clipboard unavailable"),
+        };
+        child
+            .stdin
+            .take()
+            .context("Clipboard input unavailable")?
+            .write_all(text.as_bytes())?;
+        let output = child.wait_with_output()?;
+        if !output.status.success() {
+            bail!(
+                "Clipboard command {program} failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        return Ok(true);
+    }
+    Ok(false)
+}
+
 pub fn copy(text: &str) -> Result<()> {
+    #[cfg(not(any(target_os = "macos", windows)))]
+    {
+        if !copy_with_tool(text)? {
+            native_clipboard()?
+                .set_text(text)
+                .context("Clipboard write failed")?;
+        }
+        Ok(())
+    }
+    #[cfg(any(target_os = "macos", windows))]
+    copy_with_command(text)
+}
+
+#[cfg(any(target_os = "macos", windows))]
+fn copy_with_command(text: &str) -> Result<()> {
     #[cfg(target_os = "macos")]
     let mut command = Command::new("pbcopy");
-    #[cfg(not(any(target_os = "macos", windows)))]
-    let mut command = Command::new("xclip");
-    #[cfg(not(any(target_os = "macos", windows)))]
-    command.args(["-selection", "clipboard"]);
     #[cfg(windows)]
     let mut command = {
         let mut command = Command::new("powershell.exe");
@@ -208,6 +281,13 @@ pub fn paste() -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// Manual check against the real desktop clipboard (no xclip/wl-copy needed):
+    /// `cargo test -- --ignored copy_reaches`, then paste into another app.
+    #[test]
+    #[ignore]
+    fn copy_reaches_the_desktop_clipboard() {
+        copy(&format!("loom 클립보드 {}", std::process::id())).unwrap();
+    }
     #[test]
     fn launcher_treats_paths_and_thread_ids_as_data() {
         let text = agent_command(
