@@ -189,16 +189,39 @@ pub struct Host<'a> {
     pub instructions: Instructions,
     /// Tools from `.loom/config.toml` (MCP servers, web search), when configured.
     pub extensions: Option<crate::extensions::Extensions>,
+    /// MCP servers whose tools are listed. Every schema travels with every request
+    /// (three common servers are ~40k tokens), so the rest wait behind `enable_mcp`.
+    pub mcp_enabled: BTreeSet<String>,
 }
 impl Host<'_> {
     /// Extension tools this task may see (read-only tasks see read-only ones only).
     pub fn extension_tools(&self) -> Vec<ToolSpec> {
         let Some(extensions) = &self.extensions else { return vec![] };
-        extensions
+        let mut hidden = BTreeSet::new();
+        let mut tools: Vec<ToolSpec> = extensions
             .specs()
             .into_iter()
             .filter(|spec| !self.readonly || extensions.is_read_only(&spec.name))
-            .collect()
+            .filter(|spec| match crate::extensions::mcp_server_of(&spec.name) {
+                Some(server) if !self.mcp_enabled.contains(server) => {
+                    hidden.insert(server.to_owned());
+                    false
+                }
+                _ => true,
+            })
+            .collect();
+        if !hidden.is_empty() {
+            let names: Vec<_> = hidden.into_iter().collect();
+            tools.push(ToolSpec {
+                name: "enable_mcp".into(),
+                description: format!(
+                    "Load the tools of connected MCP servers before using them: {} (atlassian = Jira/Confluence).",
+                    names.join(", ")
+                ),
+                parameters: json!({"type":"object","required":["servers"],"properties":{"servers":{"type":"array","items":{"type":"string","enum":names}}}}),
+            });
+        }
+        tools
     }
     pub fn refresh(&mut self, cancel: &AtomicBool) -> Result<()> {
         self.view = self.hub.view_cancellable(self.overlay.dir(), cancel)?;
@@ -321,6 +344,15 @@ impl Host<'_> {
                     String::from_utf8_lossy(&result.stderr)
                 );
                 Ok(json!({"text":clip(&String::from_utf8_lossy(&result.stdout),12000)}))
+            }
+            "enable_mcp" => {
+                let requested: Vec<String> = args["servers"]
+                    .as_array()
+                    .map(|a| a.iter().filter_map(Value::as_str).map(str::to_owned).collect())
+                    .unwrap_or_default();
+                ensure!(!requested.is_empty(), "enable_mcp needs servers");
+                self.mcp_enabled.extend(requested.iter().cloned());
+                Ok(json!({"enabled": requested, "note": "their tools are listed from the next step"}))
             }
             other if self.extension_tools().iter().any(|spec| spec.name == other) => {
                 let extensions = self.extensions.as_ref().expect("listed above");

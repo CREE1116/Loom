@@ -145,6 +145,30 @@ struct Route {
     read_only: bool,
 }
 
+/// MCP server of a published tool name (`mcp__<server>__<tool>`).
+pub fn mcp_server_of(tool: &str) -> Option<&str> {
+    tool.strip_prefix("mcp__")?.split("__").next()
+}
+
+/// Servers a request names directly (Jira/Confluence count as Atlassian), so their
+/// tools can be listed up front instead of waiting for the model to ask.
+pub fn servers_mentioned<'a>(
+    goal: &str,
+    servers: impl IntoIterator<Item = &'a str>,
+) -> Vec<&'a str> {
+    let goal = goal.to_lowercase();
+    servers
+        .into_iter()
+        .filter(|server| {
+            goal.contains(&server.to_lowercase())
+                || (*server == "atlassian"
+                    && ["jira", "confluence", "지라", "컨플루언스"]
+                        .iter()
+                        .any(|w| goal.contains(w)))
+        })
+        .collect()
+}
+
 impl Extensions {
     pub fn open(root: &Path) -> Result<Self> {
         Self::open_for_workspace(
@@ -474,13 +498,66 @@ impl Extensions {
             DIAGNOSTICS.to_string(),
         ]);
         used.extend(state.routes.keys().cloned());
-        for name in names {
-            check(cancel, deadline)?;
-            let server = state.servers.get_mut(&name).unwrap();
-            if server.discovered || (!allow_network && server.config.url.is_some()) {
-                continue;
+        check(cancel, deadline)?;
+        // Servers are independent, so connect them concurrently (a slow one no longer
+        // adds to the others), then publish routes in name order as before.
+        let ready: Vec<String> = names
+            .into_iter()
+            .filter(|name| {
+                let server = &state.servers[name];
+                !server.discovered && (allow_network || server.config.url.is_none())
+            })
+            .collect();
+        let pending: Vec<(String, Server)> = ready
+            .into_iter()
+            .map(|name| {
+                let server = state.servers.remove(&name).unwrap();
+                (name, server)
+            })
+            .collect();
+        let execution = &self.execution;
+        let discover = |name: &str, server: &mut Server| {
+            let key = cache_key(name, &server.config);
+            match cache_load(&key) {
+                Some(tools) => Ok(tools),
+                None => server
+                    .discover(execution, cancel, deadline)
+                    .inspect(|tools| cache_save(&key, tools)),
             }
-            let discovered = server.discover(&self.execution, cancel, deadline);
+        };
+        // HTTP servers are connected concurrently (a slow one no longer adds to the
+        // others). Stdio servers stay on this thread: the sandbox's die-with-parent
+        // signal fires when the spawning *thread* exits, which would kill them.
+        let (http, stdio): (Vec<_>, Vec<_>) = pending
+            .into_iter()
+            .partition(|(_, server)| server.config.url.is_some());
+        let mut results: Vec<_> = thread::scope(|scope| {
+            let workers: Vec<_> = http
+                .into_iter()
+                .map(|(name, mut server)| {
+                    scope.spawn(move || {
+                        let discovered = discover(&name, &mut server);
+                        (name, server, discovered)
+                    })
+                })
+                .collect();
+            let mut results: Vec<_> = stdio
+                .into_iter()
+                .map(|(name, mut server)| {
+                    let discovered = discover(&name, &mut server);
+                    (name, server, discovered)
+                })
+                .collect();
+            results.extend(
+                workers
+                    .into_iter()
+                    .map(|worker| worker.join().expect("MCP discovery worker panicked")),
+            );
+            results
+        });
+        results.sort_by(|a, b| a.0.cmp(&b.0));
+        let mut cancelled = None;
+        for (name, mut server, discovered) in results {
             server.discovered = true;
             match discovered {
                 Ok(tools) => {
@@ -509,10 +586,14 @@ impl Extensions {
                         .diagnostics
                         .push(format!("MCP server {name} discovery failed: {e:#}"));
                     if cancel.load(Ordering::Relaxed) {
-                        return Err(e);
+                        cancelled.get_or_insert(e);
                     }
                 }
             }
+            state.servers.insert(name, server);
+        }
+        if let Some(e) = cancelled {
+            return Err(e);
         }
         state.discovered = state.servers.values().all(|s| s.discovered);
         Ok(())
@@ -614,6 +695,78 @@ impl Extensions {
 }
 
 type DiscoveredTool = (String, String, Value, &'static str, Option<String>, bool);
+
+/// Tool lists are cached so a task does not wait on every server's round trips
+/// (GitHub's list alone is ~2.5s); calls still connect on demand. The key covers the server config, so edits invalidate it.
+const CACHE_TTL: Duration = Duration::from_secs(24 * 3600);
+fn cache_dir() -> Option<PathBuf> {
+    crate::models::state_dir().map(|dir| dir.join("mcp-cache"))
+}
+fn cache_key(name: &str, c: &ServerConfig) -> String {
+    use sha2::{Digest, Sha256};
+    let identity = format!(
+        "{name}\n{:?}\n{:?}\n{:?}\n{:?}\n{:?}",
+        c.url, c.command, c.args, c.env, c.headers
+    );
+    Sha256::digest(identity.as_bytes())[..12]
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+fn cache_load(key: &str) -> Option<Vec<DiscoveredTool>> {
+    let path = cache_dir()?.join(format!("{key}.json"));
+    let age = fs::metadata(&path).ok()?.modified().ok()?.elapsed().ok()?;
+    if age > CACHE_TTL {
+        return None;
+    }
+    let entries: Vec<Value> = serde_json::from_slice(&fs::read(&path).ok()?).ok()?;
+    entries
+        .into_iter()
+        .map(|e| {
+            let method = match e["method"].as_str()? {
+                "tools/call" => "tools/call",
+                "resources/list" => "resources/list",
+                "resources/read" => "resources/read",
+                "resources/templates/list" => "resources/templates/list",
+                "prompts/list" => "prompts/list",
+                "prompts/get" => "prompts/get",
+                _ => return None,
+            };
+            Some((
+                e["name"].as_str()?.to_owned(),
+                e["description"].as_str()?.to_owned(),
+                e["parameters"].clone(),
+                method,
+                e["tool"].as_str().map(str::to_owned),
+                e["read_only"].as_bool()?,
+            ))
+        })
+        .collect()
+}
+fn cache_save(key: &str, tools: &[DiscoveredTool]) {
+    let Some(dir) = cache_dir() else { return };
+    let entries: Vec<Value> = tools
+        .iter()
+        .map(|(name, description, parameters, method, tool, read_only)| {
+            json!({"name": name, "description": description, "parameters": parameters,
+                   "method": method, "tool": tool, "read_only": read_only})
+        })
+        .collect();
+    // Best effort: a cache that cannot be written only costs the next discovery.
+    let _ = fs::create_dir_all(&dir).and_then(|()| {
+        fs::write(
+            dir.join(format!("{key}.json")),
+            serde_json::to_vec(&entries).unwrap_or_default(),
+        )
+    });
+}
+/// Forget cached tool lists (after config, sign-in, or an explicit refresh).
+pub fn clear_discovery_cache() {
+    if let Some(dir) = cache_dir() {
+        let _ = fs::remove_dir_all(dir);
+    }
+}
+
 impl Server {
     fn start(
         &mut self,

@@ -1,6 +1,13 @@
 // Path import keeps this gate runnable before the main agent exports the module.
 mod models {
     pub use loom_core::models::ToolSpec;
+    thread_local! {
+        /// Per-test state dir for the discovery cache; unset disables caching.
+        pub static STATE_DIR: std::cell::RefCell<Option<std::path::PathBuf>> = const { std::cell::RefCell::new(None) };
+    }
+    pub fn state_dir() -> Option<std::path::PathBuf> {
+        STATE_DIR.with(|dir| dir.borrow().clone())
+    }
 }
 mod effects {
     pub use loom_core::effects::{ExecutionPolicy, SandboxMode};
@@ -955,4 +962,41 @@ fn workspace_network_policy_denies_stdio_os_network_and_builtin_http_calls() {
             }
         }
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn cached_tool_lists_skip_server_startup_until_a_call() {
+    let state = TempDir::new().unwrap();
+    models::STATE_DIR.with(|dir| *dir.borrow_mut() = Some(state.path().to_owned()));
+    let dir = stdio("");
+    let started = dir.path().join("started");
+    let first = Extensions::open(dir.path()).unwrap().specs();
+    assert!(started.exists(), "first discovery starts the server");
+    fs::remove_file(&started).unwrap();
+
+    let ext = Extensions::open(dir.path()).unwrap();
+    let cached = ext.specs();
+    let names = |specs: &[loom_core::models::ToolSpec]| {
+        specs.iter().map(|s| s.name.clone()).collect::<Vec<_>>()
+    };
+    assert_eq!(names(&cached), names(&first));
+    assert!(!started.exists(), "a cached list must not start the server");
+    let echo = &cached
+        .iter()
+        .find(|s| s.name.starts_with("mcp__fixture__echo"))
+        .unwrap()
+        .name;
+    assert!(
+        ext.call(
+            echo,
+            &json!({"text":"lazy"}),
+            &AtomicBool::new(false),
+            TIMEOUT
+        )
+        .unwrap()
+        .contains("lazy")
+    );
+    assert!(started.exists(), "a call connects on demand");
+    models::STATE_DIR.with(|dir| *dir.borrow_mut() = None);
 }

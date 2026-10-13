@@ -358,10 +358,16 @@ pub fn run(
         policy: shared.options.policy,
         instructions,
         extensions: None,
+        mcp_enabled: BTreeSet::new(),
     };
     // Extensions are configured per workspace; without a config there is nothing to start.
     if shared.root.join(".loom/config.toml").is_file() {
         host.extensions = crate::extensions::Extensions::open_for_workspace(shared.root, host.overlay.dir(), shared.options.policy).ok();
+        if let Some(extensions) = &host.extensions {
+            let specs = extensions.specs();
+            let servers: BTreeSet<&str> = specs.iter().filter_map(|s| crate::extensions::mcp_server_of(&s.name)).collect();
+            host.mcp_enabled.extend(crate::extensions::servers_mentioned(goal, servers).into_iter().map(str::to_owned));
+        }
     }
     if id == "main" && !shared.options.inquiry {
         shared.options.control.publish(
